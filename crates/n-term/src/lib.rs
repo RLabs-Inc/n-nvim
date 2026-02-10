@@ -21,4 +21,5 @@ pub mod cell;
 pub mod color;
 pub mod diff;
 pub mod output;
+pub mod input;
 pub mod terminal;
