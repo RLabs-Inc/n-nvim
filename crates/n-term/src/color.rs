@@ -453,10 +453,65 @@ impl Color {
     /// Produces a `TrueColor` value (24-bit RGB). For terminals that don't
     /// support `TrueColor`, use [`CellColor::to_ansi256`] or
     /// [`CellColor::to_ansi16`] for fallback.
+    ///
+    /// Alpha is discarded — this produces the raw color without compositing.
+    /// For colors with alpha, use [`resolve_over`](Self::resolve_over) to
+    /// composite against a background first.
     #[must_use]
     pub fn to_cell_color(self) -> CellColor {
         let (r, g, b) = self.to_rgb8();
         CellColor::Rgb(r, g, b)
+    }
+
+    /// Resolve this color to a terminal-ready [`CellColor`], compositing
+    /// over the given background if this color has alpha < 1.0.
+    ///
+    /// This is the bridge between the rich `Color` type (OKLCH with alpha)
+    /// and the compact `CellColor` (terminal output, no alpha). Use this
+    /// when painting semi-transparent overlays onto existing cells:
+    ///
+    /// ```
+    /// use n_term::color::{Color, CellColor};
+    ///
+    /// // A 50% transparent red overlay on a blue background
+    /// let overlay = Color::srgba(1.0, 0.0, 0.0, 0.5);
+    /// let existing = CellColor::Rgb(0, 0, 255);
+    /// let resolved = overlay.resolve_over(&existing);
+    ///
+    /// // Result is a blended purple — fully resolved, ready for terminal output
+    /// assert!(matches!(resolved, CellColor::Rgb(_, _, _)));
+    /// ```
+    ///
+    /// Compositing happens in linear sRGB (physically correct, no dark seams).
+    #[must_use]
+    pub fn resolve_over(self, background: &CellColor) -> CellColor {
+        // Fully opaque — no blending needed
+        if self.is_opaque() {
+            return self.to_cell_color();
+        }
+
+        // Fully transparent — background shows through
+        if self.is_transparent() {
+            return *background;
+        }
+
+        // Semi-transparent — composite over background
+        let bg_color = background.to_color().unwrap_or(Self::BLACK);
+        self.blend_over(&bg_color).to_cell_color()
+    }
+
+    /// Resolve this color to a terminal-ready [`CellColor`], compositing
+    /// over black if this color has alpha < 1.0.
+    ///
+    /// Convenience method for the common case where the background is
+    /// unknown or black (e.g., cleared screen, first paint).
+    #[must_use]
+    pub fn resolve(self) -> CellColor {
+        if self.is_opaque() {
+            self.to_cell_color()
+        } else {
+            self.blend_over(&Self::BLACK).to_cell_color()
+        }
     }
 
     /// Find the nearest ANSI-256 palette color using perceptual distance.
@@ -1372,6 +1427,72 @@ mod tests {
             assert!(approx_eq(mapped.l, color.l, 0.001)); // Lightness preserved
             assert!(approx_eq(mapped.h, color.h, 0.5)); // Hue preserved
         }
+    }
+
+    // ── Resolve (Transparency Bridge) ────────────────────────────────────
+
+    #[test]
+    fn resolve_opaque_ignores_background() {
+        let color = Color::srgb(1.0, 0.0, 0.0); // Opaque red
+        let bg = CellColor::Rgb(0, 0, 255); // Blue background
+        let resolved = color.resolve_over(&bg);
+        assert_eq!(resolved, CellColor::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn resolve_transparent_returns_background() {
+        let color = Color::TRANSPARENT;
+        let bg = CellColor::Rgb(0, 255, 0);
+        let resolved = color.resolve_over(&bg);
+        assert_eq!(resolved, bg);
+    }
+
+    #[test]
+    fn resolve_transparent_preserves_default_bg() {
+        let color = Color::TRANSPARENT;
+        let bg = CellColor::Default;
+        let resolved = color.resolve_over(&bg);
+        assert_eq!(resolved, CellColor::Default);
+    }
+
+    #[test]
+    fn resolve_semi_transparent_blends() {
+        let color = Color::srgba(1.0, 0.0, 0.0, 0.5); // 50% red
+        let bg = CellColor::Rgb(0, 0, 255); // Blue
+        let resolved = color.resolve_over(&bg);
+
+        // Should be a blended purple-ish color (not pure red, not pure blue)
+        if let CellColor::Rgb(r, _, b) = resolved {
+            assert!(r > 100, "Expected red > 100, got {r}");
+            assert!(b > 100, "Expected blue > 100, got {b}");
+        } else {
+            panic!("Expected Rgb variant");
+        }
+    }
+
+    #[test]
+    fn resolve_over_default_bg_treats_as_black() {
+        let color = Color::srgba(1.0, 1.0, 1.0, 0.5); // 50% white
+        let resolved_default = color.resolve_over(&CellColor::Default);
+        let resolved_black = color.resolve_over(&CellColor::Rgb(0, 0, 0));
+
+        // Both should produce similar results (default → black fallback)
+        assert_eq!(resolved_default, resolved_black);
+    }
+
+    #[test]
+    fn resolve_convenience_composites_over_black() {
+        let color = Color::srgba(1.0, 1.0, 1.0, 0.5);
+        let resolved = color.resolve();
+        let manual = color.resolve_over(&CellColor::Rgb(0, 0, 0));
+        assert_eq!(resolved, manual);
+    }
+
+    #[test]
+    fn resolve_opaque_convenience() {
+        let color = Color::srgb(0.5, 0.5, 0.5);
+        let resolved = color.resolve();
+        assert_eq!(resolved, color.to_cell_color());
     }
 
     // ── CellColor ────────────────────────────────────────────────────────
