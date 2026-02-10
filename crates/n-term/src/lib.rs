@@ -14,6 +14,10 @@
 // sequences and raw termios. Every byte sent to the terminal is
 // accounted for. Every frame is diffed. Every escape code is earned.
 
+#[allow(clippy::missing_errors_doc)] // ANSI functions all just forward io::Write errors.
+pub mod ansi;
 pub mod buffer;
 pub mod cell;
 pub mod color;
+pub mod diff;
+pub mod output;

@@ -321,6 +321,27 @@ impl FrameBuffer {
         self.cells.fill(Cell::EMPTY.with_bg(bg));
     }
 
+    /// Copy all cells from another buffer of the same dimensions.
+    ///
+    /// This is used by the diff renderer to store the previous frame without
+    /// allocating a new `Vec` every frame. Only the first render (or a resize)
+    /// allocates; subsequent frames are a memcpy into the existing buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the dimensions don't match.
+    pub fn copy_from(&mut self, other: &Self) {
+        assert!(
+            self.width == other.width && self.height == other.height,
+            "FrameBuffer::copy_from: dimensions mismatch ({}x{} vs {}x{})",
+            self.width,
+            self.height,
+            other.width,
+            other.height,
+        );
+        self.cells.copy_from_slice(&other.cells);
+    }
+
     /// Resize the buffer, clearing all content.
     ///
     /// After resize, all cells are empty (space, default colors).
