@@ -2,6 +2,11 @@
 //
 // n-term color system — OKLCH-native with full perceptual color support.
 //
+// Single-character variable names (r, g, b, l, c, h, a, s, m) are the
+// standard mathematical convention in color science. Renaming them would
+// make the code harder to compare against reference implementations.
+#![allow(clippy::many_single_char_names)]
+//
 // The terminal world has been stuck in raw RGB for decades. This module
 // brings perceptually uniform color to terminal rendering, with OKLCH
 // at its core. Every color operation (lighten, darken, shift hue, blend)
@@ -213,7 +218,7 @@ impl Color {
     /// Set lightness to an absolute value (clamped to 0.0–1.0).
     #[inline]
     #[must_use]
-    pub fn set_lightness(self, l: f32) -> Self {
+    pub const fn set_lightness(self, l: f32) -> Self {
         Self {
             l: l.clamp(0.0, 1.0),
             ..self
@@ -243,7 +248,7 @@ impl Color {
     /// Set chroma to an absolute value (clamped to >= 0.0).
     #[inline]
     #[must_use]
-    pub fn set_chroma(self, c: f32) -> Self {
+    pub const fn set_chroma(self, c: f32) -> Self {
         Self {
             c: c.max(0.0),
             ..self
@@ -296,10 +301,10 @@ impl Color {
         };
 
         Self {
-            l: self.l * inv_t + other.l * t,
-            c: self.c * inv_t + other.c * t,
+            l: self.l.mul_add(inv_t, other.l * t),
+            c: self.c.mul_add(inv_t, other.c * t),
             h,
-            alpha: self.alpha * inv_t + other.alpha * t,
+            alpha: self.alpha.mul_add(inv_t, other.alpha * t),
         }
     }
 
@@ -315,7 +320,7 @@ impl Color {
         let dl = l1 - l2;
         let da = a1 - a2;
         let db = b1 - b2;
-        (dl * dl + da * da + db * db).sqrt()
+        db.mul_add(db, dl.mul_add(dl, da * da)).sqrt()
     }
 
     // ─── Alpha Blending ──────────────────────────────────────────────────
@@ -341,15 +346,15 @@ impl Color {
         let da = dst.alpha;
 
         // Porter-Duff "source over"
-        let out_a = sa + da * (1.0 - sa);
+        let out_a = da.mul_add(1.0 - sa, sa);
         if out_a < 1e-6 {
             return Self::TRANSPARENT;
         }
 
         let inv_sa = 1.0 - sa;
-        let out_r = (sr * sa + dr * da * inv_sa) / out_a;
-        let out_g = (sg * sa + dg * da * inv_sa) / out_a;
-        let out_b = (sb * sa + db * da * inv_sa) / out_a;
+        let out_r = sr.mul_add(sa, dr * da * inv_sa) / out_a;
+        let out_g = sg.mul_add(sa, dg * da * inv_sa) / out_a;
+        let out_b = sb.mul_add(sa, db * da * inv_sa) / out_a;
 
         // Convert back through sRGB → OKLCH
         let r = linear_to_srgb(out_r);
@@ -445,8 +450,8 @@ impl Color {
 
     /// Convert to a [`CellColor`] for terminal rendering.
     ///
-    /// Produces a TrueColor value (24-bit RGB). For terminals that don't
-    /// support TrueColor, use [`CellColor::to_ansi256`] or
+    /// Produces a `TrueColor` value (24-bit RGB). For terminals that don't
+    /// support `TrueColor`, use [`CellColor::to_ansi256`] or
     /// [`CellColor::to_ansi16`] for fallback.
     #[must_use]
     pub fn to_cell_color(self) -> CellColor {
@@ -521,8 +526,9 @@ impl Default for Color {
 /// For rich color operations, use [`Color`] and convert with
 /// [`Color::to_cell_color`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum CellColor {
-    /// 24-bit TrueColor (the standard for modern terminals).
+    /// 24-bit `TrueColor` (the standard for modern terminals).
     Rgb(u8, u8, u8),
 
     /// ANSI 256-color palette index.
@@ -530,6 +536,7 @@ pub enum CellColor {
 
     /// Terminal default color (inherits from terminal settings).
     /// Used when the editor should respect the user's terminal theme.
+    #[default]
     Default,
 }
 
@@ -563,7 +570,7 @@ impl CellColor {
         self.to_srgb().map(|(r, g, b)| Color::srgb(r, g, b))
     }
 
-    /// Downgrade to ANSI-256 palette (for terminals without TrueColor).
+    /// Downgrade to ANSI-256 palette (for terminals without `TrueColor`).
     #[must_use]
     pub fn to_ansi256(self) -> Self {
         match self {
@@ -616,11 +623,6 @@ impl fmt::Display for CellColor {
     }
 }
 
-impl Default for CellColor {
-    fn default() -> Self {
-        Self::Default
-    }
-}
 
 impl From<Color> for CellColor {
     fn from(color: Color) -> Self {
@@ -678,7 +680,7 @@ fn oklch_to_oklab_ab(c: f32, h: f32) -> (f32, f32) {
 /// Convert Oklab a, b components to OKLCH chroma and hue.
 #[inline]
 fn oklab_ab_to_oklch(a: f32, b: f32) -> (f32, f32) {
-    let c = (a * a + b * b).sqrt();
+    let c = a.hypot(b);
     let h = if c < 1e-8 {
         0.0 // Achromatic — hue is undefined, default to 0
     } else {
@@ -712,9 +714,9 @@ fn oklab_to_oklch(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
 #[inline]
 fn oklab_to_linear_srgb(l_ok: f32, a: f32, b: f32) -> (f32, f32, f32) {
     // Oklab → LMS (cube roots)
-    let l_ = l_ok + 0.396_337_78 * a + 0.215_803_76 * b;
-    let m_ = l_ok - 0.105_561_346 * a - 0.063_854_17 * b;
-    let s_ = l_ok - 0.089_484_18 * a - 1.291_485_5 * b;
+    let l_ = 0.215_803_76f32.mul_add(b, 0.396_337_78f32.mul_add(a, l_ok));
+    let m_ = 0.063_854_17f32.mul_add(-b, 0.105_561_346f32.mul_add(-a, l_ok));
+    let s_ = 1.291_485_5f32.mul_add(-b, 0.089_484_18f32.mul_add(-a, l_ok));
 
     // Undo cube root
     let l = l_ * l_ * l_;
@@ -722,9 +724,9 @@ fn oklab_to_linear_srgb(l_ok: f32, a: f32, b: f32) -> (f32, f32, f32) {
     let s = s_ * s_ * s_;
 
     // LMS → Linear sRGB
-    let r = 4.076_741_7 * l - 3.307_711_6 * m + 0.230_969_94 * s;
-    let g = -1.268_438 * l + 2.609_757_4 * m - 0.341_319_38 * s;
-    let bl = -0.004_196_086_3 * l - 0.703_418_6 * m + 1.707_614_7 * s;
+    let r = 0.230_969_94f32.mul_add(s, 4.076_741_7f32.mul_add(l, -(3.307_711_6 * m)));
+    let g = 0.341_319_38f32.mul_add(-s, (-1.268_438f32).mul_add(l, 2.609_757_4 * m));
+    let bl = 1.707_614_7f32.mul_add(s, (-0.004_196_086_3f32).mul_add(l, -(0.703_418_6 * m)));
 
     (r, g, bl)
 }
@@ -733,9 +735,9 @@ fn oklab_to_linear_srgb(l_ok: f32, a: f32, b: f32) -> (f32, f32, f32) {
 #[inline]
 fn linear_srgb_to_oklab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     // Linear sRGB → LMS
-    let l = 0.412_221_47 * r + 0.536_332_55 * g + 0.051_445_995 * b;
-    let m = 0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b;
-    let s = 0.088_302_46 * r + 0.281_718_84 * g + 0.629_978_7 * b;
+    let l = 0.051_445_995f32.mul_add(b, 0.412_221_47f32.mul_add(r, 0.536_332_55 * g));
+    let m = 0.107_396_96f32.mul_add(b, 0.211_903_5f32.mul_add(r, 0.680_699_5 * g));
+    let s = 0.629_978_7f32.mul_add(b, 0.088_302_46f32.mul_add(r, 0.281_718_84 * g));
 
     // Cube root (LMS → Oklab intermediate)
     let l_ = l.cbrt();
@@ -743,9 +745,9 @@ fn linear_srgb_to_oklab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let s_ = s.cbrt();
 
     // Oklab intermediate → Oklab
-    let l_ok = 0.210_454_26 * l_ + 0.793_617_8 * m_ - 0.004_072_047 * s_;
-    let a = 1.977_998_5 * l_ - 2.428_592_2 * m_ + 0.450_593_7 * s_;
-    let b_ok = 0.025_904_037 * l_ + 0.782_771_77 * m_ - 0.808_675_77 * s_;
+    let l_ok = 0.004_072_047f32.mul_add(-s_, 0.210_454_26f32.mul_add(l_, 0.793_617_8 * m_));
+    let a = 0.450_593_7f32.mul_add(s_, 1.977_998_5f32.mul_add(l_, -(2.428_592_2 * m_)));
+    let b_ok = 0.808_675_77f32.mul_add(-s_, 0.025_904_037f32.mul_add(l_, 0.782_771_77 * m_));
 
     (l_ok, a, b_ok)
 }
@@ -762,7 +764,7 @@ fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.003_130_8 {
         c * 12.92
     } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
+        1.055f32.mul_add(c.powf(1.0 / 2.4), -0.055)
     }
 }
 
@@ -836,7 +838,7 @@ fn parse_hex(s: &str) -> Option<Color> {
 }
 
 #[inline]
-fn parse_hex_digit(c: u8) -> Option<u8> {
+const fn parse_hex_digit(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
@@ -854,8 +856,10 @@ fn parse_hex_byte(bytes: &[u8]) -> Option<u8> {
 
 /// Convert a float (0.0–1.0) to a u8 (0–255) with correct rounding.
 #[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn to_u8(v: f32) -> u8 {
-    (v * 255.0 + 0.5).min(255.0).max(0.0) as u8
+    // Safe: clamp guarantees 0.0 <= value <= 255.0 before truncation.
+    v.mul_add(255.0, 0.5).clamp(0.0, 255.0) as u8
 }
 
 // ─── ANSI Palette ────────────────────────────────────────────────────────────
@@ -943,8 +947,8 @@ pub mod ansi {
         let mut best_idx: u8 = 0;
         let mut best_dist = f32::MAX;
 
-        for idx in 0u16..=255 {
-            let (r, g, b) = ansi256_to_rgb(idx as u8);
+        for idx in 0u8..=255 {
+            let (r, g, b) = ansi256_to_rgb(idx);
             let (l2, c2, h2) = srgb_to_oklch(
                 f32::from(r) / 255.0,
                 f32::from(g) / 255.0,
@@ -955,11 +959,11 @@ pub mod ansi {
             let dl = l1 - l2;
             let da = a1 - a2;
             let db = b1 - b2;
-            let dist = dl * dl + da * da + db * db;
+            let dist = db.mul_add(db, dl.mul_add(dl, da * da));
 
             if dist < best_dist {
                 best_dist = dist;
-                best_idx = idx as u8;
+                best_idx = idx;
             }
         }
 
@@ -986,7 +990,7 @@ pub mod ansi {
             let dl = l1 - l2;
             let da = a1 - a2;
             let db = b1 - b2;
-            let dist = dl * dl + da * da + db * db;
+            let dist = db.mul_add(db, dl.mul_add(dl, da * da));
 
             if dist < best_dist {
                 best_dist = dist;
