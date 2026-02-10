@@ -174,6 +174,165 @@ pub fn end_sync(w: &mut impl Write) -> io::Result<()> {
     w.write_all(b"\x1b[?2026l")
 }
 
+// ─── Alternate Screen ───────────────────────────────────────────────────────
+
+/// Enter the alternate screen buffer (DEC Private Mode 1049).
+///
+/// The alternate screen is a separate buffer that preserves the original
+/// terminal content. On exit, the original content is restored — this is
+/// what makes TUI applications non-destructive.
+#[inline]
+pub fn enter_alt_screen(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?1049h")
+}
+
+/// Exit the alternate screen buffer and restore original content.
+#[inline]
+pub fn exit_alt_screen(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?1049l")
+}
+
+// ─── Mouse Protocol ─────────────────────────────────────────────────────────
+
+/// Mouse tracking granularity for SGR mouse protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseMode {
+    /// Report button press and release events (DEC 1000).
+    Click,
+    /// Report button events and drag motion (DEC 1000 + 1002).
+    Drag,
+    /// Report all mouse motion, even without buttons held (DEC 1000 + 1002 + 1003).
+    Motion,
+}
+
+/// Enable SGR mouse tracking at the specified granularity.
+///
+/// Uses SGR format (DEC 1006) which supports coordinates beyond column 223
+/// and distinguishes button press from release. Call [`disable_mouse`] before
+/// changing modes to avoid stale tracking flags.
+pub fn enable_mouse(w: &mut impl Write, mode: MouseMode) -> io::Result<()> {
+    w.write_all(b"\x1b[?1000h")?;
+    if matches!(mode, MouseMode::Drag | MouseMode::Motion) {
+        w.write_all(b"\x1b[?1002h")?;
+    }
+    if mode == MouseMode::Motion {
+        w.write_all(b"\x1b[?1003h")?;
+    }
+    w.write_all(b"\x1b[?1006h")
+}
+
+/// Disable all mouse tracking.
+pub fn disable_mouse(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?1006l")?;
+    w.write_all(b"\x1b[?1003l")?;
+    w.write_all(b"\x1b[?1002l")?;
+    w.write_all(b"\x1b[?1000l")
+}
+
+// ─── Kitty Keyboard Protocol ────────────────────────────────────────────────
+
+/// Enable the Kitty keyboard protocol with progressive enhancement flags.
+///
+/// Flags (bitfield, combine with `|`):
+/// - `1` — Disambiguate escape codes (essential for editors).
+/// - `2` — Report event types (press / release / repeat).
+/// - `4` — Report alternate keys.
+/// - `8` — Report all keys as escape codes.
+/// - `16` — Report associated text.
+///
+/// For a text editor, `1` (disambiguate) is the minimum useful flag.
+#[inline]
+pub fn enable_kitty_keyboard(w: &mut impl Write, flags: u8) -> io::Result<()> {
+    write!(w, "\x1b[>{flags}u")
+}
+
+/// Disable the Kitty keyboard protocol (pop enhancement from stack).
+#[inline]
+pub fn disable_kitty_keyboard(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[<u")
+}
+
+// ─── Bracketed Paste ────────────────────────────────────────────────────────
+
+/// Enable bracketed paste mode (DEC 2004).
+///
+/// Pasted text is wrapped with `\x1b[200~` / `\x1b[201~`, letting the
+/// editor distinguish typed input from clipboard paste. Without this,
+/// pasting triggers auto-indent on every line.
+#[inline]
+pub fn enable_bracketed_paste(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?2004h")
+}
+
+/// Disable bracketed paste mode.
+#[inline]
+pub fn disable_bracketed_paste(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?2004l")
+}
+
+// ─── Focus Reporting ────────────────────────────────────────────────────────
+
+/// Enable terminal focus reporting (DEC 1004).
+///
+/// The terminal sends `\x1b[I` on focus gain and `\x1b[O` on focus loss.
+/// Useful for pausing animations, dimming the UI, or refreshing file state
+/// when the user returns from another window.
+#[inline]
+pub fn enable_focus_reporting(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?1004h")
+}
+
+/// Disable terminal focus reporting.
+#[inline]
+pub fn disable_focus_reporting(w: &mut impl Write) -> io::Result<()> {
+    w.write_all(b"\x1b[?1004l")
+}
+
+// ─── Cursor Shape ───────────────────────────────────────────────────────────
+
+/// Terminal cursor shape (DECSCUSR — Set Cursor Style).
+///
+/// Used for Vim mode indication:
+/// - Normal mode → [`SteadyBlock`](CursorShape::SteadyBlock)
+/// - Insert mode → [`SteadyBar`](CursorShape::SteadyBar)
+/// - Replace mode → [`SteadyUnderline`](CursorShape::SteadyUnderline)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// Terminal default (usually blinking block).
+    #[default]
+    Default,
+    /// Blinking block cursor.
+    BlinkBlock,
+    /// Steady (non-blinking) block cursor.
+    SteadyBlock,
+    /// Blinking underline cursor.
+    BlinkUnderline,
+    /// Steady underline cursor.
+    SteadyUnderline,
+    /// Blinking bar (I-beam) cursor.
+    BlinkBar,
+    /// Steady bar (I-beam) cursor.
+    SteadyBar,
+}
+
+/// Set the cursor shape using DECSCUSR.
+///
+/// Supported by all modern terminals: Kitty, `WezTerm`, Ghostty, iTerm2,
+/// Alacritty, foot, Windows Terminal.
+#[inline]
+pub fn set_cursor_shape(w: &mut impl Write, shape: CursorShape) -> io::Result<()> {
+    let n: u8 = match shape {
+        CursorShape::Default => 0,
+        CursorShape::BlinkBlock => 1,
+        CursorShape::SteadyBlock => 2,
+        CursorShape::BlinkUnderline => 3,
+        CursorShape::SteadyUnderline => 4,
+        CursorShape::BlinkBar => 5,
+        CursorShape::SteadyBar => 6,
+    };
+    write!(w, "\x1b[{n} q")
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -469,5 +628,154 @@ mod tests {
         attrs(&mut buf, Attr::BOLD).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s, "\x1b[4;6H\x1b[38;2;255;0;0m\x1b[40m\x1b[1m");
+    }
+
+    // ── Alternate Screen ────────────────────────────────────────────────
+
+    #[test]
+    fn enter_alt_screen_sequence() {
+        assert_eq!(emit(|w| enter_alt_screen(w)), "\x1b[?1049h");
+    }
+
+    #[test]
+    fn exit_alt_screen_sequence() {
+        assert_eq!(emit(|w| exit_alt_screen(w)), "\x1b[?1049l");
+    }
+
+    // ── Mouse Protocol ──────────────────────────────────────────────────
+
+    #[test]
+    fn enable_mouse_click_mode() {
+        let output = emit(|w| enable_mouse(w, MouseMode::Click));
+        assert!(output.contains("\x1b[?1000h"));
+        assert!(output.contains("\x1b[?1006h"));
+        assert!(!output.contains("\x1b[?1002h"));
+        assert!(!output.contains("\x1b[?1003h"));
+    }
+
+    #[test]
+    fn enable_mouse_drag_mode() {
+        let output = emit(|w| enable_mouse(w, MouseMode::Drag));
+        assert!(output.contains("\x1b[?1000h"));
+        assert!(output.contains("\x1b[?1002h"));
+        assert!(output.contains("\x1b[?1006h"));
+        assert!(!output.contains("\x1b[?1003h"));
+    }
+
+    #[test]
+    fn enable_mouse_motion_mode() {
+        let output = emit(|w| enable_mouse(w, MouseMode::Motion));
+        assert!(output.contains("\x1b[?1000h"));
+        assert!(output.contains("\x1b[?1002h"));
+        assert!(output.contains("\x1b[?1003h"));
+        assert!(output.contains("\x1b[?1006h"));
+    }
+
+    #[test]
+    fn disable_mouse_all_modes() {
+        let output = emit(|w| disable_mouse(w));
+        assert!(output.contains("\x1b[?1006l"));
+        assert!(output.contains("\x1b[?1003l"));
+        assert!(output.contains("\x1b[?1002l"));
+        assert!(output.contains("\x1b[?1000l"));
+    }
+
+    // ── Kitty Keyboard Protocol ─────────────────────────────────────────
+
+    #[test]
+    fn enable_kitty_keyboard_disambiguate() {
+        assert_eq!(emit(|w| enable_kitty_keyboard(w, 1)), "\x1b[>1u");
+    }
+
+    #[test]
+    fn enable_kitty_keyboard_all_flags() {
+        assert_eq!(emit(|w| enable_kitty_keyboard(w, 31)), "\x1b[>31u");
+    }
+
+    #[test]
+    fn disable_kitty_keyboard_sequence() {
+        assert_eq!(emit(|w| disable_kitty_keyboard(w)), "\x1b[<u");
+    }
+
+    // ── Bracketed Paste ─────────────────────────────────────────────────
+
+    #[test]
+    fn enable_bracketed_paste_sequence() {
+        assert_eq!(emit(|w| enable_bracketed_paste(w)), "\x1b[?2004h");
+    }
+
+    #[test]
+    fn disable_bracketed_paste_sequence() {
+        assert_eq!(emit(|w| disable_bracketed_paste(w)), "\x1b[?2004l");
+    }
+
+    // ── Focus Reporting ─────────────────────────────────────────────────
+
+    #[test]
+    fn enable_focus_reporting_sequence() {
+        assert_eq!(emit(|w| enable_focus_reporting(w)), "\x1b[?1004h");
+    }
+
+    #[test]
+    fn disable_focus_reporting_sequence() {
+        assert_eq!(emit(|w| disable_focus_reporting(w)), "\x1b[?1004l");
+    }
+
+    // ── Cursor Shape ────────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_shape_default() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::Default)),
+            "\x1b[0 q"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_blink_block() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::BlinkBlock)),
+            "\x1b[1 q"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_steady_block() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::SteadyBlock)),
+            "\x1b[2 q"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_blink_underline() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::BlinkUnderline)),
+            "\x1b[3 q"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_steady_underline() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::SteadyUnderline)),
+            "\x1b[4 q"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_blink_bar() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::BlinkBar)),
+            "\x1b[5 q"
+        );
+    }
+
+    #[test]
+    fn cursor_shape_steady_bar() {
+        assert_eq!(
+            emit(|w| set_cursor_shape(w, CursorShape::SteadyBar)),
+            "\x1b[6 q"
+        );
     }
 }
