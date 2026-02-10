@@ -1,0 +1,22 @@
+[package]
+name = "n-term"
+description = "Terminal rendering engine for n-nvim — fast, OKLCH-native, differential"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags = "2.9"
+unicode-width = "0.2"
+unicode-segmentation = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1"
