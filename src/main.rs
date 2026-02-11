@@ -227,6 +227,24 @@ struct DotRepeat {
     keys: Vec<KeyEvent>,
 }
 
+// ─── Block insert replay ──────────────────────────────────────────────────
+
+/// State for visual-block insert replay.
+///
+/// When the user enters insert mode via block `I`, `A`, or `c`, this struct
+/// remembers which lines and column to replay the typed text on once Escape
+/// is pressed. The first line in the list is the one the user is typing on —
+/// the others receive the replayed text.
+struct BlockInsert {
+    /// Lines that will receive the replayed insertion (excludes the line
+    /// the user is actively editing, which is the cursor's current line).
+    lines: Vec<usize>,
+    /// Column at which to insert the replayed text on each line.
+    col: usize,
+    /// The cursor column when block insert started (to extract typed text).
+    start_col: usize,
+}
+
 // ─── Buffer / window state ─────────────────────────────────────────────────
 
 /// Per-buffer state — the text content and its editing history.
@@ -423,6 +441,10 @@ struct Editor {
 
     /// Change list — positions where edits occurred, for `g;` / `g,`.
     change_list: ChangeList,
+
+    /// Active block-insert replay state. When `Some`, the next Escape from
+    /// insert mode will replay the typed text on the stored lines.
+    block_insert: Option<BlockInsert>,
 }
 
 impl Editor {
@@ -471,6 +493,7 @@ impl Editor {
             last_visual_lines: None,
             jump_list: JumpList::new(),
             change_list: ChangeList::new(),
+            block_insert: None,
         }
     }
 
@@ -524,6 +547,7 @@ impl Editor {
             last_visual_lines: None,
             jump_list: JumpList::new(),
             change_list: ChangeList::new(),
+            block_insert: None,
         }
     }
 
@@ -2790,6 +2814,11 @@ impl Editor {
             KeyCode::Escape => {
                 // Commit the insert-mode transaction and return to normal.
                 self.commit_history();
+
+                // If a block insert is active, replay the typed text on
+                // all other lines before leaving insert mode.
+                self.replay_block_insert();
+
                 self.mode = Mode::Normal;
                 self.cursor.move_left(1, &self.buffer, false);
 
@@ -3429,6 +3458,14 @@ impl Editor {
             KeyCode::Char('y') => self.visual_yank(),
             KeyCode::Char('c') => self.visual_change(),
 
+            // -- Block insert / append (only in block mode) --
+            KeyCode::Char('I') if current_kind == VisualKind::Block => {
+                self.visual_block_insert();
+            }
+            KeyCode::Char('A') if current_kind == VisualKind::Block => {
+                self.visual_block_append();
+            }
+
             // -- Enter command mode (prefill with '<,'>) --
             KeyCode::Char(':') => {
                 self.save_visual_lines();
@@ -3535,6 +3572,105 @@ impl Editor {
         }
     }
 
+    // ── Visual block helpers ───────────────────────────────────────────
+
+    /// Compute the rectangular block coordinates from the visual selection.
+    ///
+    /// Returns `(start_line, end_line, left_col, right_col)` where columns
+    /// are inclusive (`right_col` is included in the block). Returns `None` if
+    /// there is no active selection.
+    fn visual_block_coords(&self) -> Option<(usize, usize, usize, usize)> {
+        let range = self.cursor.selection()?;
+        let left = range.start.col.min(range.end.col);
+        let right = range.start.col.max(range.end.col);
+        Some((range.start.line, range.end.line, left, right))
+    }
+
+    /// Extract text from a rectangular block region.
+    ///
+    /// Returns one string per line (the column slice), joined with newlines.
+    /// Lines shorter than `left_col` contribute an empty string.
+    fn extract_block_text(
+        &self,
+        start_line: usize,
+        end_line: usize,
+        left: usize,
+        right: usize,
+    ) -> String {
+        let mut parts = Vec::with_capacity(end_line - start_line + 1);
+        for line_idx in start_line..=end_line {
+            let line_len = self.buffer.line_content_len(line_idx).unwrap_or(0);
+            if left >= line_len {
+                parts.push(String::new());
+            } else {
+                let end_col = (right + 1).min(line_len);
+                let range = Range::new(
+                    Position::new(line_idx, left),
+                    Position::new(line_idx, end_col),
+                );
+                let s = self
+                    .buffer
+                    .slice(range)
+                    .map(|sl| sl.to_string())
+                    .unwrap_or_default();
+                parts.push(s);
+            }
+        }
+        parts.join("\n")
+    }
+
+    /// Delete a rectangular block from the buffer, recording history.
+    ///
+    /// Iterates lines in reverse order for position stability. Returns the
+    /// extracted text (newline-joined column slices).
+    fn delete_block(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+        left: usize,
+        right: usize,
+    ) -> String {
+        let text = self.extract_block_text(start_line, end_line, left, right);
+
+        self.history.begin(self.cursor.position());
+        for line_idx in (start_line..=end_line).rev() {
+            let line_len = self.buffer.line_content_len(line_idx).unwrap_or(0);
+            if left >= line_len {
+                continue;
+            }
+            let end_col = (right + 1).min(line_len);
+            let range = Range::new(
+                Position::new(line_idx, left),
+                Position::new(line_idx, end_col),
+            );
+            let deleted = self
+                .buffer
+                .slice(range)
+                .map(|sl| sl.to_string())
+                .unwrap_or_default();
+            self.history
+                .record_delete(Position::new(line_idx, left), &deleted);
+            self.buffer.delete(range);
+        }
+
+        text
+    }
+
+    /// Pad a line with spaces so that column `col` is reachable, then
+    /// insert `text` at that column. Records history.
+    fn insert_at_col_with_pad(&mut self, line: usize, col: usize, text: &str) {
+        let line_len = self.buffer.line_content_len(line).unwrap_or(0);
+        if col > line_len {
+            let pad: String = " ".repeat(col - line_len);
+            let pad_pos = Position::new(line, line_len);
+            self.history.record_insert(pad_pos, &pad);
+            self.buffer.insert(pad_pos, &pad);
+        }
+        let pos = Position::new(line, col);
+        self.history.record_insert(pos, text);
+        self.buffer.insert(pos, text);
+    }
+
     // ── Visual operators ─────────────────────────────────────────────────
 
     /// Delete the visual selection (`d` / `x` in visual mode).
@@ -3542,20 +3678,20 @@ impl Editor {
         let Mode::Visual(kind) = self.mode else { return };
 
         if kind == VisualKind::Block {
-            self.set_error("Block operations not yet supported");
-            self.cursor.clear_anchor();
-            self.mode = Mode::Normal;
+            self.visual_block_delete();
             return;
         }
 
         let reg_kind = match kind {
             VisualKind::Char => RegisterKind::Char,
-            VisualKind::Line | VisualKind::Block => RegisterKind::Line,
+            VisualKind::Line => RegisterKind::Line,
+            VisualKind::Block => unreachable!(),
         };
 
         let range = match kind {
             VisualKind::Char => self.visual_char_range(),
-            VisualKind::Line | VisualKind::Block => self.visual_line_range(),
+            VisualKind::Line => self.visual_line_range(),
+            VisualKind::Block => unreachable!(),
         };
 
         let Some(range) = range else {
@@ -3595,14 +3731,36 @@ impl Editor {
         self.mode = Mode::Normal;
     }
 
+    /// Delete the visual block selection.
+    fn visual_block_delete(&mut self) {
+        let Some((start_line, end_line, left, right)) = self.visual_block_coords() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let text = self.delete_block(start_line, end_line, left, right);
+
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text, RegisterKind::Block);
+        if RegisterFile::is_clipboard(reg_name) {
+            clipboard_write(self.registers.get(reg_name).content());
+        }
+
+        self.cursor.clear_anchor();
+        self.cursor
+            .set_position(Position::new(start_line, left), &self.buffer, false);
+        self.cursor.clamp(&self.buffer, false);
+        self.commit_history();
+        self.mode = Mode::Normal;
+    }
+
     /// Yank the visual selection (`y` in visual mode).
     fn visual_yank(&mut self) {
         let Mode::Visual(kind) = self.mode else { return };
 
         if kind == VisualKind::Block {
-            self.set_error("Block operations not yet supported");
-            self.cursor.clear_anchor();
-            self.mode = Mode::Normal;
+            self.visual_block_yank();
             return;
         }
 
@@ -3615,7 +3773,7 @@ impl Editor {
                 };
                 (r, RegisterKind::Char)
             }
-            VisualKind::Line | VisualKind::Block => {
+            VisualKind::Line => {
                 // For yank, we want the clean line range (full lines).
                 let Some(r) = self.cursor.selection() else {
                     self.cursor.clear_anchor();
@@ -3632,6 +3790,7 @@ impl Editor {
                 };
                 (Range::new(start, end), RegisterKind::Line)
             }
+            VisualKind::Block => unreachable!(),
         };
 
         let text = self
@@ -3665,6 +3824,33 @@ impl Editor {
         }
     }
 
+    /// Yank the visual block selection.
+    fn visual_block_yank(&mut self) {
+        let Some((start_line, end_line, left, right)) = self.visual_block_coords() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let text = self.extract_block_text(start_line, end_line, left, right);
+        let line_count = end_line - start_line + 1;
+
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text, RegisterKind::Block);
+        if RegisterFile::is_clipboard(reg_name) {
+            clipboard_write(self.registers.get(reg_name).content());
+        }
+
+        self.cursor.clear_anchor();
+        self.cursor
+            .set_position(Position::new(start_line, left), &self.buffer, false);
+        self.mode = Mode::Normal;
+
+        if line_count > 1 {
+            self.set_message(format!("{line_count} lines yanked"));
+        }
+    }
+
     /// Change the visual selection (`c` in visual mode).
     ///
     /// Deletes the selection and enters insert mode.
@@ -3672,20 +3858,20 @@ impl Editor {
         let Mode::Visual(kind) = self.mode else { return };
 
         if kind == VisualKind::Block {
-            self.set_error("Block operations not yet supported");
-            self.cursor.clear_anchor();
-            self.mode = Mode::Normal;
+            self.visual_block_change();
             return;
         }
 
         let reg_kind = match kind {
             VisualKind::Char => RegisterKind::Char,
-            VisualKind::Line | VisualKind::Block => RegisterKind::Line,
+            VisualKind::Line => RegisterKind::Line,
+            VisualKind::Block => unreachable!(),
         };
 
         let range = match kind {
             VisualKind::Char => self.visual_char_range(),
-            VisualKind::Line | VisualKind::Block => self.visual_line_range(),
+            VisualKind::Line => self.visual_line_range(),
+            VisualKind::Block => unreachable!(),
         };
 
         let Some(range) = range else {
@@ -3723,6 +3909,153 @@ impl Editor {
         // Begin a new transaction for the insert session.
         self.history.begin(self.cursor.position());
         self.mode = Mode::Insert;
+    }
+
+    /// Change the visual block selection.
+    ///
+    /// Deletes the rectangular block and enters insert mode on the first
+    /// line. On Escape, the typed text is replayed on all other lines.
+    fn visual_block_change(&mut self) {
+        let Some((start_line, end_line, left, right)) = self.visual_block_coords() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let text = self.delete_block(start_line, end_line, left, right);
+
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text, RegisterKind::Block);
+        if RegisterFile::is_clipboard(reg_name) {
+            clipboard_write(self.registers.get(reg_name).content());
+        }
+
+        self.cursor.clear_anchor();
+        self.cursor
+            .set_position(Position::new(start_line, left), &self.buffer, true);
+        self.cursor.clamp(&self.buffer, true);
+        self.commit_history();
+
+        // Set up block insert replay for the remaining lines.
+        let other_lines: Vec<usize> = ((start_line + 1)..=end_line).collect();
+        if !other_lines.is_empty() {
+            self.block_insert = Some(BlockInsert {
+                lines: other_lines,
+                col: left,
+                start_col: left,
+            });
+        }
+
+        // Begin a new transaction for the insert session.
+        self.history.begin(self.cursor.position());
+        self.mode = Mode::Insert;
+    }
+
+    /// Enter insert mode at the left edge of the block (`I` in visual block).
+    fn visual_block_insert(&mut self) {
+        let Some((start_line, end_line, left, _right)) = self.visual_block_coords() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let other_lines: Vec<usize> = ((start_line + 1)..=end_line).collect();
+        self.cursor.clear_anchor();
+        self.cursor
+            .set_position(Position::new(start_line, left), &self.buffer, true);
+
+        if !other_lines.is_empty() {
+            self.block_insert = Some(BlockInsert {
+                lines: other_lines,
+                col: left,
+                start_col: left,
+            });
+        }
+
+        self.history.begin(self.cursor.position());
+        self.mode = Mode::Insert;
+    }
+
+    /// Enter insert mode at the right edge + 1 of the block (`A` in visual block).
+    fn visual_block_append(&mut self) {
+        let Some((start_line, end_line, _left, right)) = self.visual_block_coords() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let insert_col = right + 1;
+        let other_lines: Vec<usize> = ((start_line + 1)..=end_line).collect();
+
+        self.cursor.clear_anchor();
+        // Pad the first line if needed so cursor can be placed at insert_col.
+        let first_line_len = self.buffer.line_content_len(start_line).unwrap_or(0);
+        if insert_col > first_line_len {
+            let pad: String = " ".repeat(insert_col - first_line_len);
+            let pad_pos = Position::new(start_line, first_line_len);
+            self.history.begin(self.cursor.position());
+            self.history.record_insert(pad_pos, &pad);
+            self.buffer.insert(pad_pos, &pad);
+            self.commit_history();
+        }
+
+        self.cursor
+            .set_position(Position::new(start_line, insert_col), &self.buffer, true);
+
+        if !other_lines.is_empty() {
+            self.block_insert = Some(BlockInsert {
+                lines: other_lines,
+                col: insert_col,
+                start_col: insert_col,
+            });
+        }
+
+        self.history.begin(self.cursor.position());
+        self.mode = Mode::Insert;
+    }
+
+    /// Replay block-insert text on all stored lines.
+    ///
+    /// Called on Escape from insert mode when `block_insert` is active.
+    /// Extracts the text typed on the first line (from `start_col` to the
+    /// current cursor position) and inserts it at `col` on each other line,
+    /// padding shorter lines with spaces as needed.
+    fn replay_block_insert(&mut self) {
+        let Some(bi) = self.block_insert.take() else {
+            return;
+        };
+
+        // The cursor is still on the line where the user typed (before
+        // move_left in Escape handling). Extract what was typed.
+        let cur_line = self.cursor.line();
+        let cur_col = self.cursor.col();
+
+        if cur_col <= bi.start_col {
+            // User deleted everything or moved backward — nothing to replay.
+            return;
+        }
+
+        let typed_range = Range::new(
+            Position::new(cur_line, bi.start_col),
+            Position::new(cur_line, cur_col),
+        );
+        let typed_text = match self.buffer.slice(typed_range) {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+
+        if typed_text.is_empty() {
+            return;
+        }
+
+        // Replay on all other lines within a single history transaction.
+        self.history.begin(self.cursor.position());
+        for &line in &bi.lines {
+            if line < self.buffer.line_count() {
+                self.insert_at_col_with_pad(line, bi.col, &typed_text);
+            }
+        }
+        self.commit_history();
     }
 
     /// Indent the visual selection (`>` in visual mode).
@@ -3985,8 +4318,15 @@ impl Editor {
         }
 
         let single = reg.content().to_string();
-        let text = single.repeat(count);
         let kind = reg.kind();
+
+        // Block paste: insert each row as a column at cursor.col + 1.
+        if kind == RegisterKind::Block {
+            self.paste_block(&single, self.cursor.col() + 1, count);
+            return;
+        }
+
+        let text = single.repeat(count);
 
         let pos = match kind {
             RegisterKind::Char => {
@@ -4008,6 +4348,7 @@ impl Editor {
                     Position::new(self.cursor.line(), len)
                 }
             }
+            RegisterKind::Block => unreachable!(),
         };
 
         self.history.begin(self.cursor.position());
@@ -4056,12 +4397,20 @@ impl Editor {
         }
 
         let single = reg.content().to_string();
-        let text = single.repeat(count);
         let kind = reg.kind();
+
+        // Block paste: insert each row as a column at cursor.col.
+        if kind == RegisterKind::Block {
+            self.paste_block(&single, self.cursor.col(), count);
+            return;
+        }
+
+        let text = single.repeat(count);
 
         let pos = match kind {
             RegisterKind::Char => self.cursor.position(),
             RegisterKind::Line => Position::new(self.cursor.line(), 0),
+            RegisterKind::Block => unreachable!(),
         };
 
         self.history.begin(self.cursor.position());
@@ -4075,6 +4424,46 @@ impl Editor {
             self.cursor.set_position(end, &self.buffer, false);
         }
 
+        self.cursor.clamp(&self.buffer, false);
+        self.commit_history();
+    }
+
+    /// Paste a block register as a column at the given column.
+    ///
+    /// Each newline-separated row from `content` is inserted on successive
+    /// buffer lines starting at `self.cursor.line()`. Lines shorter than
+    /// `col` are padded with spaces. If the buffer has fewer lines than the
+    /// block, new lines are created.
+    fn paste_block(&mut self, content: &str, col: usize, count: usize) {
+        let rows: Vec<&str> = content.split('\n').collect();
+        if rows.is_empty() {
+            return;
+        }
+
+        // Build the repeated row text for count > 1.
+        let repeated: Vec<String> = rows.iter().map(|r| r.repeat(count)).collect();
+
+        let start_line = self.cursor.line();
+        self.history.begin(self.cursor.position());
+
+        for (i, row_text) in repeated.iter().enumerate() {
+            let target_line = start_line + i;
+
+            // Create new lines if needed.
+            if target_line >= self.buffer.line_count() {
+                let last_line = self.buffer.line_count() - 1;
+                let last_len = self.buffer.line_len(last_line).unwrap_or(0);
+                let nl_pos = Position::new(last_line, last_len);
+                self.history.record_insert(nl_pos, "\n");
+                self.buffer.insert(nl_pos, "\n");
+            }
+
+            self.insert_at_col_with_pad(target_line, col, row_text);
+        }
+
+        // Cursor goes to (start_line, col).
+        self.cursor
+            .set_position(Position::new(start_line, col), &self.buffer, false);
         self.cursor.clamp(&self.buffer, false);
         self.commit_history();
     }
@@ -9288,5 +9677,461 @@ mod tests {
         let top_before = e.view.top_line();
         feed(&mut e, &[event]);
         assert_eq!(e.view.top_line(), top_before);
+    }
+
+    // ── Visual block operations ───────────────────────────────────────────
+
+    /// Enter visual block mode selecting a rectangular region.
+    ///
+    /// Starts at (start_line, start_col), enters Ctrl-V, then moves to
+    /// (end_line, end_col) via motions. Returns the editor in visual block.
+    fn enter_block_mode(text: &str, start_line: usize, start_col: usize,
+                        end_line: usize, end_col: usize) -> Editor {
+        let mut e = editor_with(text);
+        // Navigate to start position.
+        for _ in 0..start_line {
+            feed(&mut e, &[press('j')]);
+        }
+        for _ in 0..start_col {
+            feed(&mut e, &[press('l')]);
+        }
+        // Enter visual block mode.
+        feed(&mut e, &[ctrl('v')]);
+        // Navigate to end position.
+        if end_line > start_line {
+            for _ in 0..(end_line - start_line) {
+                feed(&mut e, &[press('j')]);
+            }
+        }
+        if end_col > start_col {
+            for _ in 0..(end_col - start_col) {
+                feed(&mut e, &[press('l')]);
+            }
+        } else if end_col < start_col {
+            for _ in 0..(start_col - end_col) {
+                feed(&mut e, &[press('h')]);
+            }
+        }
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Block)));
+        e
+    }
+
+    // -- Block delete (d/x) --
+
+    #[test]
+    fn block_delete_basic() {
+        // Delete a 2x3 block from:
+        // "hello world\nfoo bar baz\nqux quux"
+        // Block: lines 0-1, cols 2-4 → "llo"/"o b"
+        let mut e = enter_block_mode("hello world\nfoo bar baz\nqux quux", 0, 2, 1, 4);
+        feed(&mut e, &[press('d')]);
+        assert!(matches!(e.mode, Mode::Normal));
+        assert_eq!(e.buffer.contents(), "he world\nfoar baz\nqux quux");
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn block_delete_short_lines() {
+        // Lines shorter than the block's left edge are untouched.
+        let mut e = enter_block_mode("abcdefgh\nab\nabcdefgh", 0, 3, 2, 5);
+        feed(&mut e, &[press('d')]);
+        assert_eq!(e.buffer.contents(), "abcgh\nab\nabcgh");
+    }
+
+    #[test]
+    fn block_delete_single_line() {
+        let mut e = enter_block_mode("hello world", 0, 1, 0, 3);
+        feed(&mut e, &[press('d')]);
+        assert_eq!(e.buffer.contents(), "ho world");
+    }
+
+    #[test]
+    fn block_delete_x_same_as_d() {
+        let mut e = enter_block_mode("hello world\nfoo bar baz", 0, 2, 1, 4);
+        feed(&mut e, &[press('x')]);
+        assert_eq!(e.buffer.contents(), "he world\nfoar baz");
+    }
+
+    #[test]
+    fn block_delete_stores_in_register() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('d')]);
+        let reg = e.registers.get(None);
+        assert_eq!(reg.content(), "ell\norl\nooo");
+        assert_eq!(reg.kind(), RegisterKind::Block);
+    }
+
+    #[test]
+    fn block_delete_named_register() {
+        let mut e = enter_block_mode("abcde\nfghij", 0, 1, 1, 3);
+        // "a before d to store in register a
+        feed(&mut e, &[press('"'), press('a'), press('d')]);
+        assert_eq!(e.registers.get(Some('a')).content(), "bcd\nghi");
+        assert_eq!(e.registers.get(Some('a')).kind(), RegisterKind::Block);
+    }
+
+    #[test]
+    fn block_delete_undo() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        feed(&mut e, &[press('d')]);
+        assert_eq!(e.buffer.contents(), "ho\nwd");
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "hello\nworld");
+    }
+
+    #[test]
+    fn block_delete_cursor_at_top_left() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 2, 2, 4);
+        feed(&mut e, &[press('d')]);
+        assert_eq!(e.cursor.line(), 0);
+        // "hello" → delete cols 2-4 → "he" (2 chars). Col 2 is out of
+        // bounds, so clamp to col 1 (last valid position in normal mode).
+        assert_eq!(e.cursor.col(), 1);
+    }
+
+    // -- Block yank (y) --
+
+    #[test]
+    fn block_yank_basic() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('y')]);
+        assert!(matches!(e.mode, Mode::Normal));
+        // Buffer unchanged.
+        assert_eq!(e.buffer.contents(), "hello\nworld\nfoooo");
+        // Register has the block text.
+        let reg = e.registers.get(None);
+        assert_eq!(reg.content(), "ell\norl\nooo");
+        assert_eq!(reg.kind(), RegisterKind::Block);
+    }
+
+    #[test]
+    fn block_yank_cursor_at_top_left() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 2, 2, 4);
+        feed(&mut e, &[press('y')]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn block_yank_short_lines_empty_rows() {
+        let mut e = enter_block_mode("abcdef\nab\nabcdef", 0, 3, 2, 5);
+        feed(&mut e, &[press('y')]);
+        let reg = e.registers.get(None);
+        assert_eq!(reg.content(), "def\n\ndef");
+    }
+
+    #[test]
+    fn block_yank_message() {
+        let mut e = enter_block_mode("aaa\nbbb\nccc", 0, 0, 2, 2);
+        feed(&mut e, &[press('y')]);
+        assert_eq!(e.message, Some("3 lines yanked".to_string()));
+    }
+
+    #[test]
+    fn block_yank_single_line_no_message() {
+        let mut e = enter_block_mode("hello world", 0, 1, 0, 3);
+        feed(&mut e, &[press('y')]);
+        assert!(e.message.is_none());
+    }
+
+    // -- Block change (c) --
+
+    #[test]
+    fn block_change_enters_insert() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('c')]);
+        assert!(matches!(e.mode, Mode::Insert));
+        // Block columns deleted.
+        assert_eq!(e.buffer.contents(), "ho\nwd\nfo");
+        // Cursor at top-left of deleted block.
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 1);
+    }
+
+    #[test]
+    fn block_change_replay_on_escape() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('c')]);
+        // Type replacement text on the first line.
+        feed(&mut e, &[press('X'), press('Y')]);
+        // Escape → text is replayed on lines 1 and 2.
+        feed(&mut e, &[esc()]);
+        assert!(matches!(e.mode, Mode::Normal));
+        assert_eq!(e.buffer.contents(), "hXYo\nwXYd\nfXYo");
+    }
+
+    #[test]
+    fn block_change_replay_single_char() {
+        let mut e = enter_block_mode("aaa\nbbb\nccc", 0, 1, 2, 1);
+        feed(&mut e, &[press('c')]);
+        feed(&mut e, &[press('Z')]);
+        feed(&mut e, &[esc()]);
+        assert_eq!(e.buffer.contents(), "aZa\nbZb\ncZc");
+    }
+
+    #[test]
+    fn block_change_stores_in_register() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        feed(&mut e, &[press('c')]);
+        let reg = e.registers.get(None);
+        assert_eq!(reg.content(), "ell\norl");
+        assert_eq!(reg.kind(), RegisterKind::Block);
+    }
+
+    #[test]
+    fn block_change_undo_restores_all() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('c'), press('X'), press('Y'), esc()]);
+        assert_eq!(e.buffer.contents(), "hXYo\nwXYd\nfXYo");
+        // Undo the replay.
+        feed(&mut e, &[press('u')]);
+        // Undo the insert.
+        feed(&mut e, &[press('u')]);
+        // Undo the delete.
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "hello\nworld\nfoooo");
+    }
+
+    // -- Block insert (I) --
+
+    #[test]
+    fn block_insert_basic() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 2, 2, 4);
+        feed(&mut e, &[press('I')]);
+        assert!(matches!(e.mode, Mode::Insert));
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 2);
+        // Type text and Escape.
+        feed(&mut e, &[press('X'), press('X'), esc()]);
+        assert!(matches!(e.mode, Mode::Normal));
+        // "XX" inserted at col 2 on all three lines.
+        assert_eq!(e.buffer.contents(), "heXXllo\nwoXXrld\nfoXXooo");
+    }
+
+    #[test]
+    fn block_insert_single_char() {
+        let mut e = enter_block_mode("aaa\nbbb\nccc", 0, 1, 2, 2);
+        feed(&mut e, &[press('I'), press('|'), esc()]);
+        assert_eq!(e.buffer.contents(), "a|aa\nb|bb\nc|cc");
+    }
+
+    #[test]
+    fn block_insert_undo() {
+        let mut e = enter_block_mode("aaa\nbbb\nccc", 0, 0, 2, 1);
+        feed(&mut e, &[press('I'), press('>'), esc()]);
+        assert_eq!(e.buffer.contents(), ">aaa\n>bbb\n>ccc");
+        // Undo replay.
+        feed(&mut e, &[press('u')]);
+        // Undo first-line insert.
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+    }
+
+    #[test]
+    fn block_insert_short_lines_padded() {
+        // Line 1 is shorter than the insert column.
+        let mut e = enter_block_mode("abcdef\nab\nabcdef", 0, 3, 2, 5);
+        feed(&mut e, &[press('I'), press('|'), esc()]);
+        // Line 0: "abc|def", Line 1: "ab |" (padded to col 3), Line 2: "abc|def"
+        assert_eq!(e.buffer.contents(), "abc|def\nab |\nabc|def");
+    }
+
+    // -- Block append (A) --
+
+    #[test]
+    fn block_append_basic() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 2, 2, 4);
+        feed(&mut e, &[press('A')]);
+        assert!(matches!(e.mode, Mode::Insert));
+        // Cursor at col 5 (right + 1) on line 0.
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 5);
+        feed(&mut e, &[press('!'), esc()]);
+        assert_eq!(e.buffer.contents(), "hello!\nworld!\nfoooo!");
+    }
+
+    #[test]
+    fn block_append_short_lines_padded() {
+        // Line 1 is shorter than right_col + 1.
+        let mut e = enter_block_mode("abcdef\nab\nabcdef", 0, 3, 2, 5);
+        feed(&mut e, &[press('A')]);
+        feed(&mut e, &[press('!'), esc()]);
+        // Line 0: "abcdef!", Line 1: "ab    !" (padded), Line 2: "abcdef!"
+        assert_eq!(e.buffer.contents(), "abcdef!\nab    !\nabcdef!");
+    }
+
+    #[test]
+    fn block_append_undo() {
+        let mut e = enter_block_mode("aaa\nbbb\nccc", 0, 0, 2, 2);
+        feed(&mut e, &[press('A'), press('!'), esc()]);
+        assert_eq!(e.buffer.contents(), "aaa!\nbbb!\nccc!");
+        feed(&mut e, &[press('u')]);
+        feed(&mut e, &[press('u')]);
+        // Undo pad on first line if any.
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+    }
+
+    // -- Block paste (p/P) --
+
+    #[test]
+    fn block_paste_after() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('y')]);
+        // Cursor at (0, 1). p pastes block at col 2.
+        // "ell" inserted at col 2 of "hello": "he"+"ell"+"llo" = "heellllo"
+        feed(&mut e, &[press('p')]);
+        assert_eq!(e.buffer.contents(), "heellllo\nwoorlrld\nfooooooo");
+    }
+
+    #[test]
+    fn block_paste_before() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('y')]);
+        // P pastes block at col 1 (cursor col).
+        // "ell" inserted at col 1 of "hello": "h"+"ell"+"ello" = "hellello"
+        feed(&mut e, &[press('P')]);
+        assert_eq!(e.buffer.contents(), "hellello\nworlorld\nfooooooo");
+    }
+
+    #[test]
+    fn block_paste_creates_new_lines() {
+        // Yank a 3-line block, paste at last line.
+        let mut e = enter_block_mode("aa\nbb\ncc", 0, 0, 2, 1);
+        feed(&mut e, &[press('y')]);
+        // Move to last line.
+        feed(&mut e, &[press('G')]);
+        feed(&mut e, &[press('p')]);
+        // "cc" gets "aa" pasted, and two new lines with "bb" and "cc".
+        assert_eq!(e.buffer.contents(), "aa\nbb\ncaac\n bb\n cc");
+    }
+
+    #[test]
+    fn block_paste_pads_short_lines() {
+        // "x" on line 1 has content_len=1. Cursor at (1,0) can't move to
+        // col 1 in visual mode (pe=false). Block is (0,0)-(1,0), 1 column.
+        // Content: "a\nx". After yank, cursor at (0,0). Move to line 1.
+        // p pastes at col 1: "a" at (1,1) → "xa", "x" at (2,1) → " x".
+        let mut e = editor_with("abcd\nx");
+        feed(&mut e, &[ctrl('v'), press('j'), press('l')]);
+        feed(&mut e, &[press('y')]);
+        feed(&mut e, &[press('j'), press('p')]);
+        // Line 1: "x" + "a" at col 1 → "xa" (2 chars).
+        assert_eq!(e.buffer.line_content_len(1).unwrap(), 2);
+    }
+
+    #[test]
+    fn block_paste_undo() {
+        let mut e = enter_block_mode("ab\ncd", 0, 0, 1, 1);
+        feed(&mut e, &[press('y')]);
+        feed(&mut e, &[press('p')]);
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "ab\ncd");
+    }
+
+    // -- Interaction: block + modes --
+
+    #[test]
+    fn block_escape_cancels() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        feed(&mut e, &[esc()]);
+        assert!(matches!(e.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn block_o_swaps_anchor() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        let pos_before = e.cursor.position();
+        feed(&mut e, &[press('o')]);
+        let pos_after = e.cursor.position();
+        // Cursor and anchor should swap.
+        assert_ne!(pos_before, pos_after);
+    }
+
+    #[test]
+    fn block_v_switches_to_char_visual() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        feed(&mut e, &[press('v')]);
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Char)));
+    }
+
+    #[test]
+    fn block_shift_v_switches_to_line_visual() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        feed(&mut e, &[press('V')]);
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Line)));
+    }
+
+    #[test]
+    fn block_ctrlv_toggles_off() {
+        let mut e = enter_block_mode("hello\nworld", 0, 1, 1, 3);
+        feed(&mut e, &[ctrl('v')]);
+        assert!(matches!(e.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn block_change_no_replay_on_single_line() {
+        // Block change on a single line should NOT set block_insert.
+        let mut e = enter_block_mode("hello world", 0, 2, 0, 4);
+        feed(&mut e, &[press('c')]);
+        assert!(matches!(e.mode, Mode::Insert));
+        feed(&mut e, &[press('X'), esc()]);
+        assert_eq!(e.buffer.contents(), "heX world");
+    }
+
+    #[test]
+    fn block_insert_no_replay_on_single_line() {
+        let mut e = enter_block_mode("hello world", 0, 2, 0, 4);
+        feed(&mut e, &[press('I')]);
+        feed(&mut e, &[press('|'), esc()]);
+        assert_eq!(e.buffer.contents(), "he|llo world");
+    }
+
+    #[test]
+    fn block_delete_entire_line_content() {
+        // Block spans entire line content (col 0 to end).
+        let mut e = editor_with("abc\ndef\nghi");
+        feed(&mut e, &[ctrl('v'), press('j'), press('j'), press('$')]);
+        feed(&mut e, &[press('d')]);
+        // Should delete all content from each line up to the block width.
+        // $ makes right_col = max line length. But col is char-based.
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn block_yank_named_register() {
+        let mut e = enter_block_mode("abcde\nfghij\nklmno", 0, 1, 2, 3);
+        feed(&mut e, &[press('"'), press('b'), press('y')]);
+        let reg = e.registers.get(Some('b'));
+        assert_eq!(reg.content(), "bcd\nghi\nlmn");
+        assert_eq!(reg.kind(), RegisterKind::Block);
+    }
+
+    #[test]
+    fn block_change_empty_insert_no_replay() {
+        // Block change, then immediately Escape (no text typed).
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 1, 2, 3);
+        feed(&mut e, &[press('c'), esc()]);
+        // Only deletion happened, no replay.
+        assert_eq!(e.buffer.contents(), "ho\nwd\nfo");
+    }
+
+    #[test]
+    fn block_insert_empty_no_replay() {
+        // Block I, then immediately Escape.
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 2, 2, 4);
+        feed(&mut e, &[press('I'), esc()]);
+        // Buffer unchanged.
+        assert_eq!(e.buffer.contents(), "hello\nworld\nfoooo");
+    }
+
+    #[test]
+    fn block_append_empty_no_replay() {
+        let mut e = enter_block_mode("hello\nworld\nfoooo", 0, 2, 2, 4);
+        feed(&mut e, &[press('A'), esc()]);
+        // Buffer unchanged (except possible padding on first line).
+        assert_eq!(e.buffer.contents(), "hello\nworld\nfoooo");
     }
 }

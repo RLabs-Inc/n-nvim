@@ -27,6 +27,12 @@ pub enum RegisterKind {
     /// Line-wise (from `V` visual or `dd`).
     /// Paste inserts entire lines above or below the cursor line.
     Line,
+
+    /// Block-wise (from `Ctrl-V` visual block).
+    /// Content is newline-separated column slices — one per block row.
+    /// Paste inserts each slice as a column at the cursor position on
+    /// successive buffer lines, padding shorter lines with spaces.
+    Block,
 }
 
 /// A single register slot — holds text and its capture kind.
@@ -61,13 +67,20 @@ impl Register {
     /// If either the existing content or the appended text is line-wise,
     /// the register becomes line-wise and a newline separator is inserted.
     pub fn append(&mut self, text: &str, kind: RegisterKind) {
-        if kind == RegisterKind::Line || self.kind == RegisterKind::Line {
+        if matches!(kind, RegisterKind::Line | RegisterKind::Block)
+            || matches!(self.kind, RegisterKind::Line | RegisterKind::Block)
+        {
             // Ensure existing content ends with newline before appending.
             if !self.content.is_empty() && !self.content.ends_with('\n') {
                 self.content.push('\n');
             }
             self.content.push_str(text);
-            self.kind = RegisterKind::Line;
+            // Block + Block stays Block; any Line involvement → Line.
+            if kind == RegisterKind::Block && self.kind == RegisterKind::Block {
+                // stays Block
+            } else {
+                self.kind = RegisterKind::Line;
+            }
         } else {
             self.content.push_str(text);
         }
@@ -313,10 +326,21 @@ mod tests {
     }
 
     #[test]
+    fn yank_block_stores_content() {
+        let mut reg = Register::new();
+        reg.yank("abc\ndef\nghi".into(), RegisterKind::Block);
+        assert_eq!(reg.content(), "abc\ndef\nghi");
+        assert_eq!(reg.kind(), RegisterKind::Block);
+    }
+
+    #[test]
     fn register_kind_equality() {
         assert_eq!(RegisterKind::Char, RegisterKind::Char);
         assert_eq!(RegisterKind::Line, RegisterKind::Line);
+        assert_eq!(RegisterKind::Block, RegisterKind::Block);
         assert_ne!(RegisterKind::Char, RegisterKind::Line);
+        assert_ne!(RegisterKind::Char, RegisterKind::Block);
+        assert_ne!(RegisterKind::Line, RegisterKind::Block);
     }
 
     #[test]
@@ -389,6 +413,24 @@ mod tests {
         reg.yank("line one\n".into(), RegisterKind::Line);
         reg.append("line two\n", RegisterKind::Line);
         assert_eq!(reg.content(), "line one\nline two\n");
+        assert_eq!(reg.kind(), RegisterKind::Line);
+    }
+
+    #[test]
+    fn append_block_to_block_stays_block() {
+        let mut reg = Register::new();
+        reg.yank("abc".into(), RegisterKind::Block);
+        reg.append("def", RegisterKind::Block);
+        assert_eq!(reg.content(), "abc\ndef");
+        assert_eq!(reg.kind(), RegisterKind::Block);
+    }
+
+    #[test]
+    fn append_line_to_block_upgrades_to_line() {
+        let mut reg = Register::new();
+        reg.yank("abc".into(), RegisterKind::Block);
+        reg.append("line\n", RegisterKind::Line);
+        assert_eq!(reg.content(), "abc\nline\n");
         assert_eq!(reg.kind(), RegisterKind::Line);
     }
 
