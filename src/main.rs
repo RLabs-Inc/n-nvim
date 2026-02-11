@@ -69,6 +69,27 @@ enum Pending {
     TextObject { op: char, inner: bool, count: usize },
 }
 
+// ─── Dot-repeat ─────────────────────────────────────────────────────────────
+
+/// Recorded state of the last buffer-modifying change, for `.` (dot-repeat).
+///
+/// The key sequence has all digit keys stripped out — counts are tracked
+/// separately so that a count before `.` can override the original.
+///
+/// Examples:
+///
+///   `2d3w`        → count=Some(6), keys=[d, w]
+///   `dw`          → count=None,    keys=[d, w]
+///   `x`           → count=None,    keys=[x]
+///   `ihello<Esc>` → count=None,    keys=[i, h, e, l, l, o, Esc]
+#[derive(Clone)]
+struct DotRepeat {
+    /// The effective count for the change. `None` means no explicit count.
+    count: Option<usize>,
+    /// Key sequence with all count digits removed.
+    keys: Vec<KeyEvent>,
+}
+
 // ─── Editor ─────────────────────────────────────────────────────────────────
 
 /// The editor application state.
@@ -121,6 +142,24 @@ struct Editor {
     /// Direction of the last search. Used by `n` (same direction) and `N`
     /// (opposite direction).
     last_search_direction: SearchDirection,
+
+    /// True when recording keys for dot-repeat. Insert-mode keys are
+    /// recorded verbatim; normal-mode digit keys are excluded (counts
+    /// are tracked separately in `dot_effective_count`).
+    dot_recording: bool,
+
+    /// Accumulated key sequence for the change being recorded.
+    dot_keys: Vec<KeyEvent>,
+
+    /// Effective count for the change being recorded (`op_count × motion_count`).
+    dot_effective_count: Option<usize>,
+
+    /// The last completed change, ready for `.` replay.
+    last_change: Option<DotRepeat>,
+
+    /// True during `.` replay — suppresses recording so replayed keys
+    /// don't overwrite `last_change`.
+    dot_replaying: bool,
 }
 
 impl Editor {
@@ -142,6 +181,11 @@ impl Editor {
             search: None,
             last_search: String::new(),
             last_search_direction: SearchDirection::Forward,
+            dot_recording: false,
+            dot_keys: Vec::new(),
+            dot_effective_count: None,
+            last_change: None,
+            dot_replaying: false,
         }
     }
 
@@ -168,6 +212,11 @@ impl Editor {
             search: None,
             last_search: String::new(),
             last_search_direction: SearchDirection::Forward,
+            dot_recording: false,
+            dot_keys: Vec::new(),
+            dot_effective_count: None,
+            last_change: None,
+            dot_replaying: false,
         }
     }
 
@@ -208,6 +257,95 @@ impl Editor {
         let current = self.count.unwrap_or(0);
         // Cap at a reasonable maximum to prevent overflow from mashing digits.
         self.count = Some(current.saturating_mul(10).saturating_add(digit as usize));
+    }
+
+    // ── Dot-repeat recording ────────────────────────────────────────────
+
+    /// Merge two optional counts by multiplication.
+    ///
+    /// Returns `None` only when both inputs are `None` (no count typed).
+    const fn merge_counts(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+        match (a, b) {
+            (None, None) => None,
+            (Some(x), None) => Some(x),
+            (None, Some(y)) => Some(y),
+            (Some(x), Some(y)) => Some(x.saturating_mul(y)),
+        }
+    }
+
+    /// Start recording a change for dot-repeat.
+    ///
+    /// Saves the initiating key and the raw count. Subsequent keys are
+    /// recorded by [`handle_pending`] and [`handle_insert`].
+    fn dot_start(&mut self, key: &KeyEvent, raw_count: Option<usize>) {
+        if self.dot_replaying {
+            return;
+        }
+        self.dot_recording = true;
+        self.dot_keys.clear();
+        self.dot_keys.push(*key);
+        self.dot_effective_count = raw_count;
+    }
+
+    /// Record a single-key change and finalize immediately.
+    ///
+    /// Used for commands like `x`, `p`, `P` that complete in one key.
+    fn dot_immediate(&mut self, key: &KeyEvent, raw_count: Option<usize>) {
+        if self.dot_replaying {
+            return;
+        }
+        self.dot_recording = false;
+        self.last_change = Some(DotRepeat {
+            count: raw_count,
+            keys: vec![*key],
+        });
+    }
+
+    /// Finalize the current dot-repeat recording.
+    fn dot_finish(&mut self) {
+        if self.dot_replaying {
+            return;
+        }
+        self.dot_recording = false;
+        if self.dot_keys.is_empty() {
+            return;
+        }
+        self.last_change = Some(DotRepeat {
+            count: self.dot_effective_count,
+            keys: self.dot_keys.clone(),
+        });
+    }
+
+    /// Cancel an in-progress dot recording without saving.
+    fn dot_cancel(&mut self) {
+        self.dot_recording = false;
+        self.dot_keys.clear();
+    }
+
+    /// Replay the last change (`.` command).
+    ///
+    /// If `count_override` is `Some`, it replaces the stored count.
+    /// Otherwise the original effective count is reused.
+    fn dot_replay(&mut self, count_override: Option<usize>) -> Action {
+        let Some(change) = self.last_change.clone() else {
+            return Action::Continue;
+        };
+
+        let effective = count_override.or(change.count);
+        self.dot_replaying = true;
+        self.count = effective;
+
+        for key in &change.keys {
+            let event = Event::Key(*key);
+            let action = self.on_event(&event);
+            if matches!(action, Action::Quit) {
+                self.dot_replaying = false;
+                return Action::Quit;
+            }
+        }
+
+        self.dot_replaying = false;
+        Action::Continue
     }
 
     // ── Shared motion dispatch ──────────────────────────────────────────
@@ -352,16 +490,19 @@ impl Editor {
     ///
     /// Digits can appear between operator and motion (e.g., `d3w`). These build
     /// a "motion count" that multiplies with the operator's count.
+    #[allow(clippy::too_many_lines)]
     fn handle_pending(&mut self, pending: Pending, key: &KeyEvent) -> Action {
         match pending {
             Pending::Operator { op, count: op_count } => {
                 // Escape cancels the pending operator and any motion count.
                 if key.code == KeyCode::Escape {
                     self.count = None;
+                    self.dot_cancel();
                     return Action::Continue;
                 }
 
                 // Digit accumulation for motion count (e.g., the `3` in `d3w`).
+                // Digits are NOT recorded — they're folded into dot_effective_count.
                 match key.code {
                     KeyCode::Char(d @ '1'..='9') => {
                         self.push_count_digit(d as u8 - b'0');
@@ -376,16 +517,36 @@ impl Editor {
                     _ => {}
                 }
 
+                // Record this key for dot-repeat (non-digit, non-escape).
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_keys.push(*key);
+                }
+
                 // Same key = line operation (dd, yy, cc).
                 // Effective count: op_count * motion_count.
                 if key.code == KeyCode::Char(op) {
-                    let motion_count = self.take_count();
+                    let raw_motion_count = self.take_raw_count();
+                    let motion_count = raw_motion_count.unwrap_or(1);
                     let effective = op_count * motion_count;
-                    return self.operator_line(op, effective);
+
+                    if self.dot_recording && !self.dot_replaying {
+                        self.dot_effective_count =
+                            Self::merge_counts(self.dot_effective_count, raw_motion_count);
+                    }
+
+                    let action = self.operator_line(op, effective);
+
+                    // Finalize unless the operator entered insert mode (cc).
+                    if self.dot_recording && !self.dot_replaying && self.mode != Mode::Insert
+                    {
+                        self.dot_finish();
+                    }
+
+                    return action;
                 }
 
                 // Text object prefix: i = inner, a = around.
-                // The operator count carries forward.
+                // The operator count carries forward. Recording continues.
                 if key.code == KeyCode::Char('i') {
                     self.pending = Some(Pending::TextObject {
                         op,
@@ -410,24 +571,51 @@ impl Editor {
                 if let Some(range) =
                     self.operator_motion_range(key.code, op, effective, raw_motion_count)
                 {
-                    return self.apply_operator(op, range, false);
+                    if self.dot_recording && !self.dot_replaying {
+                        self.dot_effective_count =
+                            Self::merge_counts(self.dot_effective_count, raw_motion_count);
+                    }
+
+                    let action = self.apply_operator(op, range, false);
+
+                    if self.dot_recording && !self.dot_replaying && self.mode != Mode::Insert
+                    {
+                        self.dot_finish();
+                    }
+
+                    return action;
                 }
 
                 // Unrecognized key — cancel the operator silently.
+                self.dot_cancel();
                 Action::Continue
             }
             Pending::TextObject { op, inner, count: _op_count } => {
                 // Escape cancels.
                 if key.code == KeyCode::Escape {
                     self.count = None;
+                    self.dot_cancel();
                     return Action::Continue;
                 }
 
+                // Record the text object key for dot-repeat.
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_keys.push(*key);
+                }
+
                 if let Some(range) = self.text_object_range(key.code, inner) {
-                    return self.apply_operator(op, range, false);
+                    let action = self.apply_operator(op, range, false);
+
+                    if self.dot_recording && !self.dot_replaying && self.mode != Mode::Insert
+                    {
+                        self.dot_finish();
+                    }
+
+                    return action;
                 }
 
                 // Unrecognized text object key — cancel silently.
+                self.dot_cancel();
                 Action::Continue
             }
         }
@@ -437,6 +625,7 @@ impl Editor {
     ///
     /// `raw_count` is the accumulated numeric prefix — `None` if no digits
     /// were pressed, `Some(n)` otherwise.
+    #[allow(clippy::too_many_lines)]
     fn handle_normal_key(
         &mut self,
         key: &KeyEvent,
@@ -468,50 +657,75 @@ impl Editor {
             }
 
             // -- Mode transitions (all begin a history transaction) --
-            // (Count for i/a/A/I/o/O would repeat the insert on exit — complex,
-            // deferred to dot-repeat session.)
             KeyCode::Char('i') => {
+                self.dot_start(key, raw_count);
                 self.history.begin(self.cursor.position());
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('a') => {
+                self.dot_start(key, raw_count);
                 self.history.begin(self.cursor.position());
                 self.cursor.move_right(1, &self.buffer, true);
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('A') => {
+                self.dot_start(key, raw_count);
                 self.history.begin(self.cursor.position());
                 self.cursor.move_to_line_end(&self.buffer, true);
                 self.mode = Mode::Insert;
             }
             KeyCode::Char('I') => {
+                self.dot_start(key, raw_count);
                 self.history.begin(self.cursor.position());
                 self.cursor.move_to_first_non_blank(&self.buffer, true);
                 self.mode = Mode::Insert;
             }
-            KeyCode::Char('o') => self.open_line_below(),
-            KeyCode::Char('O') => self.open_line_above(),
+            KeyCode::Char('o') => {
+                self.dot_start(key, raw_count);
+                self.open_line_below();
+            }
+            KeyCode::Char('O') => {
+                self.dot_start(key, raw_count);
+                self.open_line_above();
+            }
 
             // -- Operators (enter pending mode with count) --
             KeyCode::Char('d') => {
+                self.dot_start(key, raw_count);
                 self.pending = Some(Pending::Operator { op: 'd', count });
             }
             KeyCode::Char('c') => {
+                self.dot_start(key, raw_count);
                 self.pending = Some(Pending::Operator { op: 'c', count });
             }
             KeyCode::Char('y') => {
+                // Yank is not a buffer change — don't record for dot-repeat.
                 self.pending = Some(Pending::Operator { op: 'y', count });
             }
-            KeyCode::Char('x') => self.delete_chars_at_cursor(count),
+            KeyCode::Char('x') => {
+                self.dot_immediate(key, raw_count);
+                self.delete_chars_at_cursor(count);
+            }
 
-            // -- Yank line shortcut --
+            // -- Yank line shortcut (not a change) --
             KeyCode::Char('Y') => {
                 self.operator_line('y', count);
             }
 
             // -- Paste --
-            KeyCode::Char('p') => self.paste_after(count),
-            KeyCode::Char('P') => self.paste_before(count),
+            KeyCode::Char('p') => {
+                self.dot_immediate(key, raw_count);
+                self.paste_after(count);
+            }
+            KeyCode::Char('P') => {
+                self.dot_immediate(key, raw_count);
+                self.paste_before(count);
+            }
+
+            // -- Dot-repeat --
+            KeyCode::Char('.') => {
+                return self.dot_replay(raw_count);
+            }
 
             // -- Undo --
             KeyCode::Char('u') => {
@@ -858,6 +1072,11 @@ impl Editor {
         // Clear message on first keypress in insert mode.
         self.clear_message();
 
+        // Record all insert-mode keys for dot-repeat (including Esc).
+        if self.dot_recording && !self.dot_replaying {
+            self.dot_keys.push(*key);
+        }
+
         if key.modifiers.contains(Modifiers::CTRL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
@@ -868,6 +1087,12 @@ impl Editor {
                 self.history.commit(self.cursor.position());
                 self.mode = Mode::Normal;
                 self.cursor.move_left(1, &self.buffer, false);
+
+                // Finalize dot-repeat recording (covers i/a/o/O/I/A + text
+                // and c + motion + text).
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_finish();
+                }
             }
 
             KeyCode::Char(ch) => {
@@ -1956,5 +2181,556 @@ fn main() {
     if let Err(e) = event_loop.run(&mut editor) {
         eprintln!("n-nvim: {e}");
         process::exit(1);
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use n_term::input::KeyEventKind;
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    /// Create a key press event for a character.
+    fn press(ch: char) -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Press,
+        })
+    }
+
+    /// Create an Escape key press event.
+    fn esc() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Escape,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Press,
+        })
+    }
+
+    /// Create an Enter key press event.
+    fn enter() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Press,
+        })
+    }
+
+    /// Create a Backspace key press event.
+    fn backspace() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Press,
+        })
+    }
+
+    /// Feed a sequence of events to the editor.
+    fn feed(editor: &mut Editor, events: &[Event]) {
+        for event in events {
+            editor.on_event(event);
+        }
+    }
+
+    /// Create an editor with the given text in the buffer.
+    fn editor_with(text: &str) -> Editor {
+        let mut e = Editor::new();
+        e.buffer = Buffer::from_text(text);
+        e
+    }
+
+    // ── merge_counts ──────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_counts_both_none() {
+        assert_eq!(Editor::merge_counts(None, None), None);
+    }
+
+    #[test]
+    fn merge_counts_first_some() {
+        assert_eq!(Editor::merge_counts(Some(3), None), Some(3));
+    }
+
+    #[test]
+    fn merge_counts_second_some() {
+        assert_eq!(Editor::merge_counts(None, Some(5)), Some(5));
+    }
+
+    #[test]
+    fn merge_counts_both_some() {
+        assert_eq!(Editor::merge_counts(Some(2), Some(3)), Some(6));
+    }
+
+    // ── Dot-repeat: x (delete char) ──────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_x() {
+        let mut e = editor_with("abcdef");
+        // x deletes 'a', cursor on 'b', then . deletes 'b'
+        feed(&mut e, &[press('x'), press('.')]);
+        assert_eq!(e.buffer.contents(), "cdef");
+    }
+
+    #[test]
+    fn dot_repeat_x_with_count() {
+        let mut e = editor_with("abcdef");
+        // 2x deletes 'ab', . repeats 2x → deletes 'cd'
+        feed(&mut e, &[press('2'), press('x'), press('.')]);
+        assert_eq!(e.buffer.contents(), "ef");
+    }
+
+    #[test]
+    fn dot_repeat_x_count_override() {
+        let mut e = editor_with("abcdefgh");
+        // 2x deletes 'ab', 3. repeats with count 3 → deletes 'cde'
+        feed(
+            &mut e,
+            &[press('2'), press('x'), press('3'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "fgh");
+    }
+
+    // ── Dot-repeat: dd (delete line) ─────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_dd() {
+        let mut e = editor_with("first\nsecond\nthird\nfourth");
+        // dd deletes "first", . deletes "second"
+        feed(&mut e, &[press('d'), press('d'), press('.')]);
+        assert_eq!(e.buffer.contents(), "third\nfourth");
+    }
+
+    #[test]
+    fn dot_repeat_dd_with_count() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf");
+        // 2dd deletes "a" and "b", . repeats 2dd → deletes "c" and "d"
+        feed(
+            &mut e,
+            &[press('2'), press('d'), press('d'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "e\nf");
+    }
+
+    // ── Dot-repeat: dw (delete word) ─────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_dw() {
+        let mut e = editor_with("one two three four");
+        // dw deletes "one ", . deletes "two "
+        feed(&mut e, &[press('d'), press('w'), press('.')]);
+        assert_eq!(e.buffer.contents(), "three four");
+    }
+
+    #[test]
+    fn dot_repeat_dw_count_override() {
+        let mut e = editor_with("one two three four five six");
+        // dw deletes "one ", 2. deletes 2 words ("two three ")
+        feed(
+            &mut e,
+            &[press('d'), press('w'), press('2'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "four five six");
+    }
+
+    // ── Dot-repeat: diw (delete inner word — text object) ────────────────
+
+    #[test]
+    fn dot_repeat_diw() {
+        let mut e = editor_with("hello world");
+        // diw deletes "hello", w to next word, . deletes "world"
+        feed(
+            &mut e,
+            &[press('d'), press('i'), press('w'), press('w'), press('.')],
+        );
+        // After diw on "hello": " world" remains, cursor on space.
+        // w moves to "world". . does diw on "world".
+        assert_eq!(e.buffer.contents(), " ");
+    }
+
+    // ── Dot-repeat: p (paste) ────────────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_paste() {
+        let mut e = editor_with("abcde");
+        // x to cut 'a', p to paste after cursor, . to paste again
+        feed(&mut e, &[press('x'), press('p'), press('.')]);
+        // x cuts 'a' → "bcde", p pastes 'a' after 'b' → "baacde"... wait
+        // Actually: x on 'a' → "bcde" cursor on 'b', p pastes 'a' after 'b' → "bacde"
+        // cursor on 'a'. . pastes again → "baacde"... hmm let me think.
+        // x: buffer="bcde" cursor=(0,0) on 'b'. register='a'
+        // p: paste after cursor char. pos = (0,1). buffer="bacde" cursor=(0,1) on 'a'.
+        // .: replays p. paste 'a' after cursor (0,1). pos=(0,2). buffer="baacde" cursor=(0,2)
+        assert_eq!(e.buffer.contents(), "baacde");
+    }
+
+    // ── Dot-repeat: insert mode (i + text + Esc) ────────────────────────
+
+    #[test]
+    fn dot_repeat_insert() {
+        let mut e = editor_with("ab");
+        // ihello<Esc> inserts "hello" before 'a', . inserts "hello" again
+        feed(
+            &mut e,
+            &[
+                press('i'),
+                press('h'),
+                press('e'),
+                press('l'),
+                press('l'),
+                press('o'),
+                esc(),
+                press('.'),
+            ],
+        );
+        // After ihello<Esc>: "helloab", cursor on 'o' (col 4).
+        // Esc moves left to 'o' (col 4). . replays: i at col 4, types "hello",
+        // Esc. Result: "hellhelloab"... wait.
+        // After first ihello<Esc>: buffer="helloab", cursor at col 4 ('o').
+        // . replays [i, h, e, l, l, o, Esc].
+        // i: enters insert at col 4. Types "hello" → "hellhellooab". Esc.
+        // Wait: insert at col 4 means inserting before 'o'. So "hell" + "hello" + "oab" = "hellhellooab"
+        assert_eq!(e.buffer.contents(), "hellhellooab");
+    }
+
+    #[test]
+    fn dot_repeat_append() {
+        let mut e = editor_with("ab");
+        // aX<Esc> appends 'X' after 'a', move to 'b', . appends 'X' after 'b'
+        feed(
+            &mut e,
+            &[press('a'), press('X'), esc(), press('l'), press('.')],
+        );
+        // a: cursor moves right (past 'a' to 'b' pos), enters insert.
+        // X: inserts 'X' at col 1. buffer="aXb". cursor at col 2 ('b').
+        // Esc: commit, move left to col 1 ('X').
+        // l: move right to col 2 ('b').
+        // .: replays [a, X, Esc]. a moves right to col 3 (past 'b'), enters insert.
+        // X: inserts at col 3. buffer="aXbX". Esc: move left to col 3 ('X').
+        assert_eq!(e.buffer.contents(), "aXbX");
+    }
+
+    // ── Dot-repeat: o (open line below) ─────────────────────────────────
+
+    #[test]
+    fn dot_repeat_open_line_below() {
+        let mut e = editor_with("first\nthird");
+        // ohello<Esc> opens line below and types "hello"
+        // j moves down to "third"
+        // . opens line below "third" and types "hello"
+        feed(
+            &mut e,
+            &[
+                press('o'),
+                press('h'),
+                press('e'),
+                press('l'),
+                press('l'),
+                press('o'),
+                esc(),
+                press('j'),
+                press('.'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "first\nhello\nthird\nhello");
+    }
+
+    // ── Dot-repeat: ciw (change inner word) ─────────────────────────────
+
+    #[test]
+    fn dot_repeat_ciw() {
+        let mut e = editor_with("foo bar baz");
+        // ciw changes "foo" to "X"
+        feed(
+            &mut e,
+            &[
+                press('c'),
+                press('i'),
+                press('w'),
+                press('X'),
+                esc(),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "X bar baz");
+        // Move to "bar": w w (past space, to 'bar')
+        feed(&mut e, &[press('w')]);
+        // . changes "bar" to "X"
+        feed(&mut e, &[press('.')]);
+        assert_eq!(e.buffer.contents(), "X X baz");
+    }
+
+    // ── Dot-repeat: cc (change line) ────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_cc() {
+        let mut e = editor_with("first\nsecond\nthird");
+        // cc deletes the line (including newline), enters insert.
+        // Note: our cc uses the same linewise range as dd (deletes newline).
+        feed(
+            &mut e,
+            &[
+                press('c'),
+                press('c'),
+                press('h'),
+                press('e'),
+                press('l'),
+                press('l'),
+                press('o'),
+                esc(),
+            ],
+        );
+        // "first\n" deleted → "second\nthird", then "hello" typed at start.
+        assert_eq!(e.buffer.contents(), "hellosecond\nthird");
+        // . replays cc + "hello" + Esc on current line
+        feed(&mut e, &[press('.')]);
+        assert_eq!(e.buffer.contents(), "hellothird");
+    }
+
+    // ── Dot-repeat: operator + motion count (2d3w) ──────────────────────
+
+    #[test]
+    fn dot_repeat_2d3w_effective_count() {
+        // 24 single-letter words. 2d3w deletes 6 words each time.
+        let mut e = editor_with("a b c d e f g h i j k l m n o p q r s t u v w x");
+        // 2d3w: effective count = 6 words
+        feed(
+            &mut e,
+            &[
+                press('2'),
+                press('d'),
+                press('3'),
+                press('w'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "g h i j k l m n o p q r s t u v w x");
+        // . repeats with same effective count (6 words)
+        feed(&mut e, &[press('.')]);
+        assert_eq!(e.buffer.contents(), "m n o p q r s t u v w x");
+    }
+
+    #[test]
+    fn dot_repeat_2d3w_count_override() {
+        let mut e = editor_with("a b c d e f g h i j k l");
+        // 2d3w: deletes 6 words ("a b c d e f ")
+        feed(
+            &mut e,
+            &[
+                press('2'),
+                press('d'),
+                press('3'),
+                press('w'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "g h i j k l");
+        // 2. overrides with count 2 → deletes 2 words ("g h ")
+        feed(&mut e, &[press('2'), press('.')]);
+        assert_eq!(e.buffer.contents(), "i j k l");
+    }
+
+    // ── Dot-repeat: no prior change ─────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_no_prior_change() {
+        let mut e = editor_with("hello");
+        // . with no prior change is a no-op
+        feed(&mut e, &[press('.')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    // ── Dot-repeat: d<Esc> cancels, preserves previous change ────────────
+
+    #[test]
+    fn dot_cancel_preserves_previous() {
+        let mut e = editor_with("abcdef");
+        // x deletes 'a', d<Esc> cancels, . still repeats x
+        feed(&mut e, &[press('x'), press('d'), esc(), press('.')]);
+        assert_eq!(e.buffer.contents(), "cdef");
+    }
+
+    // ── Dot-repeat: yank does NOT overwrite last change ──────────────────
+
+    #[test]
+    fn yank_does_not_overwrite_last_change() {
+        let mut e = editor_with("abcdef");
+        // x deletes 'a', yw yanks (not a change), . repeats x
+        feed(
+            &mut e,
+            &[press('x'), press('y'), press('w'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "cdef");
+    }
+
+    // ── Dot-repeat: insert with backspace ───────────────────────────────
+
+    #[test]
+    fn dot_repeat_insert_with_backspace() {
+        let mut e = editor_with("ab");
+        // ixy<BS>z<Esc> types "xz" (types x, y, deletes y, types z)
+        feed(
+            &mut e,
+            &[
+                press('i'),
+                press('x'),
+                press('y'),
+                backspace(),
+                press('z'),
+                esc(),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "xzab");
+
+        // Move right past 'z' to 'a', . replays the same edit
+        feed(&mut e, &[press('l'), press('.')]);
+        // Insert at cursor col 2 ('a'): types x, y, backspace, z → "xz"
+        // Buffer becomes "xzxzab"... let me trace:
+        // After first edit: "xzab", cursor at col 1 ('z') after Esc move_left.
+        // l: cursor at col 2 ('a').
+        // .: replays [i, x, y, BS, z, Esc].
+        // i at col 2: insert mode. x → "xzxab". y → "xzxyab". BS → "xzxab". z → "xzxzab". Esc.
+        assert_eq!(e.buffer.contents(), "xzxzab");
+    }
+
+    // ── Dot-repeat: open line above (O) ──────────────────────────────────
+
+    #[test]
+    fn dot_repeat_open_line_above() {
+        let mut e = editor_with("second\nfourth");
+        // Ohi<Esc> opens line above "second" and types "hi"
+        feed(
+            &mut e,
+            &[press('O'), press('h'), press('i'), esc()],
+        );
+        assert_eq!(e.buffer.contents(), "hi\nsecond\nfourth");
+
+        // Move to "fourth" (down, down), . opens line above "fourth"
+        feed(&mut e, &[press('j'), press('j'), press('.')]);
+        assert_eq!(e.buffer.contents(), "hi\nsecond\nhi\nfourth");
+    }
+
+    // ── Dot-repeat: d$ (delete to end of line) ─────────────────────────
+
+    #[test]
+    fn dot_repeat_d_dollar() {
+        let mut e = editor_with("hello world\nfoo barbaz");
+        // Move to col 6 ('w'), d$ deletes "world"
+        feed(
+            &mut e,
+            &[
+                press('l'),
+                press('l'),
+                press('l'),
+                press('l'),
+                press('l'),
+                press('l'), // cursor at col 6, 'w'
+                press('d'),
+                press('$'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "hello \nfoo barbaz");
+
+        // After d$, cursor is set to range.start (0,6), clamped to (0,5).
+        // set_position clamps THEN sets sticky_col, so sticky_col = 5.
+        // j moves to line 1 col 5 ('a' in "barbaz"). d$ deletes "arbaz".
+        feed(&mut e, &[press('j'), press('.')]);
+        assert_eq!(e.buffer.contents(), "hello \nfoo b");
+    }
+
+    // ── Dot-repeat: I (insert at first non-blank) ───────────────────────
+
+    #[test]
+    fn dot_repeat_insert_at_first_non_blank() {
+        let mut e = editor_with("  hello\n  world");
+        // I inserts at first non-blank (col 2), types ">>", Esc
+        feed(
+            &mut e,
+            &[press('I'), press('>'), press('>'), esc()],
+        );
+        assert_eq!(e.buffer.contents(), "  >>hello\n  world");
+
+        // j to next line, . repeats
+        feed(&mut e, &[press('j'), press('.')]);
+        assert_eq!(e.buffer.contents(), "  >>hello\n  >>world");
+    }
+
+    // ── Dot-repeat: insert with Enter ────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_insert_with_enter() {
+        let mut e = editor_with("ab");
+        // iX<Enter>Y<Esc>: inserts "X\nY" before 'a'
+        feed(
+            &mut e,
+            &[press('i'), press('X'), enter(), press('Y'), esc()],
+        );
+        assert_eq!(e.buffer.contents(), "X\nYab");
+
+        // Move to end of first line, . repeats
+        feed(&mut e, &[press('g'), press('.')]);
+        // g goes to first line. Cursor at 'X' (col 0).
+        // . replays [i, X, Enter, Y, Esc]
+        // i at col 0, types X → "XX\nYab". Enter → "X\nX\nYab". Y → "X\nYX\nYab". Esc.
+        assert_eq!(e.buffer.contents(), "X\nYX\nYab");
+    }
+
+    // ── Dot-repeat: cw (change word) ────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_cw() {
+        let mut e = editor_with("old old old");
+        // cw changes "old" to "new"
+        feed(
+            &mut e,
+            &[
+                press('c'),
+                press('w'),
+                press('n'),
+                press('e'),
+                press('w'),
+                esc(),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "new old old");
+
+        // Move to next "old", . changes it to "new"
+        feed(&mut e, &[press('w'), press('.')]);
+        assert_eq!(e.buffer.contents(), "new new old");
+
+        // . again on last "old"
+        feed(&mut e, &[press('w'), press('.')]);
+        assert_eq!(e.buffer.contents(), "new new new");
+    }
+
+    // ── Dot-repeat: A (append at end) ───────────────────────────────────
+
+    #[test]
+    fn dot_repeat_append_at_end() {
+        let mut e = editor_with("hello\nworld");
+        // A;  — append semicolon at end of line
+        feed(&mut e, &[press('A'), press(';'), esc()]);
+        assert_eq!(e.buffer.contents(), "hello;\nworld");
+
+        // j to next line, .
+        feed(&mut e, &[press('j'), press('.')]);
+        assert_eq!(e.buffer.contents(), "hello;\nworld;");
+    }
+
+    // ── Dot-repeat: P (paste before) ────────────────────────────────────
+
+    #[test]
+    fn dot_repeat_paste_before() {
+        let mut e = editor_with("abcd");
+        // x cuts 'a', move to 'd' position, P pastes before
+        feed(
+            &mut e,
+            &[press('x'), press('$'), press('P'), press('.')],
+        );
+        // x: "bcd" cursor at 'b'. register='a'.
+        // $: cursor at 'd' (col 2).
+        // P: paste 'a' before col 2 → "bcad". cursor at 'a' (col 2).
+        // .: replays P → paste 'a' before col 2 → "bcaad". cursor at 'a' (col 2).
+        assert_eq!(e.buffer.contents(), "bcaad");
     }
 }
