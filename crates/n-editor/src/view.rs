@@ -36,6 +36,7 @@ use crate::buffer::Buffer;
 use crate::cursor::Cursor;
 use crate::mode::{Mode, VisualKind};
 use crate::position::Range;
+use crate::search;
 
 use n_term::buffer::FrameBuffer;
 use n_term::cell::{Attr, Cell, UnderlineStyle};
@@ -687,6 +688,158 @@ const fn sel_cell(ch: char, selected: bool) -> Cell {
         )
     } else {
         Cell::new(ch)
+    }
+}
+
+/// Highlight search matches in the visible portion of the framebuffer.
+///
+/// Call this **after** [`View::render`] to paint match highlights over the
+/// rendered text. This is a post-processing pass — it reads the existing
+/// cell characters and replaces their colors with the search highlight style
+/// (black text on yellow background).
+///
+/// `pattern` is the search string. If empty, this is a no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn highlight_matches(
+    view: &View,
+    frame: &mut FrameBuffer,
+    buf: &Buffer,
+    pattern: &str,
+    area_x: u16,
+    area_y: u16,
+    area_width: u16,
+    area_height: u16,
+) {
+    if pattern.is_empty() || area_height == 0 || area_width == 0 {
+        return;
+    }
+
+    let gw = gutter_width(buf.line_count(), view.line_numbers);
+    let text_x = area_x + gw;
+    let text_width = area_width.saturating_sub(gw);
+    let text_height = area_height.saturating_sub(1); // status line
+
+    if text_height == 0 || text_width == 0 {
+        return;
+    }
+
+    let matches = search::find_all(
+        buf,
+        pattern,
+        view.top_line,
+        view.top_line + text_height as usize,
+    );
+
+    for m in &matches {
+        let row = m.start.line.saturating_sub(view.top_line);
+        if row >= text_height as usize {
+            continue;
+        }
+
+        let Some(line) = buf.line(m.start.line) else {
+            continue;
+        };
+
+        // Compute display column range for the match.
+        let match_start_dc = char_col_to_display_col(
+            line.chars(),
+            m.start.col,
+            view.tab_width,
+        );
+        let match_end_dc = char_col_to_display_col(
+            line.chars(),
+            m.start.col + m.len,
+            view.tab_width,
+        );
+
+        // Paint all display columns in [match_start_dc, match_end_dc).
+        for dc in match_start_dc..match_end_dc {
+            if dc < view.left_col {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let screen_col = (dc - view.left_col) as u16;
+            if screen_col >= text_width {
+                break;
+            }
+
+            let sx = text_x + screen_col;
+            #[allow(clippy::cast_possible_truncation)]
+            let sy = area_y + row as u16;
+
+            if let Some(cell) = frame.get(sx, sy) {
+                if cell.is_continuation() {
+                    frame.set(
+                        sx,
+                        sy,
+                        Cell::continuation(
+                            CellColor::Ansi256(0),  // black
+                            CellColor::Ansi256(3),  // yellow
+                            Attr::empty(),
+                        ),
+                    );
+                } else {
+                    let ch = cell.character().unwrap_or(' ');
+                    frame.set(
+                        sx,
+                        sy,
+                        Cell::styled(
+                            ch,
+                            CellColor::Ansi256(0),  // black
+                            CellColor::Ansi256(3),  // yellow
+                            Attr::BOLD,
+                            UnderlineStyle::None,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Render a search prompt on the bottom line (`/pattern` or `?pattern`).
+///
+/// Similar to [`render_command_line`] but with a configurable prefix character.
+/// Returns the screen position of the search-line cursor.
+pub fn render_search_line(
+    frame: &mut FrameBuffer,
+    prefix: char,
+    input: &str,
+    cursor_col: usize,
+    x: u16,
+    y: u16,
+    width: u16,
+) -> Option<(u16, u16)> {
+    if width == 0 {
+        return None;
+    }
+
+    // Leading prefix ('/' or '?')
+    frame.set(x, y, Cell::new(prefix));
+    let mut col: u16 = 1;
+
+    // Input text
+    for ch in input.chars() {
+        if col >= width {
+            break;
+        }
+        frame.set(x + col, y, Cell::new(ch));
+        col += 1;
+    }
+
+    // Fill remaining with empty cells
+    while col < width {
+        frame.set(x + col, y, Cell::EMPTY);
+        col += 1;
+    }
+
+    // Cursor position: after prefix + cursor_col
+    #[allow(clippy::cast_possible_truncation)]
+    let cursor_x = 1 + cursor_col as u16;
+    if cursor_x < width {
+        Some((x + cursor_x, y))
+    } else {
+        None
     }
 }
 
@@ -1955,5 +2108,144 @@ mod tests {
         let selected = sel_cell('b', true);
         assert_eq!(selected.character(), Some('b'));
         assert!(selected.attrs.contains(Attr::INVERSE));
+    }
+
+    // ── highlight_matches ───────────────────────────────────────────────
+
+    fn is_yellow_bg(frame: &FrameBuffer, x: u16, y: u16) -> bool {
+        frame
+            .get(x, y)
+            .is_some_and(|c| c.bg == CellColor::Ansi256(3))
+    }
+
+    #[test]
+    fn highlight_basic() {
+        let buf = Buffer::from_text("hello world hello");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(30, 3);
+        let mut v = View::new();
+
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 30, 3);
+        highlight_matches(&v, &mut frame, &buf, "hello", 0, 0, 30, 3);
+
+        let gw = gutter_width(1, true);
+        // First "hello" at cols gw..gw+5 should be highlighted.
+        for i in 0..5 {
+            assert!(is_yellow_bg(&frame, gw + i, 0), "col {} not highlighted", gw + i);
+        }
+        // Space after first "hello" should NOT be highlighted.
+        assert!(!is_yellow_bg(&frame, gw + 5, 0));
+        // Second "hello" at cols gw+12..gw+17 should be highlighted.
+        for i in 12..17 {
+            assert!(is_yellow_bg(&frame, gw + i, 0), "col {} not highlighted", gw + i);
+        }
+    }
+
+    #[test]
+    fn highlight_multi_line() {
+        let buf = Buffer::from_text("abc\nabc\nxyz");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 5);
+        let mut v = View::new();
+
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 5);
+        highlight_matches(&v, &mut frame, &buf, "abc", 0, 0, 20, 5);
+
+        let gw = gutter_width(3, true);
+        // Lines 0 and 1 have "abc" highlighted.
+        assert!(is_yellow_bg(&frame, gw, 0));
+        assert!(is_yellow_bg(&frame, gw + 2, 0));
+        assert!(is_yellow_bg(&frame, gw, 1));
+        assert!(is_yellow_bg(&frame, gw + 2, 1));
+        // Line 2 "xyz" should NOT be highlighted.
+        assert!(!is_yellow_bg(&frame, gw, 2));
+    }
+
+    #[test]
+    fn highlight_empty_pattern_is_noop() {
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 3);
+        let mut v = View::new();
+
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
+        highlight_matches(&v, &mut frame, &buf, "", 0, 0, 20, 3);
+
+        let gw = gutter_width(1, true);
+        // Nothing should be highlighted.
+        assert!(!is_yellow_bg(&frame, gw, 0));
+    }
+
+    #[test]
+    fn highlight_preserves_character() {
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 3);
+        let mut v = View::new();
+
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
+        highlight_matches(&v, &mut frame, &buf, "ell", 0, 0, 20, 3);
+
+        let gw = gutter_width(1, true);
+        // Characters should be preserved even though colors changed.
+        assert_eq!(frame.get(gw + 1, 0).unwrap().character(), Some('e'));
+        assert_eq!(frame.get(gw + 2, 0).unwrap().character(), Some('l'));
+        assert_eq!(frame.get(gw + 3, 0).unwrap().character(), Some('l'));
+    }
+
+    // ── render_search_line ──────────────────────────────────────────────
+
+    #[test]
+    fn search_line_forward() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_search_line(&mut frame, '/', "hello", 5, 0, 0, 20);
+
+        let row = row_chars(&frame, 0);
+        assert!(row.starts_with("/hello"), "row = '{row}'");
+        // Cursor after input: col 6 (/ + hello)
+        assert_eq!(pos, Some((6, 0)));
+    }
+
+    #[test]
+    fn search_line_backward() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_search_line(&mut frame, '?', "world", 5, 0, 0, 20);
+
+        let row = row_chars(&frame, 0);
+        assert!(row.starts_with("?world"), "row = '{row}'");
+        assert_eq!(pos, Some((6, 0)));
+    }
+
+    #[test]
+    fn search_line_empty_input() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_search_line(&mut frame, '/', "", 0, 0, 0, 20);
+
+        assert_eq!(pos, Some((1, 0)));
+    }
+
+    #[test]
+    fn search_line_zero_width() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_search_line(&mut frame, '/', "hello", 0, 0, 0, 0);
+        assert!(pos.is_none());
+    }
+
+    #[test]
+    fn search_line_fills_remaining() {
+        let mut frame = FrameBuffer::new(10, 1);
+        for col in 0..10u16 {
+            frame.set(col, 0, Cell::new('X'));
+        }
+
+        render_search_line(&mut frame, '/', "ab", 2, 0, 0, 10);
+
+        let row = frame.row(0).unwrap();
+        assert_eq!(row[0].character(), Some('/'));
+        assert_eq!(row[1].character(), Some('a'));
+        assert_eq!(row[2].character(), Some('b'));
+        for col in 3..10 {
+            assert_eq!(row[col].character(), Some(' '), "col {col} not cleared");
+        }
     }
 }

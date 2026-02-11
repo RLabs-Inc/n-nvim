@@ -34,6 +34,7 @@ use n_editor::history::History;
 use n_editor::mode::{Mode, VisualKind};
 use n_editor::position::{Position, Range};
 use n_editor::register::{Register, RegisterKind};
+use n_editor::search::{self, SearchDirection, SearchState};
 use n_editor::text_object;
 use n_editor::view::{self, View};
 
@@ -97,6 +98,18 @@ struct Editor {
 
     /// Whether the current message is an error (renders in red).
     message_is_error: bool,
+
+    /// Active search-input session. When `Some`, the editor is accepting
+    /// search input on the bottom line (incremental search mode).
+    search: Option<SearchState>,
+
+    /// Last confirmed search pattern. Persists across searches for `n`/`N`
+    /// repeat. Empty string means no previous search.
+    last_search: String,
+
+    /// Direction of the last search. Used by `n` (same direction) and `N`
+    /// (opposite direction).
+    last_search_direction: SearchDirection,
 }
 
 impl Editor {
@@ -114,6 +127,9 @@ impl Editor {
             register: Register::new(),
             message: None,
             message_is_error: false,
+            search: None,
+            last_search: String::new(),
+            last_search_direction: SearchDirection::Forward,
         }
     }
 
@@ -136,6 +152,9 @@ impl Editor {
             register: Register::new(),
             message: None,
             message_is_error: false,
+            search: None,
+            last_search: String::new(),
+            last_search_direction: SearchDirection::Forward,
         }
     }
 
@@ -370,6 +389,18 @@ impl Editor {
                 if let Some(pos) = self.history.undo(&mut self.buffer) {
                     self.cursor.set_position(pos, &self.buffer, pe);
                 }
+            }
+
+            // -- Search --
+            KeyCode::Char('/') => self.start_search(SearchDirection::Forward),
+            KeyCode::Char('?') => self.start_search(SearchDirection::Backward),
+            KeyCode::Char('n') => self.search_next(),
+            KeyCode::Char('N') => self.search_prev(),
+            KeyCode::Char('*') => {
+                self.search_word_under_cursor(SearchDirection::Forward);
+            }
+            KeyCode::Char('#') => {
+                self.search_word_under_cursor(SearchDirection::Backward);
             }
 
             _ => {}
@@ -1204,6 +1235,212 @@ impl Editor {
         self.mode = Mode::Insert;
     }
 
+    // ── Search mode ─────────────────────────────────────────────────────
+
+    /// Handle input while the search prompt is active.
+    fn handle_search(&mut self, key: &KeyEvent) -> Action {
+        if key.modifiers.contains(Modifiers::CTRL) && key.code == KeyCode::Char('c') {
+            // Cancel search (same as Escape).
+            self.cancel_search();
+            return Action::Continue;
+        }
+
+        match key.code {
+            KeyCode::Escape => {
+                self.cancel_search();
+            }
+
+            KeyCode::Enter => {
+                self.confirm_search();
+            }
+
+            KeyCode::Char(ch) => {
+                if let Some(ref mut ss) = self.search {
+                    ss.insert_char(ch);
+                }
+                self.incremental_search();
+            }
+
+            KeyCode::Backspace => {
+                let should_cancel = self.search.as_mut().is_some_and(|ss| {
+                    if ss.backspace() {
+                        false
+                    } else {
+                        // Backspace on empty input: cancel like Vim.
+                        ss.is_empty()
+                    }
+                });
+
+                if should_cancel {
+                    self.cancel_search();
+                } else {
+                    self.incremental_search();
+                }
+            }
+
+            _ => {}
+        }
+
+        Action::Continue
+    }
+
+    /// Start a search session in the given direction.
+    fn start_search(&mut self, direction: SearchDirection) {
+        self.clear_message();
+        let saved_pos = self.cursor.position();
+        let saved_top = self.view.top_line();
+        self.search = Some(SearchState::new(direction, saved_pos, saved_top));
+    }
+
+    /// Cancel the active search and restore the cursor.
+    fn cancel_search(&mut self) {
+        if let Some(ss) = self.search.take() {
+            self.cursor
+                .set_position(ss.saved_pos(), &self.buffer, false);
+            self.view.set_top_line(ss.saved_top_line());
+        }
+    }
+
+    /// Confirm the search: store the pattern for n/N and exit search mode.
+    fn confirm_search(&mut self) {
+        if let Some(ss) = self.search.take() {
+            let pattern = ss.input().to_string();
+            let direction = ss.direction();
+            if pattern.is_empty() {
+                // Empty Enter: restore cursor (no search performed).
+                self.cursor
+                    .set_position(ss.saved_pos(), &self.buffer, false);
+                self.view.set_top_line(ss.saved_top_line());
+            } else {
+                self.last_search = pattern;
+                self.last_search_direction = direction;
+            }
+        }
+    }
+
+    /// Perform incremental search: jump to the next match as the user types.
+    fn incremental_search(&mut self) {
+        let (pattern, direction, saved_pos) = match &self.search {
+            Some(ss) => (ss.input().to_string(), ss.direction(), ss.saved_pos()),
+            None => return,
+        };
+
+        if pattern.is_empty() {
+            // Empty pattern: restore to saved position.
+            if let Some(ref ss) = self.search {
+                self.cursor
+                    .set_position(ss.saved_pos(), &self.buffer, false);
+                self.view.set_top_line(ss.saved_top_line());
+            }
+            return;
+        }
+
+        // Search from the saved position (where the cursor was before `/`).
+        if let Some(m) = search::find(&self.buffer, &pattern, saved_pos, direction) {
+            self.cursor
+                .set_position(m.start, &self.buffer, false);
+        }
+    }
+
+    /// Jump to the next match of the last search pattern (`n` in normal mode).
+    fn search_next(&mut self) {
+        if self.last_search.is_empty() {
+            self.set_error("E486: Pattern not found");
+            return;
+        }
+
+        let from = Position::new(self.cursor.line(), self.cursor.col() + 1);
+        if let Some(m) = search::find(
+            &self.buffer,
+            &self.last_search,
+            from,
+            self.last_search_direction,
+        ) {
+            let wrapped = match self.last_search_direction {
+                SearchDirection::Forward => m.start < self.cursor.position(),
+                SearchDirection::Backward => m.start > self.cursor.position(),
+            };
+            self.cursor
+                .set_position(m.start, &self.buffer, false);
+            if wrapped {
+                let msg = match self.last_search_direction {
+                    SearchDirection::Forward => {
+                        "search hit BOTTOM, continuing at TOP"
+                    }
+                    SearchDirection::Backward => {
+                        "search hit TOP, continuing at BOTTOM"
+                    }
+                };
+                self.set_message(msg);
+            }
+        } else {
+            self.set_error(format!(
+                "E486: Pattern not found: {}",
+                self.last_search
+            ));
+        }
+    }
+
+    /// Jump to the previous match (`N` in normal mode — opposite direction).
+    fn search_prev(&mut self) {
+        if self.last_search.is_empty() {
+            self.set_error("E486: Pattern not found");
+            return;
+        }
+
+        let opposite = self.last_search_direction.opposite();
+
+        // For backward from current position: search from col - 1 (or wrap).
+        let from = if self.cursor.col() > 0 {
+            Position::new(self.cursor.line(), self.cursor.col() - 1)
+        } else if self.cursor.line() > 0 {
+            let prev_line = self.cursor.line() - 1;
+            let prev_len = self.buffer.line_content_len(prev_line).unwrap_or(0);
+            Position::new(prev_line, prev_len.saturating_sub(1))
+        } else {
+            // At (0,0): wrap to end of buffer.
+            let last_line = self.buffer.line_count().saturating_sub(1);
+            let last_len = self.buffer.line_content_len(last_line).unwrap_or(0);
+            Position::new(last_line, last_len.saturating_sub(1))
+        };
+
+        if let Some(m) = search::find(&self.buffer, &self.last_search, from, opposite) {
+            let wrapped = match opposite {
+                SearchDirection::Forward => m.start < self.cursor.position(),
+                SearchDirection::Backward => m.start > self.cursor.position(),
+            };
+            self.cursor
+                .set_position(m.start, &self.buffer, false);
+            if wrapped {
+                let msg = match opposite {
+                    SearchDirection::Forward => {
+                        "search hit BOTTOM, continuing at TOP"
+                    }
+                    SearchDirection::Backward => {
+                        "search hit TOP, continuing at BOTTOM"
+                    }
+                };
+                self.set_message(msg);
+            }
+        } else {
+            self.set_error(format!(
+                "E486: Pattern not found: {}",
+                self.last_search
+            ));
+        }
+    }
+
+    /// Search for the word under the cursor (`*` forward, `#` backward).
+    fn search_word_under_cursor(&mut self, direction: SearchDirection) {
+        if let Some(word) = search::word_under_cursor(&self.buffer, self.cursor.position()) {
+            self.last_search = word;
+            self.last_search_direction = direction;
+            self.search_next();
+        } else {
+            self.set_error("E348: No string under cursor");
+        }
+    }
+
     // ── Paste commands ──────────────────────────────────────────────────
 
     /// Paste after the cursor (`p` in normal mode).
@@ -1368,6 +1605,12 @@ impl App for Editor {
             return Action::Continue;
         }
 
+        // Search-input mode takes priority: if the user is typing a search
+        // pattern, all keys go to the search handler.
+        if self.search.is_some() {
+            return self.handle_search(key);
+        }
+
         match self.mode {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
@@ -1424,10 +1667,41 @@ impl App for Editor {
             view_height,
         );
 
-        // Bottom row: command line or message.
+        // Highlight search matches in the visible area.
+        let hl_pattern = if self.search.is_some() {
+            self.search.as_ref().map_or("", |ss| ss.input())
+        } else {
+            &self.last_search
+        };
+        if !hl_pattern.is_empty() {
+            view::highlight_matches(
+                &self.view,
+                frame,
+                &self.buffer,
+                hl_pattern,
+                0,
+                0,
+                w,
+                view_height,
+            );
+        }
+
+        // Bottom row: command line, search prompt, or message.
         let bottom_y = h - 1;
 
-        if self.mode == Mode::Command {
+        if let Some(ref ss) = self.search {
+            // Render the search prompt and position the cursor there.
+            let search_cursor = view::render_search_line(
+                frame,
+                ss.prefix(),
+                ss.input(),
+                ss.input_cursor(),
+                0,
+                bottom_y,
+                w,
+            );
+            self.cursor_screen = search_cursor;
+        } else if self.mode == Mode::Command {
             // Render the command line and position the cursor there.
             let cmd_cursor = view::render_command_line(
                 frame,
