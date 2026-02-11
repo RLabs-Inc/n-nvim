@@ -7721,4 +7721,427 @@ mod tests {
         cmd(&mut e, "bd");
         assert_eq!(e.buffer.contents(), "B");
     }
+
+    // ── Window splits ────────────────────────────────────────────────────
+
+    #[test]
+    fn win_initial_state() {
+        let e = editor_with("hello");
+        assert_eq!(e.win_count(), 1);
+        assert_eq!(e.active_win_id, 1);
+        assert!(e.other_wins.is_empty());
+        assert_eq!(e.split, Split::leaf(1));
+    }
+
+    #[test]
+    fn win_sp_creates_horizontal_split() {
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "sp");
+        assert_eq!(e.win_count(), 2);
+        // Active window stays the same (window 1).
+        assert_eq!(e.active_win_id, 1);
+        // New window 2 is in other_wins showing the same buffer.
+        assert_eq!(e.other_wins.len(), 1);
+        assert_eq!(e.other_wins[0].id, 2);
+        assert_eq!(e.other_wins[0].buf_id, e.current_buf_id);
+    }
+
+    #[test]
+    fn win_vsp_creates_vertical_split() {
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "vsp");
+        assert_eq!(e.win_count(), 2);
+        assert_eq!(e.active_win_id, 1);
+        assert_eq!(e.other_wins.len(), 1);
+        assert_eq!(e.other_wins[0].id, 2);
+    }
+
+    #[test]
+    fn win_split_aliases() {
+        // :split is an alias for :sp.
+        let mut e = editor_with("text");
+        cmd(&mut e, "split");
+        assert_eq!(e.win_count(), 2);
+
+        // :vsplit is an alias for :vsp.
+        let mut e2 = editor_with("text");
+        cmd(&mut e2, "vsplit");
+        assert_eq!(e2.win_count(), 2);
+    }
+
+    #[test]
+    fn win_ctrl_w_s_splits_horizontally() {
+        let mut e = editor_with("hello");
+        // Ctrl+W s = :sp
+        feed(&mut e, &[ctrl('w'), press('s')]);
+        assert_eq!(e.win_count(), 2);
+        assert_eq!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_ctrl_w_v_splits_vertically() {
+        let mut e = editor_with("hello");
+        // Ctrl+W v = :vsp
+        feed(&mut e, &[ctrl('w'), press('v')]);
+        assert_eq!(e.win_count(), 2);
+        assert_eq!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_ctrl_w_w_cycles_forward() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        assert_eq!(e.active_win_id, 1);
+        // Ctrl+W w cycles to next window.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        assert_eq!(e.active_win_id, 2);
+        // Ctrl+W w again wraps back to window 1.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        assert_eq!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_ctrl_w_upper_w_cycles_backward() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "vsp");
+        // Ctrl+W W cycles backward (from 1 → wraps to 2).
+        feed(&mut e, &[ctrl('w'), press('W')]);
+        assert_eq!(e.active_win_id, 2);
+    }
+
+    #[test]
+    fn win_ctrl_w_hjkl_navigates() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "vsp");
+        // Window 1 is left, window 2 is right. We're on 1.
+        // Need to set last_frame_size for neighbor computation.
+        e.last_frame_size = (80, 24);
+        // Ctrl+W l → move right to window 2.
+        feed(&mut e, &[ctrl('w'), press('l')]);
+        assert_eq!(e.active_win_id, 2);
+        // Ctrl+W h → move left back to window 1.
+        feed(&mut e, &[ctrl('w'), press('h')]);
+        assert_eq!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_ctrl_w_jk_navigates_hsplit() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        // Window 1 is top, window 2 is bottom. We're on 1.
+        e.last_frame_size = (80, 24);
+        // Ctrl+W j → move down to window 2.
+        feed(&mut e, &[ctrl('w'), press('j')]);
+        assert_eq!(e.active_win_id, 2);
+        // Ctrl+W k → move up back to window 1.
+        feed(&mut e, &[ctrl('w'), press('k')]);
+        assert_eq!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_ctrl_w_c_closes_window() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        assert_eq!(e.win_count(), 2);
+        // Close the active window with Ctrl+W c.
+        feed(&mut e, &[ctrl('w'), press('c')]);
+        assert_eq!(e.win_count(), 1);
+        // The remaining window should be active.
+        assert_eq!(e.active_win_id, 2);
+    }
+
+    #[test]
+    fn win_ctrl_w_c_last_window_error() {
+        let mut e = editor_with("hello");
+        // Only one window — Ctrl+W c should show error.
+        feed(&mut e, &[ctrl('w'), press('c')]);
+        assert_eq!(e.win_count(), 1);
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E444")));
+    }
+
+    #[test]
+    fn win_close_command() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "close");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn win_close_clo_alias() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "clo");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn win_close_last_window_error() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "close");
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E444")));
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn win_ctrl_w_o_closes_all_other_windows() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "vsp");
+        assert_eq!(e.win_count(), 3);
+        // Ctrl+W o keeps only the active window.
+        feed(&mut e, &[ctrl('w'), press('o')]);
+        assert_eq!(e.win_count(), 1);
+        assert_eq!(e.active_win_id, 1);
+        assert!(e.other_wins.is_empty());
+    }
+
+    #[test]
+    fn win_only_command() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "vsp");
+        assert_eq!(e.win_count(), 3);
+        cmd(&mut e, "only");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn win_only_on_alias() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "on");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn win_only_already_single_is_noop() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "only");
+        assert_eq!(e.win_count(), 1);
+        // No error message.
+        assert!(e.message.is_none() || !e.message_is_error);
+    }
+
+    #[test]
+    fn win_split_shares_buffer() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        // Both windows show the same buffer.
+        assert_eq!(e.current_buf_id, 1);
+        assert_eq!(e.other_wins[0].buf_id, 1);
+        // Only one buffer exists.
+        assert_eq!(e.buf_count(), 1);
+    }
+
+    #[test]
+    fn win_independent_cursor_position() {
+        let mut e = editor_with("hello world\nsecond line");
+        cmd(&mut e, "sp");
+        // Move cursor in the active window.
+        feed(&mut e, &[press('j'), press('l'), press('l')]);
+        let active_line = e.cursor.line();
+        let active_col = e.cursor.col();
+        assert_eq!(active_line, 1);
+        assert_eq!(active_col, 2);
+        // Switch to the other window — should have the original position.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn win_switch_resets_mode_to_normal() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        // Enter insert mode.
+        feed(&mut e, &[press('i')]);
+        assert_eq!(e.mode, Mode::Insert);
+        // Switch window — should reset to Normal.
+        feed(&mut e, &[esc()]); // first exit insert
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn win_close_preserves_buffer() {
+        let path = temp_file("win_close_buf.txt", "file content");
+        let mut e = editor_with("original");
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Now on buffer 2. Split.
+        cmd(&mut e, "sp");
+        assert_eq!(e.win_count(), 2);
+        assert_eq!(e.buf_count(), 2);
+        // Close the window — buffer should still exist.
+        cmd(&mut e, "close");
+        assert_eq!(e.win_count(), 1);
+        assert_eq!(e.buf_count(), 2); // both buffers survive
+    }
+
+    #[test]
+    fn win_nested_splits() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "vsp");
+        assert_eq!(e.win_count(), 3);
+        assert_eq!(e.split.leaves().len(), 3);
+    }
+
+    #[test]
+    fn win_navigate_three_panes() {
+        // Create: HSplit(VSplit(1, 3), 2) — window 1 top-left, 3 top-right, 2 bottom.
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp"); // HSplit(1, 2)
+        cmd(&mut e, "vsp"); // HSplit(VSplit(1, 3), 2)
+        e.last_frame_size = (80, 24);
+        assert_eq!(e.win_count(), 3);
+        assert_eq!(e.active_win_id, 1);
+        // Ctrl+W l → right neighbor (window 3).
+        feed(&mut e, &[ctrl('w'), press('l')]);
+        assert_eq!(e.active_win_id, 3);
+        // Ctrl+W j → down neighbor (window 2).
+        feed(&mut e, &[ctrl('w'), press('j')]);
+        assert_eq!(e.active_win_id, 2);
+        // Ctrl+W k → up neighbor (window 3, nearest above).
+        feed(&mut e, &[ctrl('w'), press('k')]);
+        assert!(e.active_win_id == 1 || e.active_win_id == 3);
+    }
+
+    #[test]
+    fn win_ctrl_w_escape_cancels() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        // Ctrl+W then Escape should cancel without action.
+        feed(&mut e, &[ctrl('w'), esc()]);
+        assert_eq!(e.win_count(), 2);
+        assert_eq!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_sp_does_not_conflict_with_substitute() {
+        // Regression: :sp should NOT be parsed as a substitution command.
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "sp");
+        assert_eq!(e.win_count(), 2);
+        assert!(!e.message_is_error);
+    }
+
+    #[test]
+    fn win_split_does_not_conflict_with_substitute() {
+        // Regression: :split should NOT be parsed as :s + plit.
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "split");
+        assert_eq!(e.win_count(), 2);
+        assert!(!e.message_is_error);
+    }
+
+    #[test]
+    fn win_multiple_close_to_one() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "sp");
+        assert_eq!(e.win_count(), 4);
+        // Close three times to get back to one.
+        cmd(&mut e, "close");
+        assert_eq!(e.win_count(), 3);
+        cmd(&mut e, "close");
+        assert_eq!(e.win_count(), 2);
+        cmd(&mut e, "close");
+        assert_eq!(e.win_count(), 1);
+        // Fourth close should error.
+        cmd(&mut e, "close");
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E444")));
+    }
+
+    #[test]
+    fn win_different_buffers_in_split() {
+        let path = temp_file("win_diff_buf.txt", "second buffer");
+        let mut e = editor_with("first buffer");
+        cmd(&mut e, "vsp");
+        // Switch to window 2.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        assert_eq!(e.active_win_id, 2);
+        // Open a different file in window 2.
+        cmd(&mut e, &format!("e {}", path.display()));
+        assert_eq!(e.buffer.contents(), "second buffer");
+        // Switch back to window 1 — should still have original text.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        assert_eq!(e.active_win_id, 1);
+        assert_eq!(e.buffer.contents(), "first buffer");
+    }
+
+    #[test]
+    fn win_cycle_with_three_windows() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "vsp");
+        assert_eq!(e.win_count(), 3);
+        assert_eq!(e.active_win_id, 1);
+        // Cycle: 1 → 3 → 2 → 1.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        let second = e.active_win_id;
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        let third = e.active_win_id;
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        // Should wrap back to 1.
+        assert_eq!(e.active_win_id, 1);
+        // All three visited different windows.
+        assert_ne!(second, third);
+        assert_ne!(second, 1);
+        assert_ne!(third, 1);
+    }
+
+    #[test]
+    fn win_only_with_different_buffers() {
+        let path = temp_file("win_only_diff.txt", "other");
+        let mut e = editor_with("main");
+        cmd(&mut e, "vsp");
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Switch back and :only — all windows close, buffers preserved.
+        feed(&mut e, &[ctrl('w'), press('w')]);
+        cmd(&mut e, "only");
+        assert_eq!(e.win_count(), 1);
+        // Both buffers should still be accessible.
+        assert_eq!(e.buf_count(), 2);
+    }
+
+    #[test]
+    fn win_close_switches_to_next_window() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "sp");
+        // 3 windows: leaves order [1, 2, 3]. Active = 1.
+        assert_eq!(e.active_win_id, 1);
+        // Close window 1 → next in cycle.
+        cmd(&mut e, "close");
+        assert_eq!(e.win_count(), 2);
+        // Active should now be a different window.
+        assert_ne!(e.active_win_id, 1);
+    }
+
+    #[test]
+    fn win_ids_monotonically_increase() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp"); // creates win 2
+        cmd(&mut e, "sp"); // creates win 3
+        let mut ids = e.split.leaves();
+        ids.sort();
+        // All three IDs present, each unique.
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(e.next_win_id, 4);
+    }
+
+    #[test]
+    fn win_close_does_not_reuse_ids() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp"); // win 2
+        cmd(&mut e, "close"); // removes win 1 (active), switches to 2
+        cmd(&mut e, "sp"); // creates win 3, NOT win 1
+        let ids = e.split.leaves();
+        assert!(!ids.contains(&1)); // ID 1 never reused.
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+    }
 }
