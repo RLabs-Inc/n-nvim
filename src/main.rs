@@ -34,6 +34,7 @@ use n_editor::history::History;
 use n_editor::mode::{Mode, VisualKind};
 use n_editor::position::{Position, Range};
 use n_editor::register::{Register, RegisterKind};
+use n_editor::text_object;
 use n_editor::view::{self, View};
 
 use n_term::ansi::CursorShape;
@@ -41,6 +42,26 @@ use n_term::buffer::FrameBuffer;
 use n_term::event_loop::{Action, App, EventLoop};
 use n_term::input::{Event, KeyCode, KeyEvent, Modifiers};
 use n_term::terminal::Size;
+
+// ─── Pending state ──────────────────────────────────────────────────────────
+
+/// Multi-key command state for operator-pending mode.
+///
+/// Vim's grammar: `operator [motion | text-object]`. After pressing an
+/// operator key (`d`, `c`, `y`), we enter operator-pending mode and wait for:
+///
+/// - The same key again → line operation (`dd`, `yy`, `cc`)
+/// - A motion key → operate from cursor to motion target (`dw`, `d$`, `cw`)
+/// - `i`/`a` + object key → operate on a text object (`diw`, `ci"`, `ya(`)
+#[derive(Clone, Copy)]
+enum Pending {
+    /// Operator pressed (`d`, `c`, `y`). Waiting for motion, text-object
+    /// prefix, or the same key for a line operation.
+    Operator(char),
+    /// Operator + text-object prefix (`di`, `ca`, `yi`). Waiting for the
+    /// object key (`w`, `"`, `(`, etc.).
+    TextObject { op: char, inner: bool },
+}
 
 // ─── Editor ─────────────────────────────────────────────────────────────────
 
@@ -56,10 +77,10 @@ struct Editor {
     mode: Mode,
     history: History,
 
-    /// Pending operator key for multi-key commands like `dd`. When `d` is
-    /// pressed, this is set to `Some('d')`. The next keypress completes or
-    /// cancels the operator.
-    pending_op: Option<char>,
+    /// Multi-key command state. When an operator key (`d`, `c`, `y`) is
+    /// pressed, this tracks the pending state until the command is completed
+    /// or cancelled.
+    pending: Option<Pending>,
 
     /// Screen position of the cursor from the last paint, used by the
     /// event loop to position the hardware terminal cursor.
@@ -87,7 +108,7 @@ impl Editor {
             view: View::new(),
             mode: Mode::Normal,
             history: History::new(),
-            pending_op: None,
+            pending: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
             register: Register::new(),
@@ -109,7 +130,7 @@ impl Editor {
             view: View::new(),
             mode: Mode::Normal,
             history: History::new(),
-            pending_op: None,
+            pending: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
             register: Register::new(),
@@ -195,19 +216,19 @@ impl Editor {
 
         let pe = self.mode.cursor_past_end();
 
-        // Ctrl combinations handled first.
+        // Ctrl combinations handled first — these cancel any pending state.
         if key.modifiers.contains(Modifiers::CTRL) {
             match key.code {
                 KeyCode::Char('c') => return Action::Quit,
                 KeyCode::Char('r') => {
-                    self.pending_op = None;
+                    self.pending = None;
                     if let Some(pos) = self.history.redo(&mut self.buffer) {
                         self.cursor.set_position(pos, &self.buffer, pe);
                     }
                     return Action::Continue;
                 }
                 KeyCode::Char('v') => {
-                    self.pending_op = None;
+                    self.pending = None;
                     self.cursor.set_anchor();
                     self.mode = Mode::Visual(VisualKind::Block);
                     return Action::Continue;
@@ -216,20 +237,67 @@ impl Editor {
             }
         }
 
-        // Handle pending operator (e.g. the second key in `dd`).
-        if let Some(op) = self.pending_op.take() {
-            if op == 'd' && key.code == KeyCode::Char('d') {
-                self.delete_current_line();
-                return Action::Continue;
-            }
-            // Unknown operator sequence — discard and fall through
-            // so the key is processed normally.
+        // Handle pending operator state (multi-key commands).
+        if let Some(pending) = self.pending.take() {
+            return self.handle_pending(pending, key);
         }
 
         self.handle_normal_key(key, pe)
     }
 
-    /// Process a single normal-mode key (after Ctrl and pending-op handling).
+    /// Dispatch a keypress in operator-pending mode.
+    ///
+    /// After an operator (`d`, `c`, `y`) is pressed, the next key(s) determine
+    /// what to operate on: a motion, a text object, or the same key for a line
+    /// operation.
+    fn handle_pending(&mut self, pending: Pending, key: &KeyEvent) -> Action {
+        match pending {
+            Pending::Operator(op) => {
+                // Escape cancels the pending operator.
+                if key.code == KeyCode::Escape {
+                    return Action::Continue;
+                }
+
+                // Same key = line operation (dd, yy, cc).
+                if key.code == KeyCode::Char(op) {
+                    return self.operator_line(op);
+                }
+
+                // Text object prefix: i = inner, a = around.
+                if key.code == KeyCode::Char('i') {
+                    self.pending = Some(Pending::TextObject { op, inner: true });
+                    return Action::Continue;
+                }
+                if key.code == KeyCode::Char('a') {
+                    self.pending = Some(Pending::TextObject { op, inner: false });
+                    return Action::Continue;
+                }
+
+                // Try as a motion.
+                if let Some(range) = self.operator_motion_range(key.code, op) {
+                    return self.apply_operator(op, range, false);
+                }
+
+                // Unrecognized key — cancel the operator silently.
+                Action::Continue
+            }
+            Pending::TextObject { op, inner } => {
+                // Escape cancels.
+                if key.code == KeyCode::Escape {
+                    return Action::Continue;
+                }
+
+                if let Some(range) = self.text_object_range(key.code, inner) {
+                    return self.apply_operator(op, range, false);
+                }
+
+                // Unrecognized text object key — cancel silently.
+                Action::Continue
+            }
+        }
+    }
+
+    /// Process a single normal-mode key (no pending operator).
     fn handle_normal_key(&mut self, key: &KeyEvent, pe: bool) -> Action {
         // Try motion keys first (shared with visual mode).
         if self.apply_motion(key.code, pe) {
@@ -276,10 +344,21 @@ impl Editor {
             KeyCode::Char('o') => self.open_line_below(),
             KeyCode::Char('O') => self.open_line_above(),
 
-            // -- Delete operations --
-            KeyCode::Char('x') => self.delete_char_at_cursor(),
+            // -- Operators (enter pending mode) --
             KeyCode::Char('d') => {
-                self.pending_op = Some('d');
+                self.pending = Some(Pending::Operator('d'));
+            }
+            KeyCode::Char('c') => {
+                self.pending = Some(Pending::Operator('c'));
+            }
+            KeyCode::Char('y') => {
+                self.pending = Some(Pending::Operator('y'));
+            }
+            KeyCode::Char('x') => self.delete_char_at_cursor(),
+
+            // -- Yank line shortcut --
+            KeyCode::Char('Y') => {
+                self.operator_line('y');
             }
 
             // -- Paste --
@@ -297,6 +376,274 @@ impl Editor {
         }
 
         Action::Continue
+    }
+
+    // ── Operator dispatch ───────────────────────────────────────────────
+
+    /// Compute the motion range for an operator + motion combination.
+    ///
+    /// Uses a temporary cursor clone to compute where the motion would go,
+    /// then builds a half-open range. Handles exclusive/inclusive motion types
+    /// and linewise motions.
+    fn operator_motion_range(&self, code: KeyCode, op: char) -> Option<Range> {
+        let start = self.cursor.position();
+        let mut c = self.cursor.clone();
+
+        // Returns true for inclusive motions (range must extend past target).
+        let inclusive = match code {
+            // Exclusive motions — range end IS the target position.
+            KeyCode::Char('h') | KeyCode::Left => {
+                c.move_left(1, &self.buffer, false);
+                false
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                c.move_right(1, &self.buffer, false);
+                false
+            }
+            KeyCode::Char('0') | KeyCode::Home => {
+                c.move_to_line_start();
+                false
+            }
+            KeyCode::Char('^') => {
+                c.move_to_first_non_blank(&self.buffer, false);
+                false
+            }
+            KeyCode::Char('b') => {
+                c.word_backward(1, &self.buffer, false);
+                false
+            }
+            KeyCode::Char('B') => {
+                c.big_word_backward(1, &self.buffer, false);
+                false
+            }
+
+            // Special case: cw/cW act like ce/cE (Vim compatibility).
+            KeyCode::Char('w') if op == 'c' => {
+                c.word_end_forward(1, &self.buffer, false);
+                true
+            }
+            KeyCode::Char('W') if op == 'c' => {
+                c.big_word_end_forward(1, &self.buffer, false);
+                true
+            }
+
+            KeyCode::Char('w') => {
+                c.word_forward(1, &self.buffer, false);
+                false
+            }
+            KeyCode::Char('W') => {
+                c.big_word_forward(1, &self.buffer, false);
+                false
+            }
+
+            // Inclusive motions — range extends to include the target char.
+            KeyCode::Char('e') => {
+                c.word_end_forward(1, &self.buffer, false);
+                true
+            }
+            KeyCode::Char('E') => {
+                c.big_word_end_forward(1, &self.buffer, false);
+                true
+            }
+            KeyCode::Char('$') | KeyCode::End => {
+                c.move_to_line_end(&self.buffer, false);
+                true
+            }
+
+            // Linewise motions — expand to full lines.
+            KeyCode::Char('j') | KeyCode::Down => {
+                c.move_down(1, &self.buffer, false);
+                return self.linewise_range(start, c.position());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                c.move_up(1, &self.buffer, false);
+                return self.linewise_range(start, c.position());
+            }
+            KeyCode::Char('G') => {
+                c.move_to_last_line(&self.buffer, false);
+                return self.linewise_range(start, c.position());
+            }
+            KeyCode::Char('g') => {
+                c.move_to_first_line(&self.buffer, false);
+                return self.linewise_range(start, c.position());
+            }
+
+            _ => return None,
+        };
+
+        let end = c.position();
+        if start == end {
+            return None;
+        }
+
+        // Order the range (motion might go backward).
+        let (from, to) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        if inclusive {
+            // Extend end to include the target character.
+            let end_line_len = self.buffer.line_content_len(to.line).unwrap_or(0);
+            let extended = if to.col < end_line_len {
+                Position::new(to.line, to.col + 1)
+            } else if to.line + 1 < self.buffer.line_count() {
+                Position::new(to.line + 1, 0)
+            } else {
+                Position::new(to.line, end_line_len)
+            };
+            Some(Range::new(from, extended))
+        } else {
+            Some(Range::new(from, to))
+        }
+    }
+
+    /// Compute a linewise range spanning from one position's line to another's.
+    fn linewise_range(&self, a: Position, b: Position) -> Option<Range> {
+        let first = a.line.min(b.line);
+        let last = a.line.max(b.line);
+
+        let start = Position::new(first, 0);
+        let end = if last + 1 < self.buffer.line_count() {
+            Position::new(last + 1, 0)
+        } else {
+            let len = self.buffer.line_len(last).unwrap_or(0);
+            Position::new(last, len)
+        };
+
+        if start == end {
+            return None;
+        }
+
+        Some(Range::new(start, end))
+    }
+
+    /// Resolve a text object key into a range.
+    fn text_object_range(&self, code: KeyCode, inner: bool) -> Option<Range> {
+        let pos = self.cursor.position();
+        match code {
+            KeyCode::Char('w') if inner => text_object::inner_word(&self.buffer, pos),
+            KeyCode::Char('w') => text_object::a_word(&self.buffer, pos),
+            KeyCode::Char('W') if inner => text_object::inner_big_word(&self.buffer, pos),
+            KeyCode::Char('W') => text_object::a_big_word(&self.buffer, pos),
+            KeyCode::Char('"') if inner => text_object::inner_double_quote(&self.buffer, pos),
+            KeyCode::Char('"') => text_object::a_double_quote(&self.buffer, pos),
+            KeyCode::Char('\'') if inner => text_object::inner_single_quote(&self.buffer, pos),
+            KeyCode::Char('\'') => text_object::a_single_quote(&self.buffer, pos),
+            KeyCode::Char('`') if inner => text_object::inner_backtick(&self.buffer, pos),
+            KeyCode::Char('`') => text_object::a_backtick(&self.buffer, pos),
+            KeyCode::Char('(' | ')' | 'b') if inner => {
+                text_object::inner_paren(&self.buffer, pos)
+            }
+            KeyCode::Char('(' | ')' | 'b') => text_object::a_paren(&self.buffer, pos),
+            KeyCode::Char('[' | ']') if inner => text_object::inner_square(&self.buffer, pos),
+            KeyCode::Char('[' | ']') => text_object::a_square(&self.buffer, pos),
+            KeyCode::Char('{' | '}' | 'B') if inner => {
+                text_object::inner_curly(&self.buffer, pos)
+            }
+            KeyCode::Char('{' | '}' | 'B') => text_object::a_curly(&self.buffer, pos),
+            KeyCode::Char('<' | '>') if inner => text_object::inner_angle(&self.buffer, pos),
+            KeyCode::Char('<' | '>') => text_object::a_angle(&self.buffer, pos),
+            _ => None,
+        }
+    }
+
+    /// Apply an operator to a range.
+    ///
+    /// `linewise`: if true, the operation uses line-wise register semantics.
+    fn apply_operator(&mut self, op: char, range: Range, linewise: bool) -> Action {
+        if range.is_empty() {
+            return Action::Continue;
+        }
+
+        let text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let reg_kind = if linewise {
+            RegisterKind::Line
+        } else {
+            RegisterKind::Char
+        };
+        let reg_text = if linewise && !text.ends_with('\n') {
+            format!("{text}\n")
+        } else {
+            text.clone()
+        };
+
+        match op {
+            'd' => {
+                self.register.yank(reg_text, reg_kind);
+                self.history.begin(self.cursor.position());
+                self.history.record_delete(range.start, &text);
+                self.buffer.delete(range);
+                self.cursor
+                    .set_position(range.start, &self.buffer, false);
+                self.cursor.clamp(&self.buffer, false);
+                if linewise {
+                    self.cursor.move_to_first_non_blank(&self.buffer, false);
+                }
+                self.history.commit(self.cursor.position());
+            }
+            'c' => {
+                self.register.yank(reg_text, reg_kind);
+                self.history.begin(self.cursor.position());
+                self.history.record_delete(range.start, &text);
+                self.buffer.delete(range);
+                self.cursor
+                    .set_position(range.start, &self.buffer, true);
+                self.cursor.clamp(&self.buffer, true);
+                self.history.commit(self.cursor.position());
+                // Begin a new transaction for the insert session.
+                self.history.begin(self.cursor.position());
+                self.mode = Mode::Insert;
+            }
+            'y' => {
+                self.register.yank(reg_text, reg_kind);
+                self.cursor
+                    .set_position(range.start, &self.buffer, false);
+                let lines = range.line_span();
+                if lines > 1 {
+                    self.set_message(format!("{lines} lines yanked"));
+                }
+            }
+            _ => {}
+        }
+
+        Action::Continue
+    }
+
+    /// Apply a line-wise operator (dd, yy, cc).
+    fn operator_line(&mut self, op: char) -> Action {
+        if self.buffer.is_empty() {
+            return Action::Continue;
+        }
+
+        let line = self.cursor.line();
+        let line_count = self.buffer.line_count();
+
+        // Compute the line range (same logic as delete_current_line).
+        let range = if line_count == 1 {
+            let len = self.buffer.line_len(0).unwrap_or(0);
+            if len == 0 {
+                return Action::Continue;
+            }
+            Range::new(Position::ZERO, Position::new(0, len))
+        } else if line + 1 < line_count {
+            Range::new(Position::new(line, 0), Position::new(line + 1, 0))
+        } else {
+            let prev_len = self.buffer.line_content_len(line - 1).unwrap_or(0);
+            let this_len = self.buffer.line_len(line).unwrap_or(0);
+            Range::new(
+                Position::new(line - 1, prev_len),
+                Position::new(line, this_len),
+            )
+        };
+
+        self.apply_operator(op, range, true)
     }
 
     // ── Insert mode ─────────────────────────────────────────────────────
@@ -1006,63 +1353,6 @@ impl Editor {
         self.history.commit(self.cursor.position());
     }
 
-    /// Delete the current line (`dd` in Vim).
-    ///
-    /// Stores the deleted line in the unnamed register as line-wise text
-    /// (Vim behavior: `dd` followed by `p` pastes the line below).
-    fn delete_current_line(&mut self) {
-        let pe = self.mode.cursor_past_end();
-        let line = self.cursor.line();
-        let line_count = self.buffer.line_count();
-
-        if self.buffer.is_empty() {
-            return;
-        }
-
-        // Determine the range to delete.
-        let (from, to) = if line_count == 1 {
-            // Only line — clear everything.
-            let len = self.buffer.line_len(0).unwrap_or(0);
-            if len == 0 {
-                return;
-            }
-            (Position::ZERO, Position::new(0, len))
-        } else if line + 1 < line_count {
-            // Not the last line — delete through the trailing newline.
-            (Position::new(line, 0), Position::new(line + 1, 0))
-        } else {
-            // Last line — also remove the preceding newline so we don't
-            // leave a trailing blank line.
-            let prev_len = self.buffer.line_content_len(line - 1).unwrap_or(0);
-            let this_len = self.buffer.line_len(line).unwrap_or(0);
-            (
-                Position::new(line - 1, prev_len),
-                Position::new(line, this_len),
-            )
-        };
-
-        let range = Range::new(from, to);
-        let deleted = self
-            .buffer
-            .slice(range)
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-
-        // Store as line-wise in the register (ensure trailing newline).
-        let reg_text = if deleted.ends_with('\n') {
-            deleted.clone()
-        } else {
-            deleted.clone() + "\n"
-        };
-        self.register.yank(reg_text, RegisterKind::Line);
-
-        self.history.begin(self.cursor.position());
-        self.history.record_delete(from, &deleted);
-        self.buffer.delete(range);
-        self.cursor.clamp(&self.buffer, pe);
-        self.cursor.move_to_first_non_blank(&self.buffer, pe);
-        self.history.commit(self.cursor.position());
-    }
 }
 
 // ─── App implementation ─────────────────────────────────────────────────────

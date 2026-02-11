@@ -7,6 +7,7 @@
 //! - **[`mode`]** — Vim-style modal editing (`Normal`, `Insert`, `Visual`, etc.)
 //! - **[`cursor`]** — Cursor with movement, sticky column, and selection
 //! - **[`word`]** — Word/WORD boundary detection for `w`/`b`/`e`/`W`/`B`/`E` motions
+//! - **[`text_object`]** — Text objects (`iw`, `a"`, `i(`, etc.) for composable editing
 //! - **[`view`]** — View layer that bridges buffers to n-term's framebuffer
 //! - **[`register`]** — Yank/delete register for clipboard operations
 //!
@@ -19,5 +20,6 @@ pub mod history;
 pub mod mode;
 pub mod position;
 pub mod register;
+pub mod text_object;
 pub mod view;
 pub mod word;

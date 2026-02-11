@@ -33,7 +33,7 @@ use crate::position::Position;
 
 /// Character class for word boundary detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CharClass {
+pub(crate) enum CharClass {
     /// Letters, digits, underscore.
     Word,
     /// Non-blank, non-word characters (operators, brackets, etc.).
@@ -45,7 +45,7 @@ enum CharClass {
 }
 
 /// Classify a character for small-word motions (`w`/`b`/`e`).
-fn classify(ch: char) -> CharClass {
+pub(crate) fn classify(ch: char) -> CharClass {
     if ch == '\n' || ch == '\r' {
         CharClass::Newline
     } else if ch.is_whitespace() {
@@ -59,7 +59,7 @@ fn classify(ch: char) -> CharClass {
 
 /// Classify a character for WORD motions (`W`/`B`/`E`).
 /// Only blank vs non-blank matters — all non-blank chars are one class.
-fn classify_big(ch: char) -> CharClass {
+pub(crate) fn classify_big(ch: char) -> CharClass {
     if ch == '\n' || ch == '\r' {
         CharClass::Newline
     } else if ch.is_whitespace() {
