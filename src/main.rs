@@ -33,7 +33,7 @@ use n_editor::cursor::Cursor;
 use n_editor::history::History;
 use n_editor::mode::{Mode, VisualKind};
 use n_editor::position::{Position, Range};
-use n_editor::register::{Register, RegisterKind};
+use n_editor::register::{RegisterFile, RegisterKind};
 use n_editor::search::{self, SearchDirection, SearchState};
 use n_editor::text_object;
 use n_editor::view::{self, View};
@@ -116,6 +116,12 @@ enum Pending {
     GotoMark { exact: bool },
     /// Operator + goto-mark (`d'a`, `` d`a ``). Waiting for the mark letter.
     OperatorGotoMark { op: char, op_count: usize, exact: bool },
+    /// Register selection (`"`). Waiting for the register letter (a-z, A-Z).
+    RegisterSelect,
+    /// Macro record (`q` when not recording). Waiting for the register letter.
+    MacroRecord,
+    /// Macro play (`@`). Waiting for the register letter or `@` for repeat.
+    MacroPlay { count: usize },
 }
 
 // ─── Dot-repeat ─────────────────────────────────────────────────────────────
@@ -142,6 +148,8 @@ struct DotRepeat {
 // ─── Editor ─────────────────────────────────────────────────────────────────
 
 /// The editor application state.
+///
+#[allow(clippy::struct_excessive_bools)]
 ///
 /// Holds everything needed to edit a file: the text buffer, cursor position,
 /// current mode, undo history, view configuration, command line state, and
@@ -171,8 +179,12 @@ struct Editor {
     /// The command-line input buffer (active when mode == Command).
     cmdline: CommandLine,
 
-    /// The unnamed register — stores yanked and deleted text for `p`/`P`.
-    register: Register,
+    /// Register file — unnamed + 26 named registers (a-z) for yank/paste.
+    registers: RegisterFile,
+
+    /// The register name selected by the `"x` prefix. Consumed by the next
+    /// yank, delete, or paste operation. `None` means use the unnamed register.
+    selected_register: Option<char>,
 
     /// A message to display on the bottom line. Cleared on the next keypress.
     message: Option<String>,
@@ -222,6 +234,24 @@ struct Editor {
     /// Buffer-local marks (a-z). Each stores the position where `ma`..`mz`
     /// was set. Indexed by `ch - 'a'`.
     marks: [Option<Position>; 26],
+
+    /// Macro key recordings (a-z). Each stores the key sequence recorded
+    /// with `qa`..`qz`. Indexed by `ch - 'a'`.
+    macro_keys: [Vec<KeyEvent>; 26],
+
+    /// The register index currently being recorded into. `Some(idx)` when
+    /// `qa`..`qz` is active, `None` otherwise.
+    macro_recording: Option<usize>,
+
+    /// True during `@a` macro replay — prevents recording replayed keys
+    /// into the macro register.
+    macro_replaying: bool,
+
+    /// The index of the last played macro, for `@@` repeat.
+    last_macro: Option<usize>,
+
+    /// Recursion depth during macro replay, to prevent infinite `@a` → `@a`.
+    macro_depth: usize,
 }
 
 impl Editor {
@@ -237,7 +267,8 @@ impl Editor {
             count: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
-            register: Register::new(),
+            registers: RegisterFile::new(),
+            selected_register: None,
             message: None,
             message_is_error: false,
             search: None,
@@ -251,6 +282,11 @@ impl Editor {
             dot_replaying: false,
             last_text_height: 24, // Sensible default until first paint.
             marks: [None; 26],
+            macro_keys: std::array::from_fn(|_| Vec::new()),
+            macro_recording: None,
+            macro_replaying: false,
+            last_macro: None,
+            macro_depth: 0,
         }
     }
 
@@ -271,7 +307,8 @@ impl Editor {
             count: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
-            register: Register::new(),
+            registers: RegisterFile::new(),
+            selected_register: None,
             message: None,
             message_is_error: false,
             search: None,
@@ -285,6 +322,11 @@ impl Editor {
             dot_replaying: false,
             last_text_height: 24,
             marks: [None; 26],
+            macro_keys: std::array::from_fn(|_| Vec::new()),
+            macro_recording: None,
+            macro_replaying: false,
+            last_macro: None,
+            macro_depth: 0,
         }
     }
 
@@ -413,6 +455,45 @@ impl Editor {
         }
 
         self.dot_replaying = false;
+        Action::Continue
+    }
+
+    // ── Macro replay ────────────────────────────────────────────────────
+
+    /// Maximum macro recursion depth (prevents infinite `@a` → `@a` loops).
+    const MAX_MACRO_DEPTH: usize = 100;
+
+    /// Replay a macro from register `idx` (0-25), `count` times.
+    fn macro_replay(&mut self, idx: usize, count: usize) -> Action {
+        if idx >= 26 || self.macro_keys[idx].is_empty() {
+            return Action::Continue;
+        }
+
+        if self.macro_depth >= Self::MAX_MACRO_DEPTH {
+            self.set_error("E132: macro recursion too deep");
+            return Action::Continue;
+        }
+
+        self.last_macro = Some(idx);
+        self.macro_depth += 1;
+        let was_replaying = self.macro_replaying;
+        self.macro_replaying = true;
+
+        for _ in 0..count {
+            let keys = self.macro_keys[idx].clone();
+            for key in &keys {
+                let event = Event::Key(*key);
+                let action = self.on_event(&event);
+                if matches!(action, Action::Quit) {
+                    self.macro_replaying = was_replaying;
+                    self.macro_depth -= 1;
+                    return Action::Quit;
+                }
+            }
+        }
+
+        self.macro_replaying = was_replaying;
+        self.macro_depth -= 1;
         Action::Continue
     }
 
@@ -652,6 +733,13 @@ impl Editor {
                 return Action::Continue;
             }
             _ => {}
+        }
+
+        // Register prefix: `"` selects a register for the next operation.
+        // Transparent to count — the count passes through to the command.
+        if key.code == KeyCode::Char('"') {
+            self.pending = Some(Pending::RegisterSelect);
+            return Action::Continue;
         }
 
         // Take the accumulated count for the command that follows.
@@ -991,6 +1079,41 @@ impl Editor {
                 self.dot_cancel();
                 Action::Continue
             }
+            Pending::RegisterSelect => {
+                // `"` + register letter: select a register for the next operation.
+                if let KeyCode::Char(ch @ ('a'..='z' | 'A'..='Z')) = key.code {
+                    self.selected_register = Some(ch);
+                }
+                // Escape or unrecognized key — cancel silently.
+                Action::Continue
+            }
+            Pending::MacroRecord => {
+                // `q` + register letter: start recording a macro.
+                if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                    let idx = (ch as u8 - b'a') as usize;
+                    self.macro_keys[idx].clear();
+                    self.macro_recording = Some(idx);
+                }
+                // Escape or non-letter — cancel silently.
+                Action::Continue
+            }
+            Pending::MacroPlay { count } => {
+                match key.code {
+                    // `@@` — replay the last played macro.
+                    KeyCode::Char('@') => {
+                        if let Some(idx) = self.last_macro {
+                            return self.macro_replay(idx, count);
+                        }
+                    }
+                    // `@a`..`@z` — replay macro from that register.
+                    KeyCode::Char(ch @ 'a'..='z') => {
+                        let idx = (ch as u8 - b'a') as usize;
+                        return self.macro_replay(idx, count);
+                    }
+                    _ => {} // Escape or unrecognized — cancel silently.
+                }
+                Action::Continue
+            }
         }
     }
 
@@ -1237,6 +1360,19 @@ impl Editor {
                 self.search_word_under_cursor(SearchDirection::Backward);
             }
 
+            // -- Macro record (q + register) --
+            KeyCode::Char('q') => {
+                // Don't allow starting a recording during macro replay.
+                if !self.macro_replaying {
+                    self.pending = Some(Pending::MacroRecord);
+                }
+            }
+
+            // -- Macro play (@ + register) --
+            KeyCode::Char('@') => {
+                self.pending = Some(Pending::MacroPlay { count });
+            }
+
             _ => {}
         }
 
@@ -1478,9 +1614,12 @@ impl Editor {
             text.clone()
         };
 
+        // Consume the register selection (set by `"x` prefix).
+        let reg_name = self.selected_register.take();
+
         match op {
             'd' => {
-                self.register.yank(reg_text, reg_kind);
+                self.registers.yank(reg_name, reg_text, reg_kind);
                 self.history.begin(self.cursor.position());
                 self.history.record_delete(range.start, &text);
                 self.buffer.delete(range);
@@ -1493,7 +1632,7 @@ impl Editor {
                 self.history.commit(self.cursor.position());
             }
             'c' => {
-                self.register.yank(reg_text, reg_kind);
+                self.registers.yank(reg_name, reg_text, reg_kind);
                 self.history.begin(self.cursor.position());
                 self.history.record_delete(range.start, &text);
                 self.buffer.delete(range);
@@ -1506,7 +1645,7 @@ impl Editor {
                 self.mode = Mode::Insert;
             }
             'y' => {
-                self.register.yank(reg_text, reg_kind);
+                self.registers.yank(reg_name, reg_text, reg_kind);
                 self.cursor
                     .set_position(range.start, &self.buffer, false);
                 let lines = range.line_span();
@@ -1877,6 +2016,11 @@ impl Editor {
                         _ => {}
                     }
                 }
+                Pending::RegisterSelect => {
+                    if let KeyCode::Char(ch @ ('a'..='z' | 'A'..='Z')) = key.code {
+                        self.selected_register = Some(ch);
+                    }
+                }
                 _ => {} // Other pending types cancel silently.
             }
             return Action::Continue;
@@ -1975,6 +2119,11 @@ impl Editor {
             // -- Scroll positioning --
             KeyCode::Char('z') => {
                 self.pending = Some(Pending::Scroll);
+            }
+
+            // -- Register selection --
+            KeyCode::Char('"') => {
+                self.pending = Some(Pending::RegisterSelect);
             }
 
             // -- Goto mark --
@@ -2088,7 +2237,8 @@ impl Editor {
             text
         };
 
-        self.register.yank(text.clone(), reg_kind);
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text.clone(), reg_kind);
 
         self.history.begin(self.cursor.position());
         self.history.record_delete(range.start, &text);
@@ -2154,7 +2304,8 @@ impl Editor {
         };
 
         let line_count = range.line_span();
-        self.register.yank(text, reg_kind);
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text, reg_kind);
 
         // Move cursor to start of selection (Vim behavior).
         let start = range.start;
@@ -2208,7 +2359,8 @@ impl Editor {
             text
         };
 
-        self.register.yank(text.clone(), reg_kind);
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text.clone(), reg_kind);
 
         // Delete the selection as one transaction, then begin a new one
         // for the insert phase (so undo restores text, redo re-deletes).
@@ -2475,13 +2627,15 @@ impl Editor {
     ///
     /// With count, the register content is pasted `count` times.
     fn paste_after(&mut self, count: usize) {
-        if self.register.is_empty() || count == 0 {
+        let reg_name = self.selected_register.take();
+        let reg = self.registers.get(reg_name);
+        if reg.is_empty() || count == 0 {
             return;
         }
 
-        let single = self.register.content().to_string();
+        let single = reg.content().to_string();
         let text = single.repeat(count);
-        let kind = self.register.kind();
+        let kind = reg.kind();
 
         let pos = match kind {
             RegisterKind::Char => {
@@ -2542,13 +2696,15 @@ impl Editor {
     ///
     /// With count, the register content is pasted `count` times.
     fn paste_before(&mut self, count: usize) {
-        if self.register.is_empty() || count == 0 {
+        let reg_name = self.selected_register.take();
+        let reg = self.registers.get(reg_name);
+        if reg.is_empty() || count == 0 {
             return;
         }
 
-        let single = self.register.content().to_string();
+        let single = reg.content().to_string();
         let text = single.repeat(count);
-        let kind = self.register.kind();
+        let kind = reg.kind();
 
         let pos = match kind {
             RegisterKind::Char => self.cursor.position(),
@@ -3053,7 +3209,8 @@ impl Editor {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        self.register.yank(text.clone(), RegisterKind::Char);
+        let reg_name = self.selected_register.take();
+        self.registers.yank(reg_name, text.clone(), RegisterKind::Char);
         self.history.begin(pos);
         self.history.record_delete(pos, &text);
         self.buffer.delete(range);
@@ -3131,6 +3288,23 @@ impl App for Editor {
         // Only handle key presses, not releases or repeats (for now).
         if key.kind != n_term::input::KeyEventKind::Press {
             return Action::Continue;
+        }
+
+        // Macro recording: `q` in normal mode stops recording. All other
+        // keys are pushed to the macro register (unless we're replaying).
+        if let Some(idx) = self.macro_recording {
+            let is_stop_key = matches!(self.mode, Mode::Normal)
+                && key.code == KeyCode::Char('q')
+                && !key.modifiers.contains(Modifiers::CTRL);
+            if is_stop_key {
+                self.macro_recording = None;
+                return Action::Continue;
+            }
+            // Record every key during macro recording (skip during replay
+            // of either macros or dot-repeat, to avoid double-recording).
+            if !self.macro_replaying && !self.dot_replaying {
+                self.macro_keys[idx].push(*key);
+            }
         }
 
         // Search-input mode takes priority: if the user is typing a search
@@ -3244,6 +3418,13 @@ impl App for Editor {
             );
             // In command mode, the cursor lives on the command line.
             self.cursor_screen = cmd_cursor;
+        } else if let Some(idx) = self.macro_recording {
+            // Show "recording @a" while macro recording is active.
+            // Safe: idx is always 0..25 (fits in u8).
+            #[allow(clippy::cast_possible_truncation)]
+            let ch = (b'a' + idx as u8) as char;
+            let msg = format!("recording @{ch}");
+            view::render_message_line(frame, &msg, false, 0, bottom_y, w);
         } else if let Some(ref msg) = self.message {
             view::render_message_line(frame, msg, self.message_is_error, 0, bottom_y, w);
         } else {
@@ -4682,7 +4863,7 @@ mod tests {
     fn d_upper_stores_in_register() {
         let mut e = editor_with("hello world");
         feed(&mut e, &[press('f'), press('w'), press('D')]);
-        assert_eq!(e.register.content(), "world");
+        assert_eq!(e.registers.get(None).content(), "world");
     }
 
     // ── C (c$) — change to end of line ──────────────────────────────────
@@ -5146,5 +5327,279 @@ mod tests {
         assert_eq!(e.view.top_line(), 2);
         // Still in visual mode with selection.
         assert!(matches!(e.mode, Mode::Visual(_)));
+    }
+
+    // ── Named registers ("x prefix) ─────────────────────────────────────
+
+    #[test]
+    fn register_yank_line_into_named() {
+        // "ayy — yank line into register a.
+        let mut e = editor_with("hello\nworld");
+        feed(&mut e, &[press('"'), press('a'), press('y'), press('y')]);
+        assert_eq!(e.registers.get(Some('a')).content(), "hello\n");
+        // Unnamed also gets it.
+        assert_eq!(e.registers.get(None).content(), "hello\n");
+    }
+
+    #[test]
+    fn register_paste_from_named() {
+        // "ayy, j, "ap — yank into a, move down, paste from a.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('"'), press('a'), press('y'), press('y')]);
+        feed(&mut e, &[press('j')]);
+        feed(&mut e, &[press('"'), press('a'), press('p')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\naaa\nccc");
+    }
+
+    #[test]
+    fn register_delete_into_named() {
+        // "add — delete line into register a.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('"'), press('a'), press('d'), press('d')]);
+        assert_eq!(e.buffer.contents(), "bbb\nccc");
+        assert_eq!(e.registers.get(Some('a')).content(), "aaa\n");
+    }
+
+    #[test]
+    fn register_x_into_named() {
+        // "ax — delete char into register a.
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('"'), press('a'), press('x')]);
+        assert_eq!(e.buffer.contents(), "ello");
+        assert_eq!(e.registers.get(Some('a')).content(), "h");
+    }
+
+    #[test]
+    fn register_named_isolation() {
+        // Different registers don't interfere.
+        let mut e = editor_with("alpha\nbravo\ncharlie");
+        // "ayy on line 0.
+        feed(&mut e, &[press('"'), press('a'), press('y'), press('y')]);
+        // j, "byy on line 1.
+        feed(&mut e, &[press('j'), press('"'), press('b'), press('y'), press('y')]);
+        assert_eq!(e.registers.get(Some('a')).content(), "alpha\n");
+        assert_eq!(e.registers.get(Some('b')).content(), "bravo\n");
+    }
+
+    #[test]
+    fn register_uppercase_appends() {
+        // "ayy on line 0, j, "Ayy on line 1 — append line to register a.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('"'), press('a'), press('y'), press('y')]);
+        feed(&mut e, &[press('j'), press('"'), press('A'), press('y'), press('y')]);
+        assert_eq!(e.registers.get(Some('a')).content(), "aaa\nbbb\n");
+    }
+
+    #[test]
+    fn register_prefix_with_count() {
+        // 3"add — delete 3 lines into register a.
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        feed(&mut e, &[press('3'), press('"'), press('a'), press('d'), press('d')]);
+        assert_eq!(e.buffer.contents(), "ddd");
+        assert_eq!(e.registers.get(Some('a')).content(), "aaa\nbbb\nccc\n");
+    }
+
+    #[test]
+    fn register_unnamed_default() {
+        // Without "x prefix, yank goes to unnamed only.
+        let mut e = editor_with("hello\nworld");
+        feed(&mut e, &[press('y'), press('y')]);
+        assert_eq!(e.registers.get(None).content(), "hello\n");
+        // Named register 'a' is still empty.
+        assert!(e.registers.get(Some('a')).is_empty());
+    }
+
+    #[test]
+    fn register_visual_yank_named() {
+        // v$"ay — visual select then yank into register a.
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('v'), press('$')]);
+        feed(&mut e, &[press('"'), press('a'), press('y')]);
+        assert_eq!(e.registers.get(Some('a')).content(), "hello world");
+    }
+
+    #[test]
+    fn register_visual_delete_named() {
+        // v$"ad — visual select then delete into register a.
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('v'), press('$')]);
+        feed(&mut e, &[press('"'), press('a'), press('d')]);
+        assert!(e.buffer.contents().is_empty() || e.buffer.contents() == "\n");
+        assert_eq!(e.registers.get(Some('a')).content(), "hello world");
+    }
+
+    #[test]
+    fn register_dw_into_named() {
+        // "adw — delete word into register a.
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('"'), press('a'), press('d'), press('w')]);
+        assert_eq!(e.buffer.contents(), "world");
+        assert_eq!(e.registers.get(Some('a')).content(), "hello ");
+    }
+
+    // ── Macros (q/@ recording and replay) ───────────────────────────────
+
+    #[test]
+    fn macro_record_and_replay() {
+        // qa, A!, Esc, q — record appending "!" to end of line.
+        // @a — replay on next line.
+        let mut e = editor_with("hello\nworld");
+        feed(&mut e, &[press('q'), press('a')]);
+        assert!(e.macro_recording.is_some());
+        feed(&mut e, &[press('A'), press('!'), esc()]);
+        feed(&mut e, &[press('q')]); // Stop recording.
+        assert!(e.macro_recording.is_none());
+        assert_eq!(e.buffer.contents(), "hello!\nworld");
+
+        // Move down and replay.
+        feed(&mut e, &[press('j'), press('@'), press('a')]);
+        assert_eq!(e.buffer.contents(), "hello!\nworld!");
+    }
+
+    #[test]
+    fn macro_replay_with_count() {
+        // Record: dd (delete line). Then 2@a to replay twice.
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        feed(&mut e, &[press('q'), press('a')]);
+        feed(&mut e, &[press('d'), press('d')]);
+        feed(&mut e, &[press('q')]);
+        assert_eq!(e.buffer.contents(), "bbb\nccc\nddd");
+
+        // 2@a deletes 2 more lines.
+        feed(&mut e, &[press('2'), press('@'), press('a')]);
+        assert_eq!(e.buffer.contents(), "ddd");
+    }
+
+    #[test]
+    fn macro_replay_at_at() {
+        // @a then @@ repeats the last macro.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('q'), press('a')]);
+        feed(&mut e, &[press('d'), press('d')]);
+        feed(&mut e, &[press('q')]);
+        // @a deletes one line.
+        feed(&mut e, &[press('@'), press('a')]);
+        assert_eq!(e.buffer.contents(), "ccc");
+
+        // Reset for a fresh test.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('q'), press('a')]);
+        feed(&mut e, &[press('d'), press('d')]);
+        feed(&mut e, &[press('q')]);
+        feed(&mut e, &[press('@'), press('a')]);
+        // @@ repeats the last macro.
+        feed(&mut e, &[press('@'), press('@')]);
+        assert_eq!(e.buffer.contents(), "");
+    }
+
+    #[test]
+    fn macro_empty_register_does_nothing() {
+        let mut e = editor_with("hello");
+        // @b with no recording — does nothing.
+        feed(&mut e, &[press('@'), press('b')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn macro_q_stops_recording() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('q'), press('a')]);
+        assert!(e.macro_recording.is_some());
+        // Type some keys, then q to stop.
+        feed(&mut e, &[press('x')]);
+        feed(&mut e, &[press('q')]);
+        assert!(e.macro_recording.is_none());
+        // The macro should contain the 'x' key but not the stopping 'q'.
+        assert_eq!(e.macro_keys[0].len(), 1); // Just 'x'.
+    }
+
+    #[test]
+    fn macro_does_not_record_during_replay() {
+        // After recording, replaying should not modify the macro.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('q'), press('a')]);
+        feed(&mut e, &[press('d'), press('d')]);
+        feed(&mut e, &[press('q')]);
+        let original_len = e.macro_keys[0].len();
+
+        // Replay — the macro_keys should not grow.
+        feed(&mut e, &[press('@'), press('a')]);
+        assert_eq!(e.macro_keys[0].len(), original_len);
+    }
+
+    #[test]
+    fn macro_recording_clears_previous() {
+        // Recording into the same register overwrites.
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('q'), press('a'), press('x'), press('q')]);
+        let len1 = e.macro_keys[0].len();
+        assert_eq!(len1, 1);
+
+        // Record again into 'a' with different content.
+        feed(&mut e, &[press('q'), press('a'), press('j'), press('j'), press('q')]);
+        assert_eq!(e.macro_keys[0].len(), 2); // j, j
+    }
+
+    #[test]
+    fn macro_separate_registers() {
+        // qa and qb are independent.
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // Record 'a': delete line.
+        feed(&mut e, &[press('q'), press('a'), press('d'), press('d'), press('q')]);
+        // Record 'b': join line.
+        feed(&mut e, &[press('q'), press('b'), press('J'), press('q')]);
+
+        assert_eq!(e.macro_keys[0].len(), 2); // d, d
+        assert_eq!(e.macro_keys[1].len(), 1); // J
+    }
+
+    #[test]
+    fn macro_with_search() {
+        // Record a macro that does a search and delete.
+        let mut e = editor_with("foo bar baz\nfoo bar baz");
+        feed(&mut e, &[press('q'), press('a')]);
+        // Search for "bar", then dw.
+        feed(&mut e, &[press('/'), press('b'), press('a'), press('r'), enter()]);
+        feed(&mut e, &[press('d'), press('w')]);
+        feed(&mut e, &[press('q')]);
+        assert_eq!(e.buffer.contents(), "foo baz\nfoo bar baz");
+
+        // Replay on the second line.
+        feed(&mut e, &[press('@'), press('a')]);
+        assert_eq!(e.buffer.contents(), "foo baz\nfoo baz");
+    }
+
+    #[test]
+    fn macro_no_start_during_replay() {
+        // During macro replay, q should not start a new recording.
+        let mut e = editor_with("aaa\nbbb");
+        // Record a macro that just moves down.
+        feed(&mut e, &[press('q'), press('a'), press('j'), press('q')]);
+        // During replay, the 'j' replays fine. No new recording starts.
+        feed(&mut e, &[press('g'), press('@'), press('a')]);
+        assert!(e.macro_recording.is_none());
+    }
+
+    #[test]
+    fn macro_escape_cancels_record_start() {
+        // q then Escape should not start recording.
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('q'), esc()]);
+        assert!(e.macro_recording.is_none());
+    }
+
+    #[test]
+    fn macro_dot_repeat_inside_macro() {
+        // Record: x (delete char) + . (repeat).
+        let mut e = editor_with("abcdef");
+        feed(&mut e, &[press('q'), press('a')]);
+        feed(&mut e, &[press('x')]);  // Delete 'a' → "bcdef"
+        feed(&mut e, &[press('.')]);   // Repeat: delete 'b' → "cdef"
+        feed(&mut e, &[press('q')]);
+        assert_eq!(e.buffer.contents(), "cdef");
+
+        // Replay: should delete 'c' and 'd'.
+        feed(&mut e, &[press('@'), press('a')]);
+        assert_eq!(e.buffer.contents(), "ef");
     }
 }

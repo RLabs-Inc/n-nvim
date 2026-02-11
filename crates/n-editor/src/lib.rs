@@ -10,7 +10,7 @@
 //! - **[`text_object`]** — Text objects (`iw`, `a"`, `i(`, etc.) for composable editing
 //! - **[`search`]** — Incremental search (`/`, `?`, `n`, `N`) with match highlighting
 //! - **[`view`]** — View layer that bridges buffers to n-term's framebuffer
-//! - **[`register`]** — Yank/delete register for clipboard operations
+//! - **[`register`]** — Register file: unnamed + 26 named registers (a-z) with append
 //!
 //! Future modules will add split tree layout, floating windows, and commands.
 
