@@ -100,18 +100,30 @@ impl Default for Register {
 
 // ── Register file ────────────────────────────────────────────────────────
 
-/// A complete register file — unnamed register + 26 named registers (a-z).
+/// A complete register file — unnamed + 26 named (a-z) + clipboard (+/*).
 ///
 /// All yank/delete operations write to the unnamed register automatically.
 /// When a named register is specified via `"a`, the text goes to both the
 /// named register and the unnamed register. Uppercase names (`"A`) append
 /// to the named register instead of overwriting.
+///
+/// The clipboard register (`"+` / `"*`) stores text that the editor should
+/// synchronize with the OS clipboard. The register file itself is agnostic
+/// to the OS — the editor is responsible for calling [`sync_clipboard_in`]
+/// before reads and writing to the OS after [`yank`] to `+`/`*`.
+///
+/// [`sync_clipboard_in`]: RegisterFile::sync_clipboard_in
 pub struct RegisterFile {
     /// The unnamed register — receives every yank and delete.
     unnamed: Register,
 
     /// Named registers a-z. Indexed by `ch as u8 - b'a'`.
     named: [Register; 26],
+
+    /// Clipboard register — shared by `"+` and `"*`.
+    /// On macOS both point to the same system pasteboard. On X11, `*` is
+    /// PRIMARY and `+` is CLIPBOARD — we unify them for simplicity.
+    clipboard: Register,
 }
 
 impl RegisterFile {
@@ -121,7 +133,14 @@ impl RegisterFile {
         Self {
             unnamed: Register::new(),
             named: std::array::from_fn(|_| Register::new()),
+            clipboard: Register::new(),
         }
+    }
+
+    /// Returns `true` if the given register name targets the clipboard.
+    #[must_use]
+    pub const fn is_clipboard(name: Option<char>) -> bool {
+        matches!(name, Some('+' | '*'))
     }
 
     /// Store text in a register.
@@ -129,10 +148,15 @@ impl RegisterFile {
     /// - `name == None` → unnamed only (default behavior)
     /// - `name == Some('a'..='z')` → overwrite named, copy to unnamed
     /// - `name == Some('A'..='Z')` → append to named, copy result to unnamed
+    /// - `name == Some('+')` or `Some('*')` → clipboard + unnamed
     ///
     /// Any other name falls back to unnamed-only.
     pub fn yank(&mut self, name: Option<char>, text: String, kind: RegisterKind) {
         match name {
+            Some('+' | '*') => {
+                self.clipboard.yank(text.clone(), kind);
+                self.unnamed.yank(text, kind);
+            }
             Some(ch @ 'a'..='z') => {
                 let idx = (ch as u8 - b'a') as usize;
                 self.named[idx].yank(text.clone(), kind);
@@ -153,16 +177,26 @@ impl RegisterFile {
         }
     }
 
+    /// Push text into the clipboard register from an external source.
+    ///
+    /// Call this before paste operations to synchronize the clipboard
+    /// register with the OS clipboard contents.
+    pub fn sync_clipboard_in(&mut self, text: String, kind: RegisterKind) {
+        self.clipboard.yank(text, kind);
+    }
+
     /// Get the register to read from.
     ///
     /// - `None` → unnamed register
     /// - `Some('a'..='z')` → named register
     /// - `Some('A'..='Z')` → same as lowercase (reads are case-insensitive)
+    /// - `Some('+')` or `Some('*')` → clipboard register
     ///
     /// Any other name falls back to unnamed.
     #[must_use]
     pub const fn get(&self, name: Option<char>) -> &Register {
         match name {
+            Some('+' | '*') => &self.clipboard,
             Some(ch) if ch.is_ascii_lowercase() => {
                 &self.named[(ch as u8 - b'a') as usize]
             }
@@ -483,5 +517,74 @@ mod tests {
         assert_eq!(rf.get(Some('a')).content(), "named");
         // Unnamed updated.
         assert_eq!(rf.get(None).content(), "unnamed");
+    }
+
+    // ── Clipboard register (+/*) ────────────────────────────────────────
+
+    #[test]
+    fn is_clipboard_plus() {
+        assert!(RegisterFile::is_clipboard(Some('+')));
+    }
+
+    #[test]
+    fn is_clipboard_star() {
+        assert!(RegisterFile::is_clipboard(Some('*')));
+    }
+
+    #[test]
+    fn is_clipboard_not_letter() {
+        assert!(!RegisterFile::is_clipboard(Some('a')));
+        assert!(!RegisterFile::is_clipboard(None));
+    }
+
+    #[test]
+    fn clipboard_yank_plus() {
+        let mut rf = RegisterFile::new();
+        rf.yank(Some('+'), "clipboard text".into(), RegisterKind::Char);
+        assert_eq!(rf.get(Some('+')).content(), "clipboard text");
+        assert_eq!(rf.get(Some('+')).kind(), RegisterKind::Char);
+        // Also written to unnamed.
+        assert_eq!(rf.get(None).content(), "clipboard text");
+    }
+
+    #[test]
+    fn clipboard_yank_star() {
+        let mut rf = RegisterFile::new();
+        rf.yank(Some('*'), "star text".into(), RegisterKind::Line);
+        assert_eq!(rf.get(Some('*')).content(), "star text");
+        assert_eq!(rf.get(Some('*')).kind(), RegisterKind::Line);
+    }
+
+    #[test]
+    fn clipboard_plus_and_star_share_register() {
+        let mut rf = RegisterFile::new();
+        rf.yank(Some('+'), "shared".into(), RegisterKind::Char);
+        // Reading via * should return the same content.
+        assert_eq!(rf.get(Some('*')).content(), "shared");
+    }
+
+    #[test]
+    fn clipboard_sync_in() {
+        let mut rf = RegisterFile::new();
+        rf.sync_clipboard_in("from os".into(), RegisterKind::Char);
+        assert_eq!(rf.get(Some('+')).content(), "from os");
+        assert_eq!(rf.get(Some('*')).content(), "from os");
+    }
+
+    #[test]
+    fn clipboard_does_not_affect_named() {
+        let mut rf = RegisterFile::new();
+        rf.yank(Some('a'), "named".into(), RegisterKind::Char);
+        rf.yank(Some('+'), "clipboard".into(), RegisterKind::Char);
+        assert_eq!(rf.get(Some('a')).content(), "named");
+    }
+
+    #[test]
+    fn clipboard_isolation_from_named() {
+        let mut rf = RegisterFile::new();
+        rf.yank(Some('+'), "clip".into(), RegisterKind::Char);
+        rf.yank(Some('a'), "named".into(), RegisterKind::Char);
+        // Clipboard unchanged by named register write.
+        assert_eq!(rf.get(Some('+')).content(), "clip");
     }
 }
