@@ -25,6 +25,10 @@
 //! | `:bd` / `:bdelete`         | Close current buffer                    |
 //! | `:bd!`                     | Force-close current buffer               |
 //! | `:ls` / `:buffers`         | List all open buffers                   |
+//! | `:sp` / `:split`           | Horizontal split (top/bottom)           |
+//! | `:vsp` / `:vsplit`         | Vertical split (left/right)             |
+//! | `:close`                   | Close the current window                |
+//! | `:only`                    | Close all windows except current        |
 //!
 //! # Substitution flags
 //!
@@ -141,6 +145,18 @@ pub enum Command {
 
     /// `:ls` / `:buffers` — list all open buffers.
     BufList,
+
+    /// `:sp` / `:split` — horizontal split (current window becomes top half).
+    Split,
+
+    /// `:vsp` / `:vsplit` — vertical split (current window becomes left half).
+    VSplit,
+
+    /// `:close` — close the current window (buffer stays open).
+    WinClose,
+
+    /// `:only` — close all windows except the current one.
+    WinOnly,
 
     /// Unknown command — contains the full input for error reporting.
     Unknown(String),
@@ -302,9 +318,12 @@ fn parse_command(input: &str) -> Command {
     // Try to parse a range prefix, then the command.
     let (range, rest) = parse_range(trimmed);
 
-    // If there's a range and the next char is `s`, it's a substitution.
+    // If the rest starts with `s` followed by a delimiter (or nothing),
+    // it's a substitution command. We must NOT match `sp`, `split`, etc.
     if let Some(after_s) = rest.strip_prefix('s') {
-        return parse_substitute(range, after_s);
+        if after_s.is_empty() || !after_s.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return parse_substitute(range, after_s);
+        }
     }
 
     // A range with no command following it is invalid.
@@ -347,6 +366,10 @@ fn parse_command(input: &str) -> Command {
         "bd" | "bdelete" => Command::BufDelete,
         "bd!" | "bdelete!" => Command::BufDeleteForce,
         "ls" | "buffers" => Command::BufList,
+        "sp" | "split" => Command::Split,
+        "vsp" | "vsplit" => Command::VSplit,
+        "close" | "clo" => Command::WinClose,
+        "only" | "on" => Command::WinOnly,
         _ => Command::Unknown(trimmed.to_string()),
     }
 }
@@ -1174,5 +1197,31 @@ mod tests {
     fn parse_buf_list() {
         assert_eq!(parse_command("ls"), Command::BufList);
         assert_eq!(parse_command("buffers"), Command::BufList);
+    }
+
+    // ── Window commands ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_split() {
+        assert_eq!(parse_command("sp"), Command::Split);
+        assert_eq!(parse_command("split"), Command::Split);
+    }
+
+    #[test]
+    fn parse_vsplit() {
+        assert_eq!(parse_command("vsp"), Command::VSplit);
+        assert_eq!(parse_command("vsplit"), Command::VSplit);
+    }
+
+    #[test]
+    fn parse_win_close() {
+        assert_eq!(parse_command("close"), Command::WinClose);
+        assert_eq!(parse_command("clo"), Command::WinClose);
+    }
+
+    #[test]
+    fn parse_win_only() {
+        assert_eq!(parse_command("only"), Command::WinOnly);
+        assert_eq!(parse_command("on"), Command::WinOnly);
     }
 }

@@ -36,6 +36,7 @@ use n_editor::mode::{Mode, VisualKind};
 use n_editor::position::{Position, Range};
 use n_editor::register::{RegisterFile, RegisterKind};
 use n_editor::search::{self, SearchDirection, SearchState};
+use n_editor::split::{Direction, Rect, Split, WinId};
 use n_editor::text_object;
 use n_editor::view::{self, View};
 
@@ -133,6 +134,8 @@ enum Pending {
         op: char,
         raw_motion_count: Option<usize>,
     },
+    /// `Ctrl+W` prefix — waiting for the window command key (h/j/k/l/w/s/v/c/o).
+    CtrlW,
 }
 
 // ─── Dot-repeat ─────────────────────────────────────────────────────────────
@@ -156,24 +159,38 @@ struct DotRepeat {
     keys: Vec<KeyEvent>,
 }
 
-// ─── Buffer state ──────────────────────────────────────────────────────────
+// ─── Buffer / window state ─────────────────────────────────────────────────
 
-/// Per-buffer state that travels with a buffer when switching.
+/// Per-buffer state — the text content and its editing history.
 ///
-/// The current buffer's state lives "unpacked" as flat fields on [`Editor`]
-/// for zero-overhead access. Inactive buffers are stored as `BufferState` in
-/// `Editor::other_bufs`. Switching buffers packs the current fields into a
-/// `BufferState` and unpacks the target.
-struct BufferState {
+/// Stored in `Editor::other_bufs` for inactive buffers. The active buffer
+/// lives "unpacked" as flat fields on [`Editor`] for zero-overhead access.
+struct BufEntry {
     /// Unique buffer ID (monotonically increasing, Vim-style starting at 1).
     id: usize,
     buffer: Buffer,
-    cursor: Cursor,
-    view: View,
     history: History,
     marks: [Option<Position>; 26],
     change_list: ChangeList,
     last_visual_lines: Option<(usize, usize)>,
+    /// Last-seen cursor position — restored when a window switches to this buffer.
+    last_cursor: Cursor,
+    /// Last-seen view state — restored when a window switches to this buffer.
+    last_view: View,
+}
+
+/// Per-window state — how a window views a buffer.
+///
+/// Each window has its own cursor and scroll position, independent of other
+/// windows that may show the same buffer. Stored in `Editor::other_wins`
+/// for inactive windows; the active window's cursor/view are flat fields.
+struct WinState {
+    /// Unique window ID (monotonically increasing).
+    id: WinId,
+    /// Which buffer this window is displaying.
+    buf_id: usize,
+    cursor: Cursor,
+    view: View,
 }
 
 // ─── Editor ─────────────────────────────────────────────────────────────────
@@ -186,27 +203,27 @@ struct BufferState {
 /// current mode, undo history, view configuration, command line state, and
 /// the screen position of the cursor computed during the last paint.
 ///
-/// # Multi-buffer architecture
+/// # Multi-buffer + window architecture
 ///
-/// The current buffer's per-buffer state (buffer, cursor, view, history,
-/// marks, change list) lives as flat fields on Editor for zero-overhead
-/// access — no indirection, no borrow checker gymnastics. Inactive buffers
-/// are stored as [`BufferState`] in `other_bufs`. Switching buffers packs
-/// the current fields into a `BufferState`, swaps it into the Vec, and
-/// unpacks the target.
+/// The active window's buffer state (buffer, history, marks, change list)
+/// lives as flat fields. The active window's view state (cursor, view) also
+/// lives as flat fields. Inactive buffers are in `other_bufs`, inactive
+/// windows in `other_wins`. The split tree describes the window layout.
 struct Editor {
-    // ── Per-buffer state (current buffer, unpacked) ──────────────────
+    // ── Per-buffer state (active buffer, unpacked) ───────────────────
     buffer: Buffer,
+    history: History,
+
+    // ── Per-window state (active window, unpacked) ───────────────────
     cursor: Cursor,
     view: View,
     mode: Mode,
-    history: History,
 
     // ── Multi-buffer management ──────────────────────────────────────
 
-    /// Inactive buffers. The current buffer is NOT in this list — it lives
+    /// Inactive buffers (text + history + marks). The active buffer lives
     /// unpacked in the flat fields above.
-    other_bufs: Vec<BufferState>,
+    other_bufs: Vec<BufEntry>,
 
     /// ID of the current buffer (matches the `id` it would have if packed).
     current_buf_id: usize,
@@ -216,6 +233,20 @@ struct Editor {
 
     /// Next ID to assign when creating a new buffer.
     next_buf_id: usize,
+
+    // ── Window management ────────────────────────────────────────────
+
+    /// The split tree describing the window layout.
+    split: Split,
+
+    /// ID of the active (focused) window.
+    active_win_id: WinId,
+
+    /// Inactive windows. The active window's cursor/view are the flat fields.
+    other_wins: Vec<WinState>,
+
+    /// Next window ID to assign.
+    next_win_id: WinId,
 
     /// Multi-key command state. When an operator key (`d`, `c`, `y`) is
     /// pressed, this tracks the pending state until the command is completed
@@ -287,6 +318,9 @@ struct Editor {
     /// to compute half-page scroll distance.
     last_text_height: usize,
 
+    /// The last frame size, used for window navigation layout computation.
+    last_frame_size: (u16, u16),
+
     /// Buffer-local marks (a-z). Each stores the position where `ma`..`mz`
     /// was set. Indexed by `ch - 'a'`.
     marks: [Option<Position>; 26],
@@ -336,6 +370,10 @@ impl Editor {
             current_buf_id: 1,
             alternate_buf_id: None,
             next_buf_id: 2,
+            split: Split::leaf(1),
+            active_win_id: 1,
+            other_wins: Vec::new(),
+            next_win_id: 2,
             pending: None,
             count: None,
             cursor_screen: None,
@@ -354,6 +392,7 @@ impl Editor {
             last_change: None,
             dot_replaying: false,
             last_text_height: 24, // Sensible default until first paint.
+            last_frame_size: (80, 24),
             marks: [None; 26],
             macro_keys: std::array::from_fn(|_| Vec::new()),
             macro_recording: None,
@@ -384,6 +423,10 @@ impl Editor {
             current_buf_id: 1,
             alternate_buf_id: None,
             next_buf_id: 2,
+            split: Split::leaf(1),
+            active_win_id: 1,
+            other_wins: Vec::new(),
+            next_win_id: 2,
             pending: None,
             count: None,
             cursor_screen: None,
@@ -402,6 +445,7 @@ impl Editor {
             last_change: None,
             dot_replaying: false,
             last_text_height: 24,
+            last_frame_size: (80, 24),
             marks: [None; 26],
             macro_keys: std::array::from_fn(|_| Vec::new()),
             macro_recording: None,
@@ -458,33 +502,55 @@ impl Editor {
         }
     }
 
-    /// Pack the current buffer's per-buffer fields into a `BufferState`.
-    fn pack_current(&mut self) -> BufferState {
-        BufferState {
+    // ── Buffer pack/unpack ──────────────────────────────────────────
+
+    /// Pack the active buffer's state into a `BufEntry`.
+    fn pack_buf(&mut self) -> BufEntry {
+        BufEntry {
             id: self.current_buf_id,
             buffer: std::mem::replace(&mut self.buffer, Buffer::new()),
-            cursor: std::mem::replace(&mut self.cursor, Cursor::new()),
-            view: std::mem::replace(&mut self.view, View::new()),
             history: std::mem::replace(&mut self.history, History::new()),
             marks: std::mem::take(&mut self.marks),
             change_list: std::mem::replace(&mut self.change_list, ChangeList::new()),
             last_visual_lines: self.last_visual_lines.take(),
+            last_cursor: self.cursor.clone(),
+            last_view: self.view.clone(),
         }
     }
 
-    /// Unpack a `BufferState` into the current buffer's flat fields.
-    fn unpack(&mut self, bs: BufferState) {
-        self.current_buf_id = bs.id;
-        self.buffer = bs.buffer;
-        self.cursor = bs.cursor;
-        self.view = bs.view;
-        self.history = bs.history;
-        self.marks = bs.marks;
-        self.change_list = bs.change_list;
-        self.last_visual_lines = bs.last_visual_lines;
+    /// Unpack a `BufEntry` into the active buffer's flat fields.
+    fn unpack_buf(&mut self, be: BufEntry) {
+        self.current_buf_id = be.id;
+        self.buffer = be.buffer;
+        self.history = be.history;
+        self.marks = be.marks;
+        self.change_list = be.change_list;
+        self.last_visual_lines = be.last_visual_lines;
     }
 
-    /// Switch to the buffer with the given ID. Returns false if not found.
+    // ── Window pack/unpack ─────────────────────────────────────────
+
+    /// Pack the active window's per-window state.
+    const fn pack_win(&mut self) -> WinState {
+        WinState {
+            id: self.active_win_id,
+            buf_id: self.current_buf_id,
+            cursor: std::mem::replace(&mut self.cursor, Cursor::new()),
+            view: std::mem::replace(&mut self.view, View::new()),
+        }
+    }
+
+    /// Unpack a `WinState` into the active window's flat fields.
+    const fn unpack_win(&mut self, ws: WinState) {
+        self.active_win_id = ws.id;
+        // Buffer switch handled separately if needed.
+        self.cursor = ws.cursor;
+        self.view = ws.view;
+    }
+
+    /// Switch the active buffer in the current window. Packs/unpacks
+    /// the buffer but leaves the window (cursor/view) alone — the caller
+    /// is responsible for setting up cursor/view (fresh or restored).
     fn switch_to_buffer(&mut self, target_id: usize) -> bool {
         if target_id == self.current_buf_id {
             return true;
@@ -494,13 +560,18 @@ impl Editor {
             return false;
         };
 
-        // Pack current and swap with target.
-        let packed = self.pack_current();
+        // Pack current buffer and swap with target.
+        let packed = self.pack_buf();
         let target = std::mem::replace(&mut self.other_bufs[target_idx], packed);
-        self.unpack(target);
+        let old_buf_id = self.other_bufs[target_idx].id;
+
+        // Restore cursor/view from the buffer's last-known state.
+        self.cursor = target.last_cursor.clone();
+        self.view = target.last_view.clone();
+        self.unpack_buf(target);
 
         // Record alternate for Ctrl+^.
-        self.alternate_buf_id = Some(self.other_bufs[target_idx].id);
+        self.alternate_buf_id = Some(old_buf_id);
 
         // Reset editing state on buffer switch.
         self.mode = Mode::Normal;
@@ -510,6 +581,44 @@ impl Editor {
         self.clear_message();
 
         true
+    }
+
+    // ── Window switching ───────────────────────────────────────────
+
+    /// Switch to a different window by ID.
+    fn switch_window(&mut self, target_win_id: WinId) {
+        if target_win_id == self.active_win_id {
+            return;
+        }
+
+        let Some(target_idx) = self.other_wins.iter().position(|w| w.id == target_win_id) else {
+            return;
+        };
+
+        let target_ws = self.other_wins.remove(target_idx);
+
+        // Pack the active window.
+        let packed_win = self.pack_win();
+        self.other_wins.push(packed_win);
+
+        // If the target shows a different buffer, swap buffers too.
+        if target_ws.buf_id != self.current_buf_id {
+            let packed_buf = self.pack_buf();
+            self.other_bufs.push(packed_buf);
+
+            let buf_idx = self.other_bufs.iter().position(|b| b.id == target_ws.buf_id).unwrap();
+            let target_buf = self.other_bufs.remove(buf_idx);
+            self.unpack_buf(target_buf);
+        }
+
+        self.unpack_win(target_ws);
+
+        // Reset editing state.
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.count = None;
+        self.search = None;
+        self.clear_message();
     }
 
     /// Sorted list of all buffer IDs (current + other), for ordered iteration.
@@ -553,8 +662,8 @@ impl Editor {
             Err(e) => return CommandResult::Err(format!("E325: {e}")),
         };
 
-        // Pack current and store it.
-        let packed = self.pack_current();
+        // Pack current buffer and store it.
+        let packed = self.pack_buf();
         let old_id = packed.id;
         self.other_bufs.push(packed);
 
@@ -644,7 +753,9 @@ impl Editor {
         let target_idx = self.other_bufs.iter().position(|b| b.id == target_id).unwrap();
         let target = self.other_bufs.remove(target_idx);
         let old_id = self.current_buf_id;
-        self.unpack(target);
+        self.cursor = target.last_cursor.clone();
+        self.view = target.last_view.clone();
+        self.unpack_buf(target);
 
         // Set alternate to the closest remaining buffer (not the deleted one).
         self.alternate_buf_id = if self.other_bufs.is_empty() {
@@ -700,6 +811,138 @@ impl Editor {
             .unwrap_or("[No Name]");
         let lines = self.buffer.line_count();
         self.set_message(format!("\"{name}\" {lines}L"));
+    }
+
+    // ── Window management ──────────────────────────────────────────────
+
+    /// Total number of windows.
+    fn win_count(&self) -> usize {
+        self.split.window_count()
+    }
+
+    /// `:sp` — split the current window horizontally (top/bottom).
+    fn win_split_horizontal(&mut self) -> CommandResult {
+        let new_win_id = self.next_win_id;
+        self.next_win_id += 1;
+
+        // The new window gets a clone of the current cursor/view and
+        // references the same buffer.
+        let new_win = WinState {
+            id: new_win_id,
+            buf_id: self.current_buf_id,
+            cursor: self.cursor.clone(),
+            view: self.view.clone(),
+        };
+        self.other_wins.push(new_win);
+        self.split.split_horizontal(self.active_win_id, new_win_id);
+        CommandResult::Ok(None)
+    }
+
+    /// `:vsp` — split the current window vertically (left/right).
+    fn win_split_vertical(&mut self) -> CommandResult {
+        let new_win_id = self.next_win_id;
+        self.next_win_id += 1;
+
+        let new_win = WinState {
+            id: new_win_id,
+            buf_id: self.current_buf_id,
+            cursor: self.cursor.clone(),
+            view: self.view.clone(),
+        };
+        self.other_wins.push(new_win);
+        self.split.split_vertical(self.active_win_id, new_win_id);
+        CommandResult::Ok(None)
+    }
+
+    /// `:close` — close the current window (buffer stays open).
+    fn win_close(&mut self) -> CommandResult {
+        if self.win_count() <= 1 {
+            return CommandResult::Err(
+                "E444: Cannot close last window".to_string(),
+            );
+        }
+
+        // Find the next window to switch to.
+        let next_id = self.split.cycle_next(self.active_win_id);
+        self.split.remove(self.active_win_id);
+
+        // Load the target window's state.
+        let target_idx = self.other_wins.iter().position(|w| w.id == next_id).unwrap();
+        let target_ws = self.other_wins.remove(target_idx);
+
+        // Switch buffer if needed.
+        if target_ws.buf_id != self.current_buf_id {
+            self.pack_and_swap_buf(target_ws.buf_id);
+        }
+
+        self.unpack_win(target_ws);
+
+        // Reset editing state.
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.count = None;
+        self.search = None;
+        self.clear_message();
+        CommandResult::Ok(None)
+    }
+
+    /// `:only` — close all windows except the current one.
+    fn win_only(&mut self) -> CommandResult {
+        if self.win_count() <= 1 {
+            return CommandResult::Ok(None); // Already the only window.
+        }
+
+        let removed = self.split.keep_only(self.active_win_id);
+        // Remove all inactive window states for the closed windows.
+        self.other_wins.retain(|w| !removed.contains(&w.id));
+        CommandResult::Ok(None)
+    }
+
+    /// Pack the current buffer and load a different one by ID.
+    fn pack_and_swap_buf(&mut self, target_buf_id: usize) {
+        if target_buf_id == self.current_buf_id {
+            return;
+        }
+        let packed = self.pack_buf();
+        self.other_bufs.push(packed);
+        let idx = self.other_bufs.iter().position(|b| b.id == target_buf_id).unwrap();
+        let target = self.other_bufs.remove(idx);
+        self.unpack_buf(target);
+    }
+
+    /// Get a reference to a buffer by ID (active or inactive).
+    fn get_buffer_by_id(&self, buf_id: usize) -> &Buffer {
+        if buf_id == self.current_buf_id {
+            &self.buffer
+        } else {
+            &self.other_bufs.iter().find(|b| b.id == buf_id).unwrap().buffer
+        }
+    }
+
+    /// Render an inactive window into its rectangle.
+    ///
+    /// Temporarily removes the `WinState` from `other_wins` to avoid
+    /// borrow conflicts (we need `&mut view` and `&buffer` simultaneously).
+    fn render_inactive_window(
+        &mut self,
+        win_id: WinId,
+        buf_info: &str,
+        frame: &mut FrameBuffer,
+        rect: Rect,
+    ) {
+        let Some(ws_idx) = self.other_wins.iter().position(|w| w.id == win_id) else {
+            return;
+        };
+
+        // Temporarily take the WinState out so we can borrow self.buffer
+        // and ws.view mutably without conflict.
+        let mut ws = self.other_wins.remove(ws_idx);
+        let buf = self.get_buffer_by_id(ws.buf_id);
+        ws.view.render(
+            buf, &ws.cursor, Mode::Normal, None, buf_info,
+            frame, rect.x, rect.y, rect.w, rect.h,
+        );
+        self.other_wins.insert(ws_idx, ws);
     }
 
     // ── Count accumulation ─────────────────────────────────────────────
@@ -1094,6 +1337,12 @@ impl Editor {
                         // Already at the start of the jump list — no bell,
                         // but we could show a message if desired.
                     }
+                    return Action::Continue;
+                }
+                KeyCode::Char('w') => {
+                    // Ctrl+W — window command prefix.
+                    self.pending = Some(Pending::CtrlW);
+                    self.count = None;
                     return Action::Continue;
                 }
                 _ => {}
@@ -1609,6 +1858,62 @@ impl Editor {
                 self.dot_cancel();
                 Action::Continue
             }
+            Pending::CtrlW => {
+                match key.code {
+                    KeyCode::Char('w') => {
+                        // Ctrl+W w — cycle to next window.
+                        let next = self.split.cycle_next(self.active_win_id);
+                        self.switch_window(next);
+                    }
+                    KeyCode::Char('W') => {
+                        // Ctrl+W W — cycle to previous window.
+                        let prev = self.split.cycle_prev(self.active_win_id);
+                        self.switch_window(prev);
+                    }
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        self.win_navigate(Direction::Left);
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.win_navigate(Direction::Down);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.win_navigate(Direction::Up);
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        self.win_navigate(Direction::Right);
+                    }
+                    KeyCode::Char('s') => {
+                        // Ctrl+W s — same as :sp.
+                        self.win_split_horizontal();
+                    }
+                    KeyCode::Char('v') => {
+                        // Ctrl+W v — same as :vsp.
+                        self.win_split_vertical();
+                    }
+                    KeyCode::Char('c') => {
+                        // Ctrl+W c — close current window.
+                        if let CommandResult::Err(msg) = self.win_close() {
+                            self.set_error(msg);
+                        }
+                    }
+                    KeyCode::Char('o') => {
+                        // Ctrl+W o — close all other windows.
+                        self.win_only();
+                    }
+                    _ => {} // Unrecognized or Escape — cancel silently.
+                }
+                Action::Continue
+            }
+        }
+    }
+
+    /// Navigate to the window in the given direction using the split layout.
+    fn win_navigate(&mut self, dir: Direction) {
+        let (w, h) = self.last_frame_size;
+        let main_h = h.saturating_sub(1); // exclude command line row
+        let area = Rect { x: 0, y: 0, w, h: main_h };
+        if let Some(target) = self.split.neighbor(self.active_win_id, dir, area) {
+            self.switch_window(target);
         }
     }
 
@@ -2401,6 +2706,10 @@ impl Editor {
                 self.cmd_substitute(&range, &pattern, &replacement, flags)
             }
             Command::SubRepeat { range } => self.cmd_sub_repeat(&range),
+            Command::Split => self.win_split_horizontal(),
+            Command::VSplit => self.win_split_vertical(),
+            Command::WinClose => self.win_close(),
+            Command::WinOnly => self.win_only(),
             Command::Unknown(input) => {
                 if input.is_empty() {
                     CommandResult::Ok(None)
@@ -4153,101 +4462,96 @@ impl App for Editor {
     fn paint(&mut self, frame: &mut FrameBuffer) {
         let w = frame.width();
         let h = frame.height();
-
-        // Compute the visual selection for the render pipeline.
-        let selection = match self.mode {
-            Mode::Visual(kind) => self.cursor.selection().map(|r| (r, kind)),
-            _ => None,
-        };
-
-        // Buffer info label for the status line (shown when >1 buffer open).
-        let buf_info = self.buf_info_label();
+        self.last_frame_size = (w, h);
 
         if h < 2 {
-            // Too small for text + status + command line. Just render
-            // what we can into the View.
+            // Too small for multi-window — just render the active window.
+            let selection = match self.mode {
+                Mode::Visual(kind) => self.cursor.selection().map(|r| (r, kind)),
+                _ => None,
+            };
+            let buf_info = self.buf_info_label();
             self.cursor_screen = self.view.render(
-                &self.buffer,
-                &self.cursor,
-                self.mode,
-                selection,
-                &buf_info,
-                frame,
-                0,
-                0,
-                w,
-                h,
+                &self.buffer, &self.cursor, self.mode, selection, &buf_info,
+                frame, 0, 0, w, h,
             );
             return;
         }
 
-        // Give the View all rows except the bottom one (command/message line).
-        let view_height = h - 1;
-        // Store text height for Ctrl+D/Ctrl+U (status line takes 1 row
-        // from view_height, so text rows = view_height - 1).
-        self.last_text_height = view_height.saturating_sub(1) as usize;
-        self.cursor_screen = self.view.render(
-            &self.buffer,
-            &self.cursor,
-            self.mode,
-            selection,
-            &buf_info,
-            frame,
-            0,
-            0,
-            w,
-            view_height,
-        );
+        // Reserve the bottom row for command/message line.
+        let main_height = h - 1;
+        let main_area = Rect { x: 0, y: 0, w, h: main_height };
 
-        // Highlight search matches in the visible area.
-        let hl_pattern = if self.search.is_some() {
-            self.search.as_ref().map_or("", |ss| ss.input())
-        } else {
-            &self.last_search
-        };
-        if !hl_pattern.is_empty() {
-            view::highlight_matches(
-                &self.view,
-                frame,
-                &self.buffer,
-                hl_pattern,
-                0,
-                0,
-                w,
-                view_height,
-            );
+        // Compute layout rectangles for all windows.
+        let rects = self.split.layout(main_area);
+        let buf_info = self.buf_info_label();
+
+        // Render each window into its rectangle.
+        for &(win_id, rect) in &rects {
+            if win_id == self.active_win_id {
+                // Active window: use flat fields.
+                let selection = match self.mode {
+                    Mode::Visual(kind) => self.cursor.selection().map(|r| (r, kind)),
+                    _ => None,
+                };
+                // Store text height for active window (for Ctrl+D/U).
+                self.last_text_height = rect.h.saturating_sub(1) as usize;
+                self.cursor_screen = self.view.render(
+                    &self.buffer, &self.cursor, self.mode, selection, &buf_info,
+                    frame, rect.x, rect.y, rect.w, rect.h,
+                );
+                // Highlight search matches in the active window.
+                let hl_pattern = if self.search.is_some() {
+                    self.search.as_ref().map_or("", |ss| ss.input())
+                } else {
+                    &self.last_search
+                };
+                if !hl_pattern.is_empty() {
+                    view::highlight_matches(
+                        &self.view, frame, &self.buffer, hl_pattern,
+                        rect.x, rect.y, rect.w, rect.h,
+                    );
+                }
+            } else {
+                // Inactive window: render with its own cursor/view.
+                self.render_inactive_window(win_id, &buf_info, frame, rect);
+            }
+        }
+
+        // Draw vertical separators.
+        let separators = self.split.separators(main_area);
+        for (sx, sy, sh) in separators {
+            for row in 0..sh {
+                frame.set(
+                    sx,
+                    sy + row,
+                    n_term::cell::Cell::styled(
+                        '│',
+                        n_term::color::CellColor::Default,
+                        n_term::color::CellColor::Default,
+                        n_term::cell::Attr::DIM,
+                        n_term::cell::UnderlineStyle::None,
+                    ),
+                );
+            }
         }
 
         // Bottom row: command line, search prompt, or message.
         let bottom_y = h - 1;
 
         if let Some(ref ss) = self.search {
-            // Render the search prompt and position the cursor there.
             let search_cursor = view::render_search_line(
-                frame,
-                ss.prefix(),
-                ss.input(),
-                ss.input_cursor(),
-                0,
-                bottom_y,
-                w,
+                frame, ss.prefix(), ss.input(), ss.input_cursor(),
+                0, bottom_y, w,
             );
             self.cursor_screen = search_cursor;
         } else if self.mode == Mode::Command {
-            // Render the command line and position the cursor there.
             let cmd_cursor = view::render_command_line(
-                frame,
-                self.cmdline.input(),
-                self.cmdline.cursor(),
-                0,
-                bottom_y,
-                w,
+                frame, self.cmdline.input(), self.cmdline.cursor(),
+                0, bottom_y, w,
             );
-            // In command mode, the cursor lives on the command line.
             self.cursor_screen = cmd_cursor;
         } else if let Some(idx) = self.macro_recording {
-            // Show "recording @a" while macro recording is active.
-            // Safe: idx is always 0..25 (fits in u8).
             #[allow(clippy::cast_possible_truncation)]
             let ch = (b'a' + idx as u8) as char;
             let msg = format!("recording @{ch}");
@@ -4255,7 +4559,6 @@ impl App for Editor {
         } else if let Some(ref msg) = self.message {
             view::render_message_line(frame, msg, self.message_is_error, 0, bottom_y, w);
         } else {
-            // Empty bottom line.
             view::render_message_line(frame, "", false, 0, bottom_y, w);
         }
     }

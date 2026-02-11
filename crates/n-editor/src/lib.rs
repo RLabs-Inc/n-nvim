@@ -14,8 +14,7 @@
 //! - **[`command`]** — Command-line parsing (`:w`, `:q`, `:e`, `:s`, `:bn`, `:bd`, `:ls`)
 //! - **[`register`]** — Register file: unnamed + 26 named registers (a-z) with append
 //! - **[`jumplist`]** — Jump list (`Ctrl+O`/`Ctrl+I`) and change list (`g;`/`g,`)
-//!
-//! Future modules will add split tree layout and floating windows.
+//! - **[`split`]** — Split tree layout for window panes (`:sp`, `:vsp`, `Ctrl+W`)
 
 pub mod buffer;
 pub mod command;
@@ -26,6 +25,7 @@ pub mod mode;
 pub mod position;
 pub mod register;
 pub mod search;
+pub mod split;
 pub mod text_object;
 pub mod view;
 pub mod word;
