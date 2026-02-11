@@ -31,8 +31,9 @@ use n_editor::buffer::Buffer;
 use n_editor::command::{Command, CommandLine, CommandResult};
 use n_editor::cursor::Cursor;
 use n_editor::history::History;
-use n_editor::mode::Mode;
+use n_editor::mode::{Mode, VisualKind};
 use n_editor::position::{Position, Range};
+use n_editor::register::{Register, RegisterKind};
 use n_editor::view::{self, View};
 
 use n_term::ansi::CursorShape;
@@ -67,6 +68,9 @@ struct Editor {
     /// The command-line input buffer (active when mode == Command).
     cmdline: CommandLine,
 
+    /// The unnamed register — stores yanked and deleted text for `p`/`P`.
+    register: Register,
+
     /// A message to display on the bottom line. Cleared on the next keypress.
     message: Option<String>,
 
@@ -86,6 +90,7 @@ impl Editor {
             pending_op: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
+            register: Register::new(),
             message: None,
             message_is_error: false,
         }
@@ -107,6 +112,7 @@ impl Editor {
             pending_op: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
+            register: Register::new(),
             message: None,
             message_is_error: false,
         }
@@ -130,6 +136,57 @@ impl Editor {
         self.message_is_error = false;
     }
 
+    // ── Shared motion dispatch ──────────────────────────────────────────
+
+    /// Apply a cursor motion from the given key. Returns `true` if the key
+    /// was consumed as a motion, `false` if it wasn't a recognized motion.
+    ///
+    /// This is shared between normal and visual modes so both can move the
+    /// cursor with the same keys without duplicating the dispatch table.
+    fn apply_motion(&mut self, code: KeyCode, pe: bool) -> bool {
+        match code {
+            // Basic movement
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.cursor.move_left(1, &self.buffer, pe);
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.cursor.move_right(1, &self.buffer, pe);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.cursor.move_down(1, &self.buffer, pe);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.cursor.move_up(1, &self.buffer, pe);
+            }
+
+            // Line motions
+            KeyCode::Char('0') | KeyCode::Home => {
+                self.cursor.move_to_line_start();
+            }
+            KeyCode::Char('$') | KeyCode::End => {
+                self.cursor.move_to_line_end(&self.buffer, pe);
+            }
+            KeyCode::Char('^') => {
+                self.cursor.move_to_first_non_blank(&self.buffer, pe);
+            }
+
+            // Word motions
+            KeyCode::Char('w') => self.cursor.word_forward(1, &self.buffer, pe),
+            KeyCode::Char('b') => self.cursor.word_backward(1, &self.buffer, pe),
+            KeyCode::Char('e') => self.cursor.word_end_forward(1, &self.buffer, pe),
+            KeyCode::Char('W') => self.cursor.big_word_forward(1, &self.buffer, pe),
+            KeyCode::Char('B') => self.cursor.big_word_backward(1, &self.buffer, pe),
+            KeyCode::Char('E') => self.cursor.big_word_end_forward(1, &self.buffer, pe),
+
+            // File motions
+            KeyCode::Char('g') => self.cursor.move_to_first_line(&self.buffer, pe),
+            KeyCode::Char('G') => self.cursor.move_to_last_line(&self.buffer, pe),
+
+            _ => return false,
+        }
+        true
+    }
+
     // ── Normal mode ──────────────────────────────────────────────────────
 
     fn handle_normal(&mut self, key: &KeyEvent) -> Action {
@@ -147,6 +204,12 @@ impl Editor {
                     if let Some(pos) = self.history.redo(&mut self.buffer) {
                         self.cursor.set_position(pos, &self.buffer, pe);
                     }
+                    return Action::Continue;
+                }
+                KeyCode::Char('v') => {
+                    self.pending_op = None;
+                    self.cursor.set_anchor();
+                    self.mode = Mode::Visual(VisualKind::Block);
                     return Action::Continue;
                 }
                 _ => {}
@@ -168,11 +231,26 @@ impl Editor {
 
     /// Process a single normal-mode key (after Ctrl and pending-op handling).
     fn handle_normal_key(&mut self, key: &KeyEvent, pe: bool) -> Action {
+        // Try motion keys first (shared with visual mode).
+        if self.apply_motion(key.code, pe) {
+            return Action::Continue;
+        }
+
         match key.code {
             // -- Enter command mode --
             KeyCode::Char(':') => {
                 self.cmdline.clear();
                 self.mode = Mode::Command;
+            }
+
+            // -- Enter visual mode --
+            KeyCode::Char('v') => {
+                self.cursor.set_anchor();
+                self.mode = Mode::Visual(VisualKind::Char);
+            }
+            KeyCode::Char('V') => {
+                self.cursor.set_anchor();
+                self.mode = Mode::Visual(VisualKind::Line);
             }
 
             // -- Mode transitions (all begin a history transaction) --
@@ -199,74 +277,20 @@ impl Editor {
             KeyCode::Char('O') => self.open_line_above(),
 
             // -- Delete operations --
-            KeyCode::Char('x') => {
-                self.delete_char_at_cursor();
-            }
+            KeyCode::Char('x') => self.delete_char_at_cursor(),
             KeyCode::Char('d') => {
                 self.pending_op = Some('d');
             }
+
+            // -- Paste --
+            KeyCode::Char('p') => self.paste_after(),
+            KeyCode::Char('P') => self.paste_before(),
 
             // -- Undo/redo --
             KeyCode::Char('u') => {
                 if let Some(pos) = self.history.undo(&mut self.buffer) {
                     self.cursor.set_position(pos, &self.buffer, pe);
                 }
-            }
-
-            // -- Basic movement --
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.cursor.move_left(1, &self.buffer, pe);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.cursor.move_right(1, &self.buffer, pe);
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.cursor.move_down(1, &self.buffer, pe);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.cursor.move_up(1, &self.buffer, pe);
-            }
-
-            // -- Line motions --
-            KeyCode::Char('0') | KeyCode::Home => {
-                self.cursor.move_to_line_start();
-            }
-            KeyCode::Char('$') | KeyCode::End => {
-                self.cursor.move_to_line_end(&self.buffer, pe);
-            }
-            KeyCode::Char('^') => {
-                self.cursor.move_to_first_non_blank(&self.buffer, pe);
-            }
-
-            // -- Word motions --
-            KeyCode::Char('w') => {
-                self.cursor.word_forward(1, &self.buffer, pe);
-            }
-            KeyCode::Char('b') => {
-                self.cursor.word_backward(1, &self.buffer, pe);
-            }
-            KeyCode::Char('e') => {
-                self.cursor.word_end_forward(1, &self.buffer, pe);
-            }
-            KeyCode::Char('W') => {
-                self.cursor.big_word_forward(1, &self.buffer, pe);
-            }
-            KeyCode::Char('B') => {
-                self.cursor.big_word_backward(1, &self.buffer, pe);
-            }
-            KeyCode::Char('E') => {
-                self.cursor.big_word_end_forward(1, &self.buffer, pe);
-            }
-
-            // -- File motions --
-            KeyCode::Char('g') => {
-                // gg = go to first line. We consume 'g' here; a full
-                // implementation would use a pending-key state machine.
-                // For now, single 'g' acts as 'gg'.
-                self.cursor.move_to_first_line(&self.buffer, pe);
-            }
-            KeyCode::Char('G') => {
-                self.cursor.move_to_last_line(&self.buffer, pe);
             }
 
             _ => {}
@@ -518,6 +542,416 @@ impl Editor {
         }
     }
 
+    // ── Visual mode ────────────────────────────────────────────────────
+
+    fn handle_visual(&mut self, key: &KeyEvent) -> Action {
+        self.clear_message();
+
+        let pe = self.mode.cursor_past_end();
+
+        // Extract the current visual kind.
+        let Mode::Visual(current_kind) = self.mode else {
+            return Action::Continue;
+        };
+
+        // Ctrl combinations.
+        if key.modifiers.contains(Modifiers::CTRL) {
+            match key.code {
+                KeyCode::Char('c') => return Action::Quit,
+                KeyCode::Char('v') => {
+                    // Toggle: Ctrl-V in Block → Normal, otherwise → Block.
+                    if current_kind == VisualKind::Block {
+                        self.cursor.clear_anchor();
+                        self.mode = Mode::Normal;
+                    } else {
+                        self.mode = Mode::Visual(VisualKind::Block);
+                    }
+                    return Action::Continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Try motion keys (shared with normal mode). Motions move the
+        // cursor but leave the anchor in place, extending the selection.
+        if self.apply_motion(key.code, pe) {
+            return Action::Continue;
+        }
+
+        match key.code {
+            KeyCode::Escape => {
+                self.cursor.clear_anchor();
+                self.mode = Mode::Normal;
+            }
+
+            // -- Mode toggles --
+            KeyCode::Char('v') => {
+                if current_kind == VisualKind::Char {
+                    self.cursor.clear_anchor();
+                    self.mode = Mode::Normal;
+                } else {
+                    self.mode = Mode::Visual(VisualKind::Char);
+                }
+            }
+            KeyCode::Char('V') => {
+                if current_kind == VisualKind::Line {
+                    self.cursor.clear_anchor();
+                    self.mode = Mode::Normal;
+                } else {
+                    self.mode = Mode::Visual(VisualKind::Line);
+                }
+            }
+
+            // -- Swap anchor and cursor --
+            KeyCode::Char('o') => {
+                if let Some(anchor) = self.cursor.anchor() {
+                    let pos = self.cursor.position();
+                    self.cursor.set_position(anchor, &self.buffer, pe);
+                    self.cursor.set_anchor_at(pos);
+                }
+            }
+
+            // -- Operators --
+            KeyCode::Char('d' | 'x') => self.visual_delete(),
+            KeyCode::Char('y') => self.visual_yank(),
+            KeyCode::Char('c') => self.visual_change(),
+
+            _ => {}
+        }
+
+        Action::Continue
+    }
+
+    // ── Visual selection ranges ──────────────────────────────────────────
+
+    /// Compute the effective char-wise selection range.
+    ///
+    /// Extends the half-open range from `cursor.selection()` to include the
+    /// cursor character (Vim visual mode is inclusive at both ends).
+    fn visual_char_range(&self) -> Option<Range> {
+        let range = self.cursor.selection()?;
+        let end_line_len = self.buffer.line_content_len(range.end.line).unwrap_or(0);
+
+        let end = if range.end.col < end_line_len {
+            // Normal case: extend by 1 char.
+            Position::new(range.end.line, range.end.col + 1)
+        } else if range.end.line + 1 < self.buffer.line_count() {
+            // At end of line — wrap to next line to include the newline.
+            Position::new(range.end.line + 1, 0)
+        } else {
+            // Last char of last line — clamp to content length.
+            Position::new(range.end.line, end_line_len)
+        };
+
+        Some(Range::new(range.start, end))
+    }
+
+    /// Compute the effective line-wise selection range.
+    ///
+    /// Expands to full lines including trailing newlines.
+    fn visual_line_range(&self) -> Option<Range> {
+        let range = self.cursor.selection()?;
+        let start_line = range.start.line;
+        let end_line = range.end.line;
+
+        if end_line + 1 < self.buffer.line_count() {
+            // Not the last line — include through the trailing newline.
+            Some(Range::new(
+                Position::new(start_line, 0),
+                Position::new(end_line + 1, 0),
+            ))
+        } else if start_line > 0 {
+            // Selection includes the last line — eat the preceding newline
+            // so we don't leave a trailing blank line after deletion.
+            let prev_len = self.buffer.line_content_len(start_line - 1).unwrap_or(0);
+            let last_len = self.buffer.line_len(end_line).unwrap_or(0);
+            Some(Range::new(
+                Position::new(start_line - 1, prev_len),
+                Position::new(end_line, last_len),
+            ))
+        } else {
+            // Entire buffer selected line-wise.
+            let last_len = self.buffer.line_len(end_line).unwrap_or(0);
+            Some(Range::new(Position::ZERO, Position::new(end_line, last_len)))
+        }
+    }
+
+    // ── Visual operators ─────────────────────────────────────────────────
+
+    /// Delete the visual selection (`d` / `x` in visual mode).
+    fn visual_delete(&mut self) {
+        let Mode::Visual(kind) = self.mode else { return };
+
+        if kind == VisualKind::Block {
+            self.set_error("Block operations not yet supported");
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        }
+
+        let reg_kind = match kind {
+            VisualKind::Char => RegisterKind::Char,
+            VisualKind::Line | VisualKind::Block => RegisterKind::Line,
+        };
+
+        let range = match kind {
+            VisualKind::Char => self.visual_char_range(),
+            VisualKind::Line | VisualKind::Block => self.visual_line_range(),
+        };
+
+        let Some(range) = range else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        // Extract text before deletion (for the register).
+        let text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // Ensure line-wise register text ends with newline.
+        let text = if reg_kind == RegisterKind::Line && !text.ends_with('\n') {
+            text + "\n"
+        } else {
+            text
+        };
+
+        self.register.yank(text.clone(), reg_kind);
+
+        self.history.begin(self.cursor.position());
+        self.history.record_delete(range.start, &text);
+        self.buffer.delete(range);
+        self.cursor.clear_anchor();
+        self.cursor
+            .set_position(range.start, &self.buffer, false);
+        self.cursor.clamp(&self.buffer, false);
+        self.history.commit(self.cursor.position());
+        self.mode = Mode::Normal;
+    }
+
+    /// Yank the visual selection (`y` in visual mode).
+    fn visual_yank(&mut self) {
+        let Mode::Visual(kind) = self.mode else { return };
+
+        if kind == VisualKind::Block {
+            self.set_error("Block operations not yet supported");
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        }
+
+        let (range, reg_kind) = match kind {
+            VisualKind::Char => {
+                let Some(r) = self.visual_char_range() else {
+                    self.cursor.clear_anchor();
+                    self.mode = Mode::Normal;
+                    return;
+                };
+                (r, RegisterKind::Char)
+            }
+            VisualKind::Line | VisualKind::Block => {
+                // For yank, we want the clean line range (full lines).
+                let Some(r) = self.cursor.selection() else {
+                    self.cursor.clear_anchor();
+                    self.mode = Mode::Normal;
+                    return;
+                };
+                let start = Position::new(r.start.line, 0);
+                let end_line = r.end.line;
+                let end = if end_line + 1 < self.buffer.line_count() {
+                    Position::new(end_line + 1, 0)
+                } else {
+                    let len = self.buffer.line_len(end_line).unwrap_or(0);
+                    Position::new(end_line, len)
+                };
+                (Range::new(start, end), RegisterKind::Line)
+            }
+        };
+
+        let text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // Ensure line-wise register text ends with newline.
+        let text = if reg_kind == RegisterKind::Line && !text.ends_with('\n') {
+            text + "\n"
+        } else {
+            text
+        };
+
+        let line_count = range.line_span();
+        self.register.yank(text, reg_kind);
+
+        // Move cursor to start of selection (Vim behavior).
+        let start = range.start;
+        self.cursor.clear_anchor();
+        self.cursor.set_position(start, &self.buffer, false);
+        self.mode = Mode::Normal;
+
+        if line_count > 1 {
+            self.set_message(format!("{line_count} lines yanked"));
+        }
+    }
+
+    /// Change the visual selection (`c` in visual mode).
+    ///
+    /// Deletes the selection and enters insert mode.
+    fn visual_change(&mut self) {
+        let Mode::Visual(kind) = self.mode else { return };
+
+        if kind == VisualKind::Block {
+            self.set_error("Block operations not yet supported");
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        }
+
+        let reg_kind = match kind {
+            VisualKind::Char => RegisterKind::Char,
+            VisualKind::Line | VisualKind::Block => RegisterKind::Line,
+        };
+
+        let range = match kind {
+            VisualKind::Char => self.visual_char_range(),
+            VisualKind::Line | VisualKind::Block => self.visual_line_range(),
+        };
+
+        let Some(range) = range else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        let text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let text = if reg_kind == RegisterKind::Line && !text.ends_with('\n') {
+            text + "\n"
+        } else {
+            text
+        };
+
+        self.register.yank(text.clone(), reg_kind);
+
+        // Delete the selection as one transaction, then begin a new one
+        // for the insert phase (so undo restores text, redo re-deletes).
+        self.history.begin(self.cursor.position());
+        self.history.record_delete(range.start, &text);
+        self.buffer.delete(range);
+        self.cursor.clear_anchor();
+        self.cursor
+            .set_position(range.start, &self.buffer, true);
+        self.cursor.clamp(&self.buffer, true);
+        self.history.commit(self.cursor.position());
+
+        // Begin a new transaction for the insert session.
+        self.history.begin(self.cursor.position());
+        self.mode = Mode::Insert;
+    }
+
+    // ── Paste commands ──────────────────────────────────────────────────
+
+    /// Paste after the cursor (`p` in normal mode).
+    fn paste_after(&mut self) {
+        if self.register.is_empty() {
+            return;
+        }
+
+        let text = self.register.content().to_string();
+        let kind = self.register.kind();
+
+        let pos = match kind {
+            RegisterKind::Char => {
+                // Insert after the cursor character.
+                let line_len = self.buffer.line_content_len(self.cursor.line()).unwrap_or(0);
+                if line_len == 0 {
+                    self.cursor.position()
+                } else {
+                    Position::new(self.cursor.line(), self.cursor.col() + 1)
+                }
+            }
+            RegisterKind::Line => {
+                // Insert on the line below.
+                if self.cursor.line() + 1 < self.buffer.line_count() {
+                    Position::new(self.cursor.line() + 1, 0)
+                } else {
+                    // Last line: insert after content, prepend a newline.
+                    let len = self.buffer.line_len(self.cursor.line()).unwrap_or(0);
+                    Position::new(self.cursor.line(), len)
+                }
+            }
+        };
+
+        self.history.begin(self.cursor.position());
+
+        if kind == RegisterKind::Line && self.cursor.line() + 1 >= self.buffer.line_count() {
+            // At last line: insert newline first, then the text.
+            let insert_text = format!("\n{text}");
+            // Strip trailing newline from text so we don't get an extra blank.
+            let insert_text = insert_text.trim_end_matches('\n').to_string() + "\n";
+            let trimmed = insert_text.trim_end_matches('\n');
+            self.history.record_insert(pos, trimmed);
+            self.buffer.insert(pos, trimmed);
+            self.cursor
+                .set_position(Position::new(self.cursor.line() + 1, 0), &self.buffer, false);
+        } else if kind == RegisterKind::Line {
+            self.history.record_insert(pos, &text);
+            self.buffer.insert(pos, &text);
+            self.cursor.set_position(pos, &self.buffer, false);
+        } else {
+            self.history.record_insert(pos, &text);
+            self.buffer.insert(pos, &text);
+            // Place cursor at end of pasted text (Vim puts cursor on last
+            // pasted char, not after it).
+            if text.len() > 1 {
+                let end = Position::new(pos.line, pos.col + text.chars().count() - 1);
+                self.cursor.set_position(end, &self.buffer, false);
+            } else {
+                self.cursor.set_position(pos, &self.buffer, false);
+            }
+        }
+
+        self.cursor.clamp(&self.buffer, false);
+        self.history.commit(self.cursor.position());
+    }
+
+    /// Paste before the cursor (`P` in normal mode).
+    fn paste_before(&mut self) {
+        if self.register.is_empty() {
+            return;
+        }
+
+        let text = self.register.content().to_string();
+        let kind = self.register.kind();
+
+        let pos = match kind {
+            RegisterKind::Char => self.cursor.position(),
+            RegisterKind::Line => Position::new(self.cursor.line(), 0),
+        };
+
+        self.history.begin(self.cursor.position());
+        self.history.record_insert(pos, &text);
+        self.buffer.insert(pos, &text);
+
+        if kind == RegisterKind::Line {
+            self.cursor.set_position(pos, &self.buffer, false);
+        } else if text.chars().count() > 1 {
+            let end = Position::new(pos.line, pos.col + text.chars().count() - 1);
+            self.cursor.set_position(end, &self.buffer, false);
+        }
+
+        self.cursor.clamp(&self.buffer, false);
+        self.history.commit(self.cursor.position());
+    }
+
     // ── Line-opening commands ─────────────────────────────────────────────
 
     /// Open a new line below the current one (`o` in Vim).
@@ -548,6 +982,9 @@ impl Editor {
     // ── Edit commands ────────────────────────────────────────────────────
 
     /// Delete the character under the cursor (`x` in Vim).
+    ///
+    /// Stores the deleted character in the unnamed register (Vim behavior:
+    /// every delete is also a cut).
     fn delete_char_at_cursor(&mut self) {
         let pe = self.mode.cursor_past_end();
         let pos = self.cursor.position();
@@ -558,16 +995,21 @@ impl Editor {
         }
 
         let ch = self.buffer.char_at(pos).unwrap();
+        let text = ch.to_string();
         let to = Position::new(pos.line, pos.col + 1);
 
+        self.register.yank(text.clone(), RegisterKind::Char);
         self.history.begin(pos);
-        self.history.record_delete(pos, &ch.to_string());
+        self.history.record_delete(pos, &text);
         self.buffer.delete(Range::new(pos, to));
         self.cursor.clamp(&self.buffer, pe);
         self.history.commit(self.cursor.position());
     }
 
     /// Delete the current line (`dd` in Vim).
+    ///
+    /// Stores the deleted line in the unnamed register as line-wise text
+    /// (Vim behavior: `dd` followed by `p` pastes the line below).
     fn delete_current_line(&mut self) {
         let pe = self.mode.cursor_past_end();
         let line = self.cursor.line();
@@ -606,6 +1048,14 @@ impl Editor {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
+        // Store as line-wise in the register (ensure trailing newline).
+        let reg_text = if deleted.ends_with('\n') {
+            deleted.clone()
+        } else {
+            deleted.clone() + "\n"
+        };
+        self.register.yank(reg_text, RegisterKind::Line);
+
         self.history.begin(self.cursor.position());
         self.history.record_delete(from, &deleted);
         self.buffer.delete(range);
@@ -632,8 +1082,9 @@ impl App for Editor {
             Mode::Normal => self.handle_normal(key),
             Mode::Insert => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
-            // Visual, Replace — not yet implemented.
-            _ => Action::Continue,
+            Mode::Visual(_) => self.handle_visual(key),
+            // Replace mode — not yet implemented.
+            Mode::Replace => Action::Continue,
         }
     }
 
@@ -646,6 +1097,12 @@ impl App for Editor {
         let w = frame.width();
         let h = frame.height();
 
+        // Compute the visual selection for the render pipeline.
+        let selection = match self.mode {
+            Mode::Visual(kind) => self.cursor.selection().map(|r| (r, kind)),
+            _ => None,
+        };
+
         if h < 2 {
             // Too small for text + status + command line. Just render
             // what we can into the View.
@@ -653,6 +1110,7 @@ impl App for Editor {
                 &self.buffer,
                 &self.cursor,
                 self.mode,
+                selection,
                 frame,
                 0,
                 0,
@@ -668,6 +1126,7 @@ impl App for Editor {
             &self.buffer,
             &self.cursor,
             self.mode,
+            selection,
             frame,
             0,
             0,

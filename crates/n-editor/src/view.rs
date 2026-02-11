@@ -34,7 +34,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::buffer::Buffer;
 use crate::cursor::Cursor;
-use crate::mode::Mode;
+use crate::mode::{Mode, VisualKind};
+use crate::position::Range;
 
 use n_term::buffer::FrameBuffer;
 use n_term::cell::{Attr, Cell, UnderlineStyle};
@@ -100,6 +101,66 @@ pub fn char_col_to_display_col<I: Iterator<Item = char>>(
     }
 
     display_col
+}
+
+// ---------------------------------------------------------------------------
+// Selection helpers
+// ---------------------------------------------------------------------------
+
+/// Compute the column range to highlight on a given line for a visual selection.
+///
+/// `range` is the raw selection from `Cursor::selection()` — ordered, with
+/// `end` being the larger position. Both `start` and `end` are **inclusive**
+/// (the characters at both positions are selected in Vim visual mode).
+///
+/// Returns `Some((start_col, end_col))` in half-open notation `[start, end)`
+/// for the columns to highlight, or `None` if this line is outside the
+/// selection entirely.
+fn line_selection_cols(
+    range: Range,
+    kind: VisualKind,
+    line_idx: usize,
+) -> Option<(usize, usize)> {
+    match kind {
+        VisualKind::Char => {
+            if line_idx < range.start.line || line_idx > range.end.line {
+                return None;
+            }
+
+            if range.start.line == range.end.line {
+                // Single line: highlight [start.col, end.col] inclusive.
+                Some((range.start.col, range.end.col + 1))
+            } else if line_idx == range.start.line {
+                // First line of multi-line: start.col to end of line.
+                Some((range.start.col, usize::MAX))
+            } else if line_idx == range.end.line {
+                // Last line of multi-line: start of line to end.col inclusive.
+                Some((0, range.end.col + 1))
+            } else {
+                // Middle line: entire line.
+                Some((0, usize::MAX))
+            }
+        }
+        VisualKind::Line => {
+            // Line-wise: full lines from start to end (both inclusive).
+            if line_idx >= range.start.line && line_idx <= range.end.line {
+                Some((0, usize::MAX))
+            } else {
+                None
+            }
+        }
+        VisualKind::Block => {
+            // Block: rectangular region. Columns from min to max of
+            // start.col and end.col (they may be in either order since
+            // Range::ordered sorts by position, not column independently).
+            if line_idx < range.start.line || line_idx > range.end.line {
+                return None;
+            }
+            let min_col = range.start.col.min(range.end.col);
+            let max_col = range.start.col.max(range.end.col);
+            Some((min_col, max_col + 1))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +322,10 @@ impl View {
     /// into the rectangular region `(area_x, area_y, area_width, area_height)`
     /// of the given framebuffer.
     ///
+    /// `selection` is the visual selection range and kind, if active. The range
+    /// comes from `Cursor::selection()` (ordered, both endpoints inclusive).
+    /// Pass `None` when not in visual mode.
+    ///
     /// Returns the screen position of the cursor as `Some((x, y))` if the
     /// cursor is visible, or `None` if the area is too small.
     #[allow(clippy::too_many_arguments)]
@@ -269,6 +334,7 @@ impl View {
         buf: &Buffer,
         cursor: &Cursor,
         mode: Mode,
+        selection: Option<(Range, VisualKind)>,
         frame: &mut FrameBuffer,
         area_x: u16,
         area_y: u16,
@@ -302,8 +368,9 @@ impl View {
                     render_line_number(frame, area_x, screen_y, gw, buf_line + 1);
                 }
 
-                // Text content
-                self.render_text_line(frame, buf, buf_line, text_x, screen_y, text_width);
+                // Text content (with optional selection highlighting)
+                let line_sel = selection.and_then(|(r, k)| line_selection_cols(r, k, buf_line));
+                self.render_text_line(frame, buf, buf_line, text_x, screen_y, text_width, line_sel);
 
                 // Cursor screen position
                 if buf_line == cursor.line() {
@@ -337,6 +404,11 @@ impl View {
     }
 
     /// Paint one line of text content into the framebuffer.
+    ///
+    /// `line_sel` is the optional column range `[start, end)` to highlight
+    /// with `Attr::INVERSE` for visual selection. `None` means no selection
+    /// on this line.
+    #[allow(clippy::too_many_arguments)]
     fn render_text_line(
         &self,
         frame: &mut FrameBuffer,
@@ -345,6 +417,7 @@ impl View {
         x: u16,
         y: u16,
         width: u16,
+        line_sel: Option<(usize, usize)>,
     ) {
         let Some(line) = buf.line(line_idx) else {
             fill_empty(frame, x, y, width);
@@ -355,12 +428,16 @@ impl View {
         let left_col = self.left_col;
         let mut display_col: usize = 0;
         let mut screen_col: u16 = 0;
+        let mut char_col: usize = 0;
 
         'chars: for ch in line.chars() {
             // Stop at line endings.
             if ch == '\n' || ch == '\r' {
                 break;
             }
+
+            let selected = line_sel
+                .is_some_and(|(sel_start, sel_end)| char_col >= sel_start && char_col < sel_end);
 
             if ch == '\t' {
                 // Tab expansion: fill to the next tab stop.
@@ -372,7 +449,7 @@ impl View {
                         if screen_col >= width {
                             break 'chars;
                         }
-                        frame.set(x + screen_col, y, Cell::EMPTY);
+                        frame.set(x + screen_col, y, sel_cell(' ', selected));
                         screen_col += 1;
                     }
                     display_col += 1;
@@ -380,6 +457,7 @@ impl View {
             } else {
                 let char_w = ch.width().unwrap_or(0);
                 if char_w == 0 {
+                    char_col += 1;
                     continue;
                 }
 
@@ -391,42 +469,48 @@ impl View {
                     if char_w == 2 {
                         // Wide character: needs 2 screen columns.
                         if screen_col + 1 < width {
-                            frame.set(x + screen_col, y, Cell::new(ch));
+                            frame.set(x + screen_col, y, sel_cell(ch, selected));
                             frame.set(
                                 x + screen_col + 1,
                                 y,
                                 Cell::continuation(
                                     CellColor::Default,
                                     CellColor::Default,
-                                    Attr::empty(),
+                                    if selected { Attr::INVERSE } else { Attr::empty() },
                                 ),
                             );
                             screen_col += 2;
                         } else {
                             // Wide char doesn't fit — place a space instead.
-                            frame.set(x + screen_col, y, Cell::EMPTY);
+                            frame.set(x + screen_col, y, sel_cell(' ', selected));
                             screen_col += 1;
                         }
                     } else {
-                        frame.set(x + screen_col, y, Cell::new(ch));
+                        frame.set(x + screen_col, y, sel_cell(ch, selected));
                         screen_col += 1;
                     }
                 } else if display_col + char_w > left_col {
                     // Wide char straddles the left scroll boundary — the left
                     // half is off-screen, so show a space for the visible part.
                     if screen_col < width {
-                        frame.set(x + screen_col, y, Cell::EMPTY);
+                        frame.set(x + screen_col, y, sel_cell(' ', selected));
                         screen_col += 1;
                     }
                 }
 
                 display_col += char_w;
             }
+
+            char_col += 1;
         }
 
-        // Fill remaining columns with empty cells.
+        // Fill remaining columns. If the selection extends past the line
+        // content (e.g., multi-line char-wise or line-wise), highlight the
+        // trailing space to show the newline is included.
+        let trail_selected =
+            line_sel.is_some_and(|(_, sel_end)| char_col < sel_end);
         while screen_col < width {
-            frame.set(x + screen_col, y, Cell::EMPTY);
+            frame.set(x + screen_col, y, sel_cell(' ', trail_selected));
             screen_col += 1;
         }
     }
@@ -584,6 +668,25 @@ fn render_status_line(
             ),
         );
         col += 1;
+    }
+}
+
+/// Create a cell with optional `INVERSE` for visual selection highlighting.
+///
+/// When `selected` is true the cell gets the `INVERSE` attribute, which
+/// swaps foreground and background — the standard Vim highlight for visual
+/// selections.
+const fn sel_cell(ch: char, selected: bool) -> Cell {
+    if selected {
+        Cell::styled(
+            ch,
+            CellColor::Default,
+            CellColor::Default,
+            Attr::INVERSE,
+            UnderlineStyle::None,
+        )
+    } else {
+        Cell::new(ch)
     }
 }
 
@@ -942,9 +1045,9 @@ mod tests {
         let mut frame = FrameBuffer::new(80, 24);
         let mut v = View::new();
 
-        assert!(v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 0, 0).is_none());
-        assert!(v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 0, 5).is_none());
-        assert!(v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 5, 0).is_none());
+        assert!(v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 0, 0).is_none());
+        assert!(v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 0, 5).is_none());
+        assert!(v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 5, 0).is_none());
     }
 
     #[test]
@@ -955,7 +1058,7 @@ mod tests {
         let mut v = View::new();
 
         // height=1 → text_height=0, only status line.
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 1);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 1);
         assert!(pos.is_none()); // no text rows, cursor not placed
 
         // Status line should be rendered on row 0.
@@ -971,7 +1074,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 5);
 
         // Gutter is 2 wide for 3 lines: "1 ", "2 ", "3 "
         let row0 = row_chars(&frame, 0);
@@ -991,7 +1094,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 14);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 14);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 14);
 
         // Line 1: " 1 " (space, digit, space)
         let row0 = row_chars(&frame, 0);
@@ -1008,7 +1111,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // Line number "1" at column 0 should be DIM.
         assert!(is_dim(&frame, 0, 0));
@@ -1022,7 +1125,7 @@ mod tests {
         let mut v = View::new();
         v.set_line_numbers(false);
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // First column should be text, not a line number.
         let row0 = row_chars(&frame, 0);
@@ -1038,7 +1141,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // Gutter = 2, text starts at col 2.
         let row0 = row_chars(&frame, 0);
@@ -1052,7 +1155,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // Tab should expand to 4 spaces: "1     hello" (gutter "1 " + 4 spaces + "hello")
         let row0 = row_chars(&frame, 0);
@@ -1066,7 +1169,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // After gutter "1 ": 中 takes 2 cols, 文 takes 2 cols, h=1, i=1.
         // Check the main characters (skipping continuations).
@@ -1095,7 +1198,7 @@ mod tests {
             }
         }
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 10, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 10, 3);
 
         // After "1 hi" (4 cols), remaining cols should be EMPTY (space).
         let row = frame.row(0).unwrap();
@@ -1115,7 +1218,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 5);
 
         // Line 1 should show "1 " then empty text.
         let row0 = row_chars(&frame, 0);
@@ -1134,7 +1237,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 5);
 
         let row0 = row_chars(&frame, 0);
         let row1 = row_chars(&frame, 1);
@@ -1153,7 +1256,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 5);
 
         // Row 0: text. Rows 1-3: tildes. Row 4: status.
         assert_eq!(frame.get(0, 1).unwrap().character(), Some('~'));
@@ -1168,7 +1271,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
 
         // Tilde on row 1 should have Ansi256(4) foreground.
         let tilde_cell = frame.get(0, 1).unwrap();
@@ -1184,7 +1287,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 3);
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("NORMAL"), "status = '{status}'");
@@ -1197,7 +1300,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Insert, &mut frame, 0, 0, 40, 3);
+        v.render(&buf, &cursor, Mode::Insert, None, &mut frame, 0, 0, 40, 3);
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("INSERT"), "status = '{status}'");
@@ -1211,7 +1314,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 3);
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("main.rs"), "status = '{status}'");
@@ -1224,7 +1327,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 3);
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("[No Name]"), "status = '{status}'");
@@ -1238,7 +1341,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 3);
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("[+]"), "status = '{status}'");
@@ -1251,7 +1354,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 4);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 40, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 40, 4);
 
         let status = row_chars(&frame, 3);
         // Position is 1-indexed: line 2, col 4.
@@ -1265,7 +1368,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // All cells on the status row should have INVERSE.
         for x in 0..20 {
@@ -1282,7 +1385,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // Gutter = 2, cursor at (2, 0).
         assert_eq!(pos, Some((2, 0)));
@@ -1295,7 +1398,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
 
         // Gutter = 2, cursor at line 1 col 3 → screen (2+3, 1) = (5, 1).
         assert_eq!(pos, Some((5, 1)));
@@ -1309,7 +1412,7 @@ mod tests {
         let mut v = View::new();
 
         // Render in a sub-region starting at (10, 5).
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 10, 5, 20, 3);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 10, 5, 20, 3);
 
         // Gutter = 2 → cursor at (10+2, 5) = (12, 5).
         assert_eq!(pos, Some((12, 5)));
@@ -1322,7 +1425,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
 
         // text_height = 3. Cursor at line 4 → top_line = 2.
         // Screen row = 4 - 2 = 2.
@@ -1338,7 +1441,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 3);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
 
         // Tab expands to 4 display columns. Cursor char col 1 → display col 4.
         // Gutter = 2. Screen x = 2 + 4 = 6.
@@ -1354,7 +1457,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
 
         // text_height = 3. Cursor at line 3 → top_line = 1.
         let row0 = row_chars(&frame, 0);
@@ -1372,7 +1475,7 @@ mod tests {
         let mut frame = FrameBuffer::new(10, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 10, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 10, 3);
 
         // gutter = 2, text_width = 8. cursor at display_col 14.
         // left_col = 14 - 8 + 1 = 7. First visible char is 'h' (index 7).
@@ -1389,17 +1492,17 @@ mod tests {
 
         // Start at top.
         let cursor = Cursor::new();
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
         assert_eq!(v.top_line(), 0);
 
         // Move cursor down past viewport.
         let cursor = Cursor::at(Position::new(4, 0));
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
         assert_eq!(v.top_line(), 2);
 
         // Move cursor back to top.
         let cursor = Cursor::at(Position::new(0, 0));
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 20, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 4);
         assert_eq!(v.top_line(), 0);
     }
 
@@ -1412,7 +1515,7 @@ mod tests {
         let mut frame = FrameBuffer::new(10, 3);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 10, 3);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 10, 3);
 
         assert_eq!(pos, Some((2, 0)));
         let row0 = row_chars(&frame, 0);
@@ -1426,7 +1529,7 @@ mod tests {
         let mut frame = FrameBuffer::new(10, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 10, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 10, 5);
 
         // 3 lines (two \n + trailing empty). All should have line numbers.
         let row0 = row_chars(&frame, 0);
@@ -1444,7 +1547,7 @@ mod tests {
         let mut frame = FrameBuffer::new(6, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 6, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 6, 3);
 
         // gutter = 2, text_width = 4. Only "hell" visible.
         let row = frame.row(0).unwrap();
@@ -1462,7 +1565,7 @@ mod tests {
         let mut frame = FrameBuffer::new(7, 3); // gutter=2, text_width=5
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, &mut frame, 0, 0, 7, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 7, 3);
 
         // "ab中" = a(1) b(1) 中(2) = 4 cols. Fits in 5 cols.
         let row = frame.row(0).unwrap();
@@ -1604,5 +1707,253 @@ mod tests {
 
         let row = row_chars(&frame, 0);
         assert_eq!(row, "hello");
+    }
+
+    // ── line_selection_cols ───────────────────────────────────────────────
+
+    #[test]
+    fn sel_char_single_line() {
+        // Cursor at (0,2), anchor at (0,0): range start=(0,0) end=(0,2).
+        let range = Range::new(Position::new(0, 0), Position::new(0, 2));
+        // Chars 0, 1, 2 selected → cols [0, 3).
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Char, 0),
+            Some((0, 3))
+        );
+        // Other lines: nothing.
+        assert_eq!(line_selection_cols(range, VisualKind::Char, 1), None);
+    }
+
+    #[test]
+    fn sel_char_multi_line() {
+        // Selection from (1,3) to (3,1).
+        let range = Range::new(Position::new(1, 3), Position::new(3, 1));
+
+        assert_eq!(line_selection_cols(range, VisualKind::Char, 0), None);
+        // First line: from col 3 to EOL.
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Char, 1),
+            Some((3, usize::MAX))
+        );
+        // Middle line: full.
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Char, 2),
+            Some((0, usize::MAX))
+        );
+        // Last line: 0 to col 1 inclusive → [0, 2).
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Char, 3),
+            Some((0, 2))
+        );
+        assert_eq!(line_selection_cols(range, VisualKind::Char, 4), None);
+    }
+
+    #[test]
+    fn sel_line_mode() {
+        let range = Range::new(Position::new(1, 5), Position::new(3, 0));
+
+        assert_eq!(line_selection_cols(range, VisualKind::Line, 0), None);
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Line, 1),
+            Some((0, usize::MAX))
+        );
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Line, 2),
+            Some((0, usize::MAX))
+        );
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Line, 3),
+            Some((0, usize::MAX))
+        );
+        assert_eq!(line_selection_cols(range, VisualKind::Line, 4), None);
+    }
+
+    #[test]
+    fn sel_block_mode() {
+        // Block from (1,5) to (3,2) → cols [2, 6) on lines 1-3.
+        let range = Range::new(Position::new(1, 5), Position::new(3, 2));
+
+        assert_eq!(line_selection_cols(range, VisualKind::Block, 0), None);
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Block, 1),
+            Some((2, 6))
+        );
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Block, 2),
+            Some((2, 6))
+        );
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Block, 3),
+            Some((2, 6))
+        );
+        assert_eq!(line_selection_cols(range, VisualKind::Block, 4), None);
+    }
+
+    #[test]
+    fn sel_char_single_char() {
+        // Single char selection: anchor == cursor.
+        let range = Range::new(Position::new(2, 4), Position::new(2, 4));
+        // One char: [4, 5).
+        assert_eq!(
+            line_selection_cols(range, VisualKind::Char, 2),
+            Some((4, 5))
+        );
+    }
+
+    // ── render with selection ────────────────────────────────────────────
+
+    #[test]
+    fn render_char_selection_single_line() {
+        let buf = Buffer::from_text("hello world");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 3);
+        let mut v = View::new();
+
+        // Select chars 2-4: "llo"
+        let sel = Some((
+            Range::new(Position::new(0, 2), Position::new(0, 4)),
+            VisualKind::Char,
+        ));
+        v.render(&buf, &cursor, Mode::Normal, sel, &mut frame, 0, 0, 20, 3);
+
+        // Gutter = 2. Text starts at col 2.
+        // Chars 0-1 ('h','e') at screen cols 2-3: NOT inverse.
+        assert!(!is_inverse(&frame, 2, 0)); // 'h'
+        assert!(!is_inverse(&frame, 3, 0)); // 'e'
+        // Chars 2-4 ('l','l','o') at screen cols 4-6: INVERSE.
+        assert!(is_inverse(&frame, 4, 0)); // 'l'
+        assert!(is_inverse(&frame, 5, 0)); // 'l'
+        assert!(is_inverse(&frame, 6, 0)); // 'o'
+        // Char 5 (' ') at screen col 7: NOT inverse.
+        assert!(!is_inverse(&frame, 7, 0));
+    }
+
+    #[test]
+    fn render_line_selection() {
+        let buf = Buffer::from_text("one\ntwo\nthree");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 5);
+        let mut v = View::new();
+
+        // Select lines 0-1 with line-wise mode.
+        let sel = Some((
+            Range::new(Position::new(0, 0), Position::new(1, 2)),
+            VisualKind::Line,
+        ));
+        v.render(&buf, &cursor, Mode::Normal, sel, &mut frame, 0, 0, 20, 5);
+
+        // Line 0 text area should be inverse (gutter is not).
+        let gw = gutter_width(3, true) as usize;
+        assert!(is_inverse(&frame, gw as u16, 0)); // first text char, line 0
+        assert!(is_inverse(&frame, gw as u16, 1)); // first text char, line 1
+        // Trailing cells should also be inverse (line-wise highlights to edge).
+        assert!(is_inverse(&frame, 19, 0));
+        assert!(is_inverse(&frame, 19, 1));
+        // Line 2 should NOT be inverse.
+        assert!(!is_inverse(&frame, gw as u16, 2));
+    }
+
+    #[test]
+    fn render_char_selection_multi_line_trailing() {
+        let buf = Buffer::from_text("abc\ndef\nghi");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 5);
+        let mut v = View::new();
+
+        // Char-wise from (0,1) to (1,1): selects "bc\nde".
+        let sel = Some((
+            Range::new(Position::new(0, 1), Position::new(1, 1)),
+            VisualKind::Char,
+        ));
+        v.render(&buf, &cursor, Mode::Normal, sel, &mut frame, 0, 0, 20, 5);
+
+        let gw = gutter_width(3, true);
+        // Line 0: chars 0('a') NOT selected, chars 1-2('b','c') selected,
+        // trailing space selected (newline included in multi-line).
+        assert!(!is_inverse(&frame, gw, 0)); // 'a'
+        assert!(is_inverse(&frame, gw + 1, 0)); // 'b'
+        assert!(is_inverse(&frame, gw + 2, 0)); // 'c'
+        assert!(is_inverse(&frame, 19, 0)); // trailing (newline)
+
+        // Line 1: chars 0-1('d','e') selected, char 2('f') NOT selected.
+        assert!(is_inverse(&frame, gw, 1)); // 'd'
+        assert!(is_inverse(&frame, gw + 1, 1)); // 'e'
+        assert!(!is_inverse(&frame, gw + 2, 1)); // 'f'
+
+        // Line 2: nothing selected.
+        assert!(!is_inverse(&frame, gw, 2));
+    }
+
+    #[test]
+    fn render_no_selection_no_inverse() {
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(20, 3);
+        let mut v = View::new();
+
+        v.render(&buf, &cursor, Mode::Normal, None, &mut frame, 0, 0, 20, 3);
+
+        let gw = gutter_width(1, true);
+        // No selection: no text cells should be inverse.
+        for col in gw..20 {
+            assert!(!is_inverse(&frame, col, 0), "col {col} should not be inverse");
+        }
+    }
+
+    #[test]
+    fn render_visual_mode_shows_in_status() {
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(40, 3);
+        let mut v = View::new();
+
+        v.render(
+            &buf,
+            &cursor,
+            Mode::Visual(VisualKind::Char),
+            None,
+            &mut frame,
+            0,
+            0,
+            40,
+            3,
+        );
+
+        let status = row_chars(&frame, 2);
+        assert!(status.contains("VISUAL"), "status = '{status}'");
+    }
+
+    #[test]
+    fn render_visual_line_mode_shows_in_status() {
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut frame = FrameBuffer::new(40, 3);
+        let mut v = View::new();
+
+        v.render(
+            &buf,
+            &cursor,
+            Mode::Visual(VisualKind::Line),
+            None,
+            &mut frame,
+            0,
+            0,
+            40,
+            3,
+        );
+
+        let status = row_chars(&frame, 2);
+        assert!(status.contains("VISUAL LINE"), "status = '{status}'");
+    }
+
+    #[test]
+    fn sel_cell_helper() {
+        let normal = sel_cell('a', false);
+        assert_eq!(normal.character(), Some('a'));
+        assert!(!normal.attrs.contains(Attr::INVERSE));
+
+        let selected = sel_cell('b', true);
+        assert_eq!(selected.character(), Some('b'));
+        assert!(selected.attrs.contains(Attr::INVERSE));
     }
 }

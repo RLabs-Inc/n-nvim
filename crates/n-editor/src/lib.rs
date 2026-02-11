@@ -8,6 +8,7 @@
 //! - **[`cursor`]** — Cursor with movement, sticky column, and selection
 //! - **[`word`]** — Word/WORD boundary detection for `w`/`b`/`e`/`W`/`B`/`E` motions
 //! - **[`view`]** — View layer that bridges buffers to n-term's framebuffer
+//! - **[`register`]** — Yank/delete register for clipboard operations
 //!
 //! Future modules will add split tree layout, floating windows, and commands.
 
@@ -17,5 +18,6 @@ pub mod cursor;
 pub mod history;
 pub mod mode;
 pub mod position;
+pub mod register;
 pub mod view;
 pub mod word;
