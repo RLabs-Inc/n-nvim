@@ -43,7 +43,7 @@ use n_editor::view::{self, View};
 use n_term::ansi::CursorShape;
 use n_term::buffer::FrameBuffer;
 use n_term::event_loop::{Action, App, EventLoop};
-use n_term::input::{Event, KeyCode, KeyEvent, Modifiers};
+use n_term::input::{Event, KeyCode, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseEventKind};
 use n_term::terminal::Size;
 
 use regex::Regex;
@@ -1008,7 +1008,7 @@ impl Editor {
         let buf = self.get_buffer_by_id(ws.buf_id);
         ws.view.render(
             buf, &ws.cursor, Mode::Normal, None, buf_info,
-            frame, rect.x, rect.y, rect.w, rect.h,
+            frame, rect.x, rect.y, rect.w, rect.h, false,
         );
         self.other_wins.insert(ws_idx, ws);
     }
@@ -1986,6 +1986,191 @@ impl Editor {
         }
     }
 
+    // ── Mouse handling ────────────────────────────────────────────────────
+
+    /// Number of lines to scroll per mouse wheel tick.
+    const SCROLL_LINES: usize = 3;
+
+    /// Handle a mouse event. Returns the action to take.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match mouse.kind {
+            MouseEventKind::Press(MouseButton::Left) => {
+                self.mouse_click(mouse.x, mouse.y, false);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.mouse_drag(mouse.x, mouse.y);
+            }
+            MouseEventKind::ScrollUp => {
+                self.mouse_scroll_up();
+            }
+            MouseEventKind::ScrollDown => {
+                self.mouse_scroll_down();
+            }
+            // Other events (release, right click, middle click, move) — ignore.
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// Handle a left click at screen position (sx, sy).
+    ///
+    /// Determines which window was clicked, switches to it if needed,
+    /// then maps the screen position to a buffer position and moves the
+    /// cursor there.
+    fn mouse_click(&mut self, sx: u16, sy: u16, is_drag: bool) {
+        let (w, h) = self.last_frame_size;
+        let main_h = h.saturating_sub(1);
+        let area = Rect { x: 0, y: 0, w, h: main_h };
+
+        // Click on the command/message line — ignore.
+        if sy >= main_h {
+            return;
+        }
+
+        // Find which window was clicked.
+        let rects = self.split.layout(area);
+        let target = rects.iter().find(|(_, r)| {
+            sx >= r.x && sx < r.x + r.w && sy >= r.y && sy < r.y + r.h
+        });
+        let Some(&(win_id, rect)) = target else {
+            return; // Click on a separator — ignore.
+        };
+
+        // Switch window if clicking a different one.
+        if win_id != self.active_win_id {
+            // Exit visual mode and any pending state in the old window.
+            if matches!(self.mode, Mode::Visual(_)) {
+                self.cursor.clear_anchor();
+                self.mode = Mode::Normal;
+            }
+            self.pending = None;
+            self.count = None;
+            self.switch_window(win_id);
+        }
+
+        // Map screen position to buffer position.
+        if let Some(pos) = self.screen_to_buffer_pos(sx, sy, rect) {
+            if !is_drag {
+                // Fresh click: exit visual mode, cancel pending ops.
+                if matches!(self.mode, Mode::Visual(_)) {
+                    self.cursor.clear_anchor();
+                    self.mode = Mode::Normal;
+                }
+                self.pending = None;
+                self.count = None;
+                // Cancel search/command mode on click.
+                if self.search.is_some() {
+                    self.search = None;
+                }
+                if self.mode == Mode::Command {
+                    self.mode = Mode::Normal;
+                }
+            }
+            let pe = self.mode.cursor_past_end();
+            self.cursor.set_position(pos, &self.buffer, pe);
+        }
+    }
+
+    /// Handle mouse drag — extends visual char selection.
+    fn mouse_drag(&mut self, sx: u16, sy: u16) {
+        let (w, h) = self.last_frame_size;
+        let main_h = h.saturating_sub(1);
+        let area = Rect { x: 0, y: 0, w, h: main_h };
+
+        // Only drag within the active window.
+        let rects = self.split.layout(area);
+        let active_rect = rects.iter()
+            .find(|(id, _)| *id == self.active_win_id)
+            .map(|(_, r)| *r);
+        let Some(rect) = active_rect else { return };
+
+        // Clamp drag coordinates to the active window's rect.
+        let clamped_x = sx.clamp(rect.x, rect.x + rect.w - 1);
+        let clamped_y = sy.clamp(rect.y, rect.y + rect.h.saturating_sub(2)); // exclude status
+
+        if let Some(pos) = self.screen_to_buffer_pos(clamped_x, clamped_y, rect) {
+            // Enter visual char mode on first drag if not already visual.
+            if !matches!(self.mode, Mode::Visual(_)) {
+                self.cursor.set_anchor();
+                self.mode = Mode::Visual(VisualKind::Char);
+            }
+            let pe = self.mode.cursor_past_end();
+            self.cursor.set_position(pos, &self.buffer, pe);
+        }
+    }
+
+    /// Map a screen (x, y) coordinate to a buffer Position within the given
+    /// window rectangle. Returns None if the click is on the status line or
+    /// outside the text area.
+    fn screen_to_buffer_pos(&self, sx: u16, sy: u16, rect: Rect) -> Option<Position> {
+        let gw = view::gutter_width(self.buffer.line_count(), self.view.line_numbers());
+        let text_x = rect.x + gw;
+        let text_height = rect.h.saturating_sub(1); // exclude status line
+
+        // Click on the status line — ignore.
+        if sy >= rect.y + text_height {
+            return None;
+        }
+
+        // Click on the gutter — treat as column 0 of that line.
+        let screen_row = sy.saturating_sub(rect.y) as usize;
+        let buf_line = self.view.top_line() + screen_row;
+
+        // Don't go past the last buffer line.
+        if buf_line >= self.buffer.line_count() {
+            return None; // Click on a tilde line.
+        }
+
+        if sx < text_x {
+            // Gutter click: move to column 0.
+            return Some(Position::new(buf_line, 0));
+        }
+
+        // Map display column to char column.
+        let screen_col = (sx - text_x) as usize;
+        let display_col = self.view.left_col() + screen_col;
+        let char_col = self.buffer.line(buf_line).map_or(0, |line| {
+            view::display_col_to_char_col(line.chars(), display_col, self.view.tab_width())
+        });
+
+        Some(Position::new(buf_line, char_col))
+    }
+
+    /// Scroll the viewport up by `SCROLL_LINES`.
+    fn mouse_scroll_up(&mut self) {
+        let new_top = self.view.top_line().saturating_sub(Self::SCROLL_LINES);
+        self.view.set_top_line(new_top);
+
+        // If cursor is now below the visible area, move it up.
+        let text_height = self.last_text_height;
+        let bottom_visible = new_top + text_height.saturating_sub(1);
+        if self.cursor.line() > bottom_visible {
+            let pe = self.mode.cursor_past_end();
+            self.cursor.set_position(
+                Position::new(bottom_visible, self.cursor.col()),
+                &self.buffer,
+                pe,
+            );
+        }
+    }
+
+    /// Scroll the viewport down by `SCROLL_LINES`.
+    fn mouse_scroll_down(&mut self) {
+        let max_top = self.buffer.line_count().saturating_sub(1);
+        let new_top = (self.view.top_line() + Self::SCROLL_LINES).min(max_top);
+        self.view.set_top_line(new_top);
+
+        // If cursor is now above the visible area, move it down.
+        if self.cursor.line() < new_top {
+            let pe = self.mode.cursor_past_end();
+            self.cursor.set_position(
+                Position::new(new_top, self.cursor.col()),
+                &self.buffer,
+                pe,
+            );
+        }
+    }
+
     /// Process a single normal-mode key (no pending operator).
     ///
     /// `raw_count` is the accumulated numeric prefix — `None` if no digits
@@ -2834,8 +3019,18 @@ impl Editor {
         }
     }
 
-    /// `:q` — quit if no unsaved changes in any buffer.
-    fn cmd_quit(&self) -> CommandResult {
+    /// `:q` — close the current window, or quit if it's the last one.
+    ///
+    /// When multiple windows are open, `:q` closes the current window
+    /// (like `:close`). When it's the last window, it checks for unsaved
+    /// changes in all buffers before quitting.
+    fn cmd_quit(&mut self) -> CommandResult {
+        // Multiple windows: close the current one (Vim behavior).
+        if self.win_count() > 1 {
+            return self.win_close();
+        }
+
+        // Last window: check for unsaved changes before quitting.
         if self.buffer.is_modified() {
             return CommandResult::Err(
                 "E37: No write since last change (add ! to override)".to_string(),
@@ -4554,6 +4749,11 @@ fn find_matching_bracket(buf: &Buffer, pos: Position) -> Option<Position> {
 
 impl App for Editor {
     fn on_event(&mut self, event: &Event) -> Action {
+        // Handle mouse events.
+        if let Event::Mouse(mouse) = *event {
+            return self.handle_mouse(mouse);
+        }
+
         let Event::Key(key) = event else {
             return Action::Continue;
         };
@@ -4615,7 +4815,7 @@ impl App for Editor {
             let buf_info = self.buf_info_label();
             self.cursor_screen = self.view.render(
                 &self.buffer, &self.cursor, self.mode, selection, &buf_info,
-                frame, 0, 0, w, h,
+                frame, 0, 0, w, h, true,
             );
             return;
         }
@@ -4640,7 +4840,7 @@ impl App for Editor {
                 self.last_text_height = rect.h.saturating_sub(1) as usize;
                 self.cursor_screen = self.view.render(
                     &self.buffer, &self.cursor, self.mode, selection, &buf_info,
-                    frame, rect.x, rect.y, rect.w, rect.h,
+                    frame, rect.x, rect.y, rect.w, rect.h, true,
                 );
                 // Highlight search matches in the active window.
                 let hl_pattern = if self.search.is_some() {
@@ -8604,5 +8804,489 @@ mod tests {
         feed(&mut e, &[press('"'), press('+'), press('d'), press('d')]);
         // Register a should still have original text.
         assert_eq!(e.registers.get(Some('a')).content(), "hello world\n");
+    }
+
+    // ── :q with splits ──────────────────────────────────────────────────
+
+    #[test]
+    fn quit_with_splits_closes_window() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        assert_eq!(e.win_count(), 2);
+        // :q should close the current window, not quit.
+        cmd(&mut e, "q");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn quit_with_three_splits_closes_one() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        cmd(&mut e, "vsp");
+        assert_eq!(e.win_count(), 3);
+        cmd(&mut e, "q");
+        assert_eq!(e.win_count(), 2);
+        cmd(&mut e, "q");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn quit_last_window_actually_quits() {
+        let mut e = editor_with("hello");
+        assert_eq!(e.win_count(), 1);
+        let result = e.run_command(Command::Quit);
+        assert_eq!(result, CommandResult::Quit);
+    }
+
+    #[test]
+    fn quit_last_window_checks_dirty() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('i'), press('x'), esc()]); // modify buffer
+        let result = e.run_command(Command::Quit);
+        assert!(matches!(result, CommandResult::Err(ref msg) if msg.contains("E37")));
+    }
+
+    #[test]
+    fn quit_split_doesnt_check_dirty() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        feed(&mut e, &[press('i'), press('x'), esc()]); // modify buffer
+        // :q with splits should close the window without dirty check
+        // (the buffer is still open in the other window).
+        cmd(&mut e, "q");
+        assert_eq!(e.win_count(), 1);
+    }
+
+    #[test]
+    fn force_quit_last_window_quits() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('i'), press('x'), esc()]);
+        let result = e.run_command(Command::ForceQuit);
+        assert_eq!(result, CommandResult::Quit);
+    }
+
+    // ── Active status line ────────────────────────────────────────────────
+
+    #[test]
+    fn active_status_line_is_bold() {
+        use n_term::cell::Attr;
+        let mut e = editor_with("hello");
+        cmd(&mut e, "sp");
+        let mut frame = FrameBuffer::new(40, 10);
+        e.paint(&mut frame);
+        // main_height = 9. HSplit: top=4 rows, bottom=5 rows.
+        // Window 1 (active, top): status at row 3.
+        // Window 2 (inactive, bottom): status at row 8.
+        let active_status = frame.get(0, 3).unwrap();
+        let inactive_status = frame.get(0, 8).unwrap();
+        assert!(active_status.attrs.contains(Attr::BOLD), "active should be BOLD");
+        assert!(active_status.attrs.contains(Attr::INVERSE), "active should be INVERSE");
+        assert!(inactive_status.attrs.contains(Attr::DIM), "inactive should be DIM");
+        assert!(inactive_status.attrs.contains(Attr::INVERSE), "inactive should be INVERSE");
+    }
+
+    // ── Mouse support ─────────────────────────────────────────────────────
+
+    /// Create a mouse left-click event at (x, y).
+    fn mouse_click(x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Press(MouseButton::Left),
+            x,
+            y,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    /// Create a mouse drag event at (x, y).
+    fn mouse_drag(x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            x,
+            y,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    /// Create a scroll-up event at (x, y).
+    fn scroll_up(x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            x,
+            y,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    /// Create a scroll-down event at (x, y).
+    fn scroll_down(x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            x,
+            y,
+            modifiers: Modifiers::empty(),
+        })
+    }
+
+    /// Paint the editor into a framebuffer so layout state is populated.
+    fn do_paint(e: &mut Editor, w: u16, h: u16) {
+        let mut frame = FrameBuffer::new(w, h);
+        e.paint(&mut frame);
+    }
+
+    #[test]
+    fn mouse_click_positions_cursor() {
+        let mut e = editor_with("hello world");
+        do_paint(&mut e, 40, 10);
+        // gutter_width for 1 line = 2. Click at screen x=7, y=0 →
+        // text column 7-2=5, char_col 5 → 'w'.
+        feed(&mut e, &[mouse_click(7, 0)]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 5);
+    }
+
+    #[test]
+    fn mouse_click_second_line() {
+        let mut e = editor_with("first\nsecond\nthird");
+        do_paint(&mut e, 40, 10);
+        // gutter = 2 (3 lines = 1 digit). Click y=1 → line 1.
+        // x=4 → text col 4-2=2, char_col 2 → 'c' in "second".
+        feed(&mut e, &[mouse_click(4, 1)]);
+        assert_eq!(e.cursor.line(), 1);
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn mouse_click_past_line_end_clamps() {
+        let mut e = editor_with("hi");
+        do_paint(&mut e, 40, 10);
+        // Click far right — should clamp to last char.
+        feed(&mut e, &[mouse_click(30, 0)]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 1); // 'i' (last char of "hi" in normal mode)
+    }
+
+    #[test]
+    fn mouse_click_on_gutter() {
+        let mut e = editor_with("hello world");
+        // Start with cursor in middle.
+        feed(&mut e, &[press('w')]); // cursor at col 6 ('w')
+        do_paint(&mut e, 40, 10);
+        // Click on gutter (x=0) → column 0.
+        feed(&mut e, &[mouse_click(0, 0)]);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn mouse_click_on_tilde_ignored() {
+        let mut e = editor_with("one line");
+        do_paint(&mut e, 40, 10);
+        // Click on row 5 — tilde line (buffer has only 1 line).
+        // Cursor should stay put.
+        feed(&mut e, &[mouse_click(5, 5)]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn mouse_click_on_status_line_ignored() {
+        let mut e = editor_with("hello");
+        do_paint(&mut e, 40, 5);
+        // Status line is at row h-2 (row 3 for area h=4, since bottom is cmd).
+        // With h=5: main_height=4, text_height=3, status line at row 3.
+        // Click on status line row → ignored.
+        feed(&mut e, &[mouse_click(5, 3)]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn mouse_click_cancels_visual_mode() {
+        let mut e = editor_with("hello world");
+        // Enter visual mode and extend selection.
+        feed(&mut e, &[press('v'), press('l'), press('l')]);
+        assert!(matches!(e.mode, Mode::Visual(_)));
+        do_paint(&mut e, 40, 10);
+        // Click anywhere.
+        feed(&mut e, &[mouse_click(5, 0)]);
+        assert_eq!(e.mode, Mode::Normal);
+        assert!(!e.cursor.has_selection());
+    }
+
+    #[test]
+    fn mouse_click_cancels_pending_operator() {
+        let mut e = editor_with("hello world");
+        // Press 'd' (pending operator).
+        feed(&mut e, &[press('d')]);
+        assert!(e.pending.is_some());
+        do_paint(&mut e, 40, 10);
+        // Click cancels the pending operator.
+        feed(&mut e, &[mouse_click(5, 0)]);
+        assert!(e.pending.is_none());
+    }
+
+    #[test]
+    fn mouse_click_cancels_command_mode() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press(':')]);
+        assert_eq!(e.mode, Mode::Command);
+        do_paint(&mut e, 40, 10);
+        feed(&mut e, &[mouse_click(3, 0)]);
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn mouse_click_in_insert_mode_moves_cursor() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('i')]); // Enter insert mode.
+        do_paint(&mut e, 40, 10);
+        feed(&mut e, &[mouse_click(8, 0)]);
+        // In insert mode, cursor_past_end = true.
+        // gutter=2, text_col = 8-2=6, char_col=6 → 'o'.
+        assert_eq!(e.cursor.col(), 6);
+        // Should still be in insert mode.
+        assert_eq!(e.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn mouse_scroll_down() {
+        let text = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        do_paint(&mut e, 40, 10);
+        assert_eq!(e.view.top_line(), 0);
+        // Scroll down.
+        feed(&mut e, &[scroll_down(10, 5)]);
+        assert_eq!(e.view.top_line(), 3); // SCROLL_LINES = 3
+    }
+
+    #[test]
+    fn mouse_scroll_up() {
+        let text = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        // Move cursor down to force scroll.
+        for _ in 0..15 {
+            feed(&mut e, &[press('j')]);
+        }
+        do_paint(&mut e, 40, 10);
+        let top_before = e.view.top_line();
+        assert!(top_before > 0);
+        // Scroll up.
+        feed(&mut e, &[scroll_up(10, 5)]);
+        assert_eq!(e.view.top_line(), top_before.saturating_sub(3));
+    }
+
+    #[test]
+    fn mouse_scroll_down_moves_cursor_if_off_screen() {
+        let text = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        do_paint(&mut e, 40, 10);
+        // Cursor at line 0, scroll down 3 × 3 = 9 lines.
+        feed(&mut e, &[scroll_down(10, 5), scroll_down(10, 5), scroll_down(10, 5)]);
+        // Cursor should have been pushed down to stay visible.
+        assert!(e.cursor.line() >= e.view.top_line());
+    }
+
+    #[test]
+    fn mouse_scroll_up_moves_cursor_if_off_screen() {
+        let text = (0..20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        // Move cursor to bottom.
+        for _ in 0..19 {
+            feed(&mut e, &[press('j')]);
+        }
+        do_paint(&mut e, 40, 10);
+        // Scroll up a lot.
+        for _ in 0..5 {
+            feed(&mut e, &[scroll_up(10, 5)]);
+        }
+        // Cursor should have been pulled up to stay visible.
+        let visible_bottom = e.view.top_line() + e.last_text_height.saturating_sub(1);
+        assert!(e.cursor.line() <= visible_bottom);
+    }
+
+    #[test]
+    fn mouse_scroll_down_clamps_at_end() {
+        let mut e = editor_with("one\ntwo");
+        do_paint(&mut e, 40, 10);
+        // Scroll down 10 times — should not crash or go past last line.
+        for _ in 0..10 {
+            feed(&mut e, &[scroll_down(10, 5)]);
+        }
+        assert!(e.view.top_line() <= 1); // Only 2 lines in buffer.
+    }
+
+    #[test]
+    fn mouse_drag_enters_visual_mode() {
+        let mut e = editor_with("hello world");
+        do_paint(&mut e, 40, 10);
+        // Click at position, then drag to extend.
+        feed(&mut e, &[mouse_click(4, 0)]); // click on 'l' (gutter=2, text_col=2)
+        assert_eq!(e.mode, Mode::Normal);
+        feed(&mut e, &[mouse_drag(8, 0)]); // drag to 'o' in "world"
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Char)));
+        assert!(e.cursor.has_selection());
+    }
+
+    #[test]
+    fn mouse_drag_extends_selection() {
+        let mut e = editor_with("hello world");
+        do_paint(&mut e, 40, 10);
+        // Click to set start position.
+        feed(&mut e, &[mouse_click(4, 0)]);
+        // Drag extends the selection progressively.
+        feed(&mut e, &[mouse_drag(6, 0)]);
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Char)));
+        feed(&mut e, &[mouse_drag(10, 0)]);
+        // Cursor should be at the drag endpoint.
+        // gutter=2, text_col=10-2=8 → char_col=8.
+        assert_eq!(e.cursor.col(), 8);
+    }
+
+    #[test]
+    fn mouse_drag_multiline() {
+        let mut e = editor_with("first\nsecond\nthird");
+        do_paint(&mut e, 40, 10);
+        // Click on first line.
+        feed(&mut e, &[mouse_click(4, 0)]);
+        // Drag to second line.
+        feed(&mut e, &[mouse_drag(4, 1)]);
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Char)));
+        assert_eq!(e.cursor.line(), 1);
+    }
+
+    #[test]
+    fn mouse_click_different_window_switches() {
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "vsp");
+        // Set frame size and paint to populate layout.
+        e.last_frame_size = (80, 24);
+        do_paint(&mut e, 80, 24);
+        assert_eq!(e.active_win_id, 1);
+        // Window 1 is left half (0..39), window 2 is right half (41..79).
+        // Click in the right half to switch to window 2.
+        feed(&mut e, &[mouse_click(50, 5)]);
+        assert_eq!(e.active_win_id, 2);
+    }
+
+    #[test]
+    fn mouse_click_separator_ignored() {
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "vsp");
+        e.last_frame_size = (80, 24);
+        do_paint(&mut e, 80, 24);
+        let before = e.active_win_id;
+        // Separator is at x=40. Clicking on it should be ignored.
+        feed(&mut e, &[mouse_click(40, 5)]);
+        assert_eq!(e.active_win_id, before);
+    }
+
+    #[test]
+    fn mouse_click_command_line_row_ignored() {
+        let mut e = editor_with("hello");
+        do_paint(&mut e, 40, 10);
+        // Bottom row (y=9) is the command/message line.
+        feed(&mut e, &[mouse_click(5, 9)]);
+        // Cursor should stay at original position.
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn mouse_right_click_ignored() {
+        let mut e = editor_with("hello");
+        do_paint(&mut e, 40, 10);
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Press(MouseButton::Right),
+            x: 5,
+            y: 0,
+            modifiers: Modifiers::empty(),
+        });
+        feed(&mut e, &[event]);
+        // Nothing should happen.
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn mouse_click_with_scrolled_view() {
+        let text = (0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        // Move cursor down to scroll the view.
+        for _ in 0..20 {
+            feed(&mut e, &[press('j')]);
+        }
+        do_paint(&mut e, 40, 10);
+        let top = e.view.top_line();
+        assert!(top > 0);
+        // Click on row 2 — should go to top_line + 2.
+        let gw = view::gutter_width(30, true); // 3 (2 digits + space)
+        feed(&mut e, &[mouse_click(gw + 3, 2)]);
+        assert_eq!(e.cursor.line(), top + 2);
+        assert_eq!(e.cursor.col(), 3);
+    }
+
+    #[test]
+    fn mouse_click_with_wide_gutter() {
+        // 100+ lines → gutter = 4 (3 digits + space).
+        let text = (0..120).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        do_paint(&mut e, 40, 10);
+        let gw = view::gutter_width(120, true); // 4
+        assert_eq!(gw, 4);
+        // Click at x=6 → text_col = 6-4 = 2.
+        feed(&mut e, &[mouse_click(6, 0)]);
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn mouse_scroll_preserves_column() {
+        let text = (0..20).map(|i| format!("line {i} extra text")).collect::<Vec<_>>().join("\n");
+        let mut e = editor_with(&text);
+        // Move cursor to col 5.
+        for _ in 0..5 {
+            feed(&mut e, &[press('l')]);
+        }
+        do_paint(&mut e, 40, 10);
+        let col_before = e.cursor.col();
+        // Scroll down — column should be preserved.
+        feed(&mut e, &[scroll_down(10, 5)]);
+        assert_eq!(e.cursor.col(), col_before);
+    }
+
+    #[test]
+    fn mouse_click_cancels_search_mode() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('/')]); // Enter search mode.
+        assert!(e.search.is_some());
+        do_paint(&mut e, 40, 10);
+        feed(&mut e, &[mouse_click(5, 0)]);
+        assert!(e.search.is_none());
+    }
+
+    #[test]
+    fn mouse_release_ignored() {
+        let mut e = editor_with("hello");
+        do_paint(&mut e, 40, 10);
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Release(MouseButton::Left),
+            x: 5,
+            y: 0,
+            modifiers: Modifiers::empty(),
+        });
+        feed(&mut e, &[event]);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn mouse_scroll_left_ignored() {
+        let mut e = editor_with("hello");
+        do_paint(&mut e, 40, 10);
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollLeft,
+            x: 5,
+            y: 0,
+            modifiers: Modifiers::empty(),
+        });
+        let top_before = e.view.top_line();
+        feed(&mut e, &[event]);
+        assert_eq!(e.view.top_line(), top_before);
     }
 }
