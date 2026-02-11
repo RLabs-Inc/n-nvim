@@ -19,6 +19,12 @@
 //! | `:N,Ms/pat/rep/flags`      | Substitute on line range                |
 //! | `:'<,'>s/pat/rep/flags`    | Substitute on visual selection          |
 //! | `:s`                       | Repeat last substitution                |
+//! | `:e <path>`                | Open file in new buffer                 |
+//! | `:bn` / `:bnext`           | Switch to next buffer                   |
+//! | `:bp` / `:bprev`           | Switch to previous buffer               |
+//! | `:bd` / `:bdelete`         | Close current buffer                    |
+//! | `:bd!`                     | Force-close current buffer               |
+//! | `:ls` / `:buffers`         | List all open buffers                   |
 //!
 //! # Substitution flags
 //!
@@ -117,6 +123,24 @@ pub enum Command {
     SubRepeat {
         range: CmdRange,
     },
+
+    /// `:e <path>` — open a file (or switch to it if already open).
+    Edit(PathBuf),
+
+    /// `:bn` / `:bnext` — switch to the next buffer.
+    BufNext,
+
+    /// `:bp` / `:bprev` / `:bprevious` — switch to the previous buffer.
+    BufPrev,
+
+    /// `:bd` / `:bdelete` — close the current buffer (refuses if modified).
+    BufDelete,
+
+    /// `:bd!` / `:bdelete!` — force-close the current buffer (discard changes).
+    BufDeleteForce,
+
+    /// `:ls` / `:buffers` — list all open buffers.
+    BufList,
 
     /// Unknown command — contains the full input for error reporting.
     Unknown(String),
@@ -307,10 +331,22 @@ fn parse_command(input: &str) -> Command {
                 Command::WriteAs(PathBuf::from(arg))
             }
         }
+        "e" | "edit" => {
+            if arg.is_empty() {
+                Command::Unknown("E32: No file name".to_string())
+            } else {
+                Command::Edit(PathBuf::from(arg))
+            }
+        }
         "q" => Command::Quit,
         "q!" => Command::ForceQuit,
         "wq" => Command::WriteQuit,
         "x" => Command::ExitSave,
+        "bn" | "bnext" => Command::BufNext,
+        "bp" | "bprev" | "bprevious" => Command::BufPrev,
+        "bd" | "bdelete" => Command::BufDelete,
+        "bd!" | "bdelete!" => Command::BufDeleteForce,
+        "ls" | "buffers" => Command::BufList,
         _ => Command::Unknown(trimmed.to_string()),
     }
 }
@@ -1083,5 +1119,60 @@ mod tests {
             parse_sub_flags("gxz"),
             SubFlags { global: true, ..SubFlags::default() }
         );
+    }
+
+    // -- Buffer commands -------------------------------------------------------
+
+    #[test]
+    fn parse_edit() {
+        assert_eq!(
+            parse_command("e src/main.rs"),
+            Command::Edit(PathBuf::from("src/main.rs"))
+        );
+    }
+
+    #[test]
+    fn parse_edit_long() {
+        assert_eq!(
+            parse_command("edit /tmp/foo.txt"),
+            Command::Edit(PathBuf::from("/tmp/foo.txt"))
+        );
+    }
+
+    #[test]
+    fn parse_edit_no_path() {
+        // :e with no argument is an error (Unknown with E32 message).
+        assert!(matches!(parse_command("e"), Command::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_buf_next() {
+        assert_eq!(parse_command("bn"), Command::BufNext);
+        assert_eq!(parse_command("bnext"), Command::BufNext);
+    }
+
+    #[test]
+    fn parse_buf_prev() {
+        assert_eq!(parse_command("bp"), Command::BufPrev);
+        assert_eq!(parse_command("bprev"), Command::BufPrev);
+        assert_eq!(parse_command("bprevious"), Command::BufPrev);
+    }
+
+    #[test]
+    fn parse_buf_delete() {
+        assert_eq!(parse_command("bd"), Command::BufDelete);
+        assert_eq!(parse_command("bdelete"), Command::BufDelete);
+    }
+
+    #[test]
+    fn parse_buf_delete_force() {
+        assert_eq!(parse_command("bd!"), Command::BufDeleteForce);
+        assert_eq!(parse_command("bdelete!"), Command::BufDeleteForce);
+    }
+
+    #[test]
+    fn parse_buf_list() {
+        assert_eq!(parse_command("ls"), Command::BufList);
+        assert_eq!(parse_command("buffers"), Command::BufList);
     }
 }

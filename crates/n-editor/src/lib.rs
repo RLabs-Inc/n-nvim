@@ -10,10 +10,12 @@
 //! - **[`text_object`]** — Text objects (`iw`, `a"`, `i(`, etc.) for composable editing
 //! - **[`search`]** — Incremental search (`/`, `?`, `n`, `N`) with match highlighting
 //! - **[`view`]** — View layer that bridges buffers to n-term's framebuffer
+//! - **[`history`]** — Undo/redo: transaction-based, cursor position restore
+//! - **[`command`]** — Command-line parsing (`:w`, `:q`, `:e`, `:s`, `:bn`, `:bd`, `:ls`)
 //! - **[`register`]** — Register file: unnamed + 26 named registers (a-z) with append
 //! - **[`jumplist`]** — Jump list (`Ctrl+O`/`Ctrl+I`) and change list (`g;`/`g,`)
 //!
-//! Future modules will add split tree layout, floating windows, and commands.
+//! Future modules will add split tree layout and floating windows.
 
 pub mod buffer;
 pub mod command;

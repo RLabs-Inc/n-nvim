@@ -354,6 +354,11 @@ fn try_parse(buf: &[u8], pos: usize) -> Parsed {
             ctrl_key(KeyCode::Char((b + b'a' - 1) as char)),
             1,
         ),
+        // Ctrl+\, Ctrl+], Ctrl+^, Ctrl+_ (0x1C-0x1F range, after Ctrl+Z).
+        0x1C => Parsed::Event(ctrl_key(KeyCode::Char('\\')), 1),
+        0x1D => Parsed::Event(ctrl_key(KeyCode::Char(']')), 1),
+        0x1E => Parsed::Event(ctrl_key(KeyCode::Char('^')), 1),
+        0x1F => Parsed::Event(ctrl_key(KeyCode::Char('_')), 1),
         0x08 | 0x7F => Parsed::Event(press(KeyCode::Backspace), 1),
         0x09 => Parsed::Event(press(KeyCode::Tab), 1),
         0x0A | 0x0D => Parsed::Event(press(KeyCode::Enter), 1),

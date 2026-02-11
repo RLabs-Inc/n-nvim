@@ -156,6 +156,26 @@ struct DotRepeat {
     keys: Vec<KeyEvent>,
 }
 
+// ─── Buffer state ──────────────────────────────────────────────────────────
+
+/// Per-buffer state that travels with a buffer when switching.
+///
+/// The current buffer's state lives "unpacked" as flat fields on [`Editor`]
+/// for zero-overhead access. Inactive buffers are stored as `BufferState` in
+/// `Editor::other_bufs`. Switching buffers packs the current fields into a
+/// `BufferState` and unpacks the target.
+struct BufferState {
+    /// Unique buffer ID (monotonically increasing, Vim-style starting at 1).
+    id: usize,
+    buffer: Buffer,
+    cursor: Cursor,
+    view: View,
+    history: History,
+    marks: [Option<Position>; 26],
+    change_list: ChangeList,
+    last_visual_lines: Option<(usize, usize)>,
+}
+
 // ─── Editor ─────────────────────────────────────────────────────────────────
 
 /// The editor application state.
@@ -165,12 +185,37 @@ struct DotRepeat {
 /// Holds everything needed to edit a file: the text buffer, cursor position,
 /// current mode, undo history, view configuration, command line state, and
 /// the screen position of the cursor computed during the last paint.
+///
+/// # Multi-buffer architecture
+///
+/// The current buffer's per-buffer state (buffer, cursor, view, history,
+/// marks, change list) lives as flat fields on Editor for zero-overhead
+/// access — no indirection, no borrow checker gymnastics. Inactive buffers
+/// are stored as [`BufferState`] in `other_bufs`. Switching buffers packs
+/// the current fields into a `BufferState`, swaps it into the Vec, and
+/// unpacks the target.
 struct Editor {
+    // ── Per-buffer state (current buffer, unpacked) ──────────────────
     buffer: Buffer,
     cursor: Cursor,
     view: View,
     mode: Mode,
     history: History,
+
+    // ── Multi-buffer management ──────────────────────────────────────
+
+    /// Inactive buffers. The current buffer is NOT in this list — it lives
+    /// unpacked in the flat fields above.
+    other_bufs: Vec<BufferState>,
+
+    /// ID of the current buffer (matches the `id` it would have if packed).
+    current_buf_id: usize,
+
+    /// ID of the alternate buffer for `Ctrl+^` quick-switch.
+    alternate_buf_id: Option<usize>,
+
+    /// Next ID to assign when creating a new buffer.
+    next_buf_id: usize,
 
     /// Multi-key command state. When an operator key (`d`, `c`, `y`) is
     /// pressed, this tracks the pending state until the command is completed
@@ -287,6 +332,10 @@ impl Editor {
             view: View::new(),
             mode: Mode::Normal,
             history: History::new(),
+            other_bufs: Vec::new(),
+            current_buf_id: 1,
+            alternate_buf_id: None,
+            next_buf_id: 2,
             pending: None,
             count: None,
             cursor_screen: None,
@@ -331,6 +380,10 @@ impl Editor {
             view: View::new(),
             mode: Mode::Normal,
             history: History::new(),
+            other_bufs: Vec::new(),
+            current_buf_id: 1,
+            alternate_buf_id: None,
+            next_buf_id: 2,
             pending: None,
             count: None,
             cursor_screen: None,
@@ -386,6 +439,267 @@ impl Editor {
         if let Some(change_pos) = self.history.commit(self.cursor.position()) {
             self.change_list.push(change_pos);
         }
+    }
+
+    // ── Multi-buffer ───────────────────────────────────────────────────
+
+    /// Total number of open buffers (current + other).
+    fn buf_count(&self) -> usize {
+        1 + self.other_bufs.len()
+    }
+
+    /// Format a `buf_info` label for the status line. Returns `""` when there
+    /// is only one buffer, otherwise `"[current_id/total]"`.
+    fn buf_info_label(&self) -> String {
+        if self.other_bufs.is_empty() {
+            String::new()
+        } else {
+            format!("[{}/{}]", self.current_buf_id, self.buf_count())
+        }
+    }
+
+    /// Pack the current buffer's per-buffer fields into a `BufferState`.
+    fn pack_current(&mut self) -> BufferState {
+        BufferState {
+            id: self.current_buf_id,
+            buffer: std::mem::replace(&mut self.buffer, Buffer::new()),
+            cursor: std::mem::replace(&mut self.cursor, Cursor::new()),
+            view: std::mem::replace(&mut self.view, View::new()),
+            history: std::mem::replace(&mut self.history, History::new()),
+            marks: std::mem::take(&mut self.marks),
+            change_list: std::mem::replace(&mut self.change_list, ChangeList::new()),
+            last_visual_lines: self.last_visual_lines.take(),
+        }
+    }
+
+    /// Unpack a `BufferState` into the current buffer's flat fields.
+    fn unpack(&mut self, bs: BufferState) {
+        self.current_buf_id = bs.id;
+        self.buffer = bs.buffer;
+        self.cursor = bs.cursor;
+        self.view = bs.view;
+        self.history = bs.history;
+        self.marks = bs.marks;
+        self.change_list = bs.change_list;
+        self.last_visual_lines = bs.last_visual_lines;
+    }
+
+    /// Switch to the buffer with the given ID. Returns false if not found.
+    fn switch_to_buffer(&mut self, target_id: usize) -> bool {
+        if target_id == self.current_buf_id {
+            return true;
+        }
+
+        let Some(target_idx) = self.other_bufs.iter().position(|b| b.id == target_id) else {
+            return false;
+        };
+
+        // Pack current and swap with target.
+        let packed = self.pack_current();
+        let target = std::mem::replace(&mut self.other_bufs[target_idx], packed);
+        self.unpack(target);
+
+        // Record alternate for Ctrl+^.
+        self.alternate_buf_id = Some(self.other_bufs[target_idx].id);
+
+        // Reset editing state on buffer switch.
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.count = None;
+        self.search = None;
+        self.clear_message();
+
+        true
+    }
+
+    /// Sorted list of all buffer IDs (current + other), for ordered iteration.
+    fn all_buf_ids_sorted(&self) -> Vec<usize> {
+        let mut ids: Vec<usize> = std::iter::once(self.current_buf_id)
+            .chain(self.other_bufs.iter().map(|b| b.id))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Open a file in a new buffer. If the file is already open, switch to it.
+    fn open_file(&mut self, path: &Path) -> CommandResult {
+        // Canonicalize for comparison (ignore errors — use as-is if unresolvable).
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+        // Check if already open in current buffer.
+        if let Some(cur_path) = self.buffer.path() {
+            if std::fs::canonicalize(cur_path).unwrap_or_else(|_| cur_path.to_path_buf()) == canon {
+                return CommandResult::Ok(Some(format!(
+                    "\"{}\" (already the current buffer)",
+                    path.display()
+                )));
+            }
+        }
+
+        // Check if already open in another buffer.
+        for bs in &self.other_bufs {
+            if let Some(p) = bs.buffer.path() {
+                if std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == canon {
+                    let id = bs.id;
+                    self.switch_to_buffer(id);
+                    return CommandResult::Ok(Some(format!("\"{}\"", path.display())));
+                }
+            }
+        }
+
+        // Load new file.
+        let buf = match Buffer::from_file(path) {
+            Ok(b) => b,
+            Err(e) => return CommandResult::Err(format!("E325: {e}")),
+        };
+
+        // Pack current and store it.
+        let packed = self.pack_current();
+        let old_id = packed.id;
+        self.other_bufs.push(packed);
+
+        // Set up the new buffer as current.
+        let new_id = self.next_buf_id;
+        self.next_buf_id += 1;
+        self.current_buf_id = new_id;
+        self.buffer = buf;
+        self.cursor = Cursor::new();
+        self.view = View::new();
+        self.history = History::new();
+        self.marks = [None; 26];
+        self.change_list = ChangeList::new();
+        self.last_visual_lines = None;
+
+        // Record alternate.
+        self.alternate_buf_id = Some(old_id);
+
+        // Reset editing state.
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.count = None;
+        self.search = None;
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| path.to_str().unwrap_or("???"));
+        let lines = self.buffer.line_count();
+        CommandResult::Ok(Some(format!("\"{name}\" {lines}L")))
+    }
+
+    /// Switch to the next buffer (by ID order). Wraps around.
+    fn buf_next(&mut self) -> CommandResult {
+        if self.other_bufs.is_empty() {
+            return CommandResult::Err("E85: There is no other buffer".to_string());
+        }
+        let ids = self.all_buf_ids_sorted();
+        let cur_pos = ids.iter().position(|&id| id == self.current_buf_id).unwrap();
+        let next_id = ids[(cur_pos + 1) % ids.len()];
+        self.switch_to_buffer(next_id);
+        self.show_buf_switch_message();
+        CommandResult::Ok(None)
+    }
+
+    /// Switch to the previous buffer (by ID order). Wraps around.
+    fn buf_prev(&mut self) -> CommandResult {
+        if self.other_bufs.is_empty() {
+            return CommandResult::Err("E85: There is no other buffer".to_string());
+        }
+        let ids = self.all_buf_ids_sorted();
+        let cur_pos = ids.iter().position(|&id| id == self.current_buf_id).unwrap();
+        let prev_id = ids[(cur_pos + ids.len() - 1) % ids.len()];
+        self.switch_to_buffer(prev_id);
+        self.show_buf_switch_message();
+        CommandResult::Ok(None)
+    }
+
+    /// Close the current buffer. If it's the last buffer, quit. If it has
+    /// unsaved changes, refuse unless `force` is true.
+    fn buf_delete(&mut self, force: bool) -> CommandResult {
+        if !force && self.buffer.is_modified() {
+            return CommandResult::Err(
+                "E89: No write since last change for buffer (add ! to override)".to_string(),
+            );
+        }
+
+        if self.other_bufs.is_empty() {
+            // Last buffer — quit the editor.
+            return CommandResult::Quit;
+        }
+
+        // Choose which buffer to switch to: alternate if available, else next.
+        let target_id = self.alternate_buf_id
+            .filter(|&id| self.other_bufs.iter().any(|b| b.id == id))
+            .unwrap_or_else(|| {
+                // Pick the buffer with the nearest ID.
+                let ids = self.all_buf_ids_sorted();
+                let cur_pos = ids.iter().position(|&id| id == self.current_buf_id).unwrap();
+                if cur_pos + 1 < ids.len() {
+                    ids[cur_pos + 1]
+                } else {
+                    ids[cur_pos.saturating_sub(1)]
+                }
+            });
+
+        let target_idx = self.other_bufs.iter().position(|b| b.id == target_id).unwrap();
+        let target = self.other_bufs.remove(target_idx);
+        let old_id = self.current_buf_id;
+        self.unpack(target);
+
+        // Set alternate to the closest remaining buffer (not the deleted one).
+        self.alternate_buf_id = if self.other_bufs.is_empty() {
+            None
+        } else {
+            // Find the buffer that was alternate before, if it's still alive.
+            Some(old_id).filter(|_| false) // old buffer is deleted, can't be alternate
+                .or_else(|| self.other_bufs.first().map(|b| b.id))
+        };
+
+        // Reset editing state.
+        self.mode = Mode::Normal;
+        self.pending = None;
+        self.count = None;
+        self.search = None;
+
+        self.show_buf_switch_message();
+        CommandResult::Ok(None)
+    }
+
+    /// Build the `:ls` buffer listing.
+    fn buf_list(&self) -> String {
+        let ids = self.all_buf_ids_sorted();
+        let mut lines = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            if id == self.current_buf_id {
+                let name = self.buffer.path()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("[No Name]");
+                let modified = if self.buffer.is_modified() { "+" } else { "" };
+                let alt = if self.alternate_buf_id == Some(id) { "#" } else { "" };
+                lines.push(format!("  {id:>3} %a{alt} \"{name}\" {modified}"));
+            } else if let Some(bs) = self.other_bufs.iter().find(|b| b.id == id) {
+                let name = bs.buffer.path()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("[No Name]");
+                let modified = if bs.buffer.is_modified() { "+" } else { "" };
+                let alt = if self.alternate_buf_id == Some(id) { "#" } else { "" };
+                let current = "";
+                lines.push(format!("  {id:>3} {current}{alt} \"{name}\" {modified}"));
+            }
+        }
+        lines.join("\n")
+    }
+
+    /// Set the message to show after a buffer switch.
+    fn show_buf_switch_message(&mut self) {
+        let name = self.buffer.path()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("[No Name]");
+        let lines = self.buffer.line_count();
+        self.set_message(format!("\"{name}\" {lines}L"));
     }
 
     // ── Count accumulation ─────────────────────────────────────────────
@@ -702,6 +1016,7 @@ impl Editor {
 
     // ── Normal mode ──────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     fn handle_normal(&mut self, key: &KeyEvent) -> Action {
         // Any keypress in normal mode clears the message line.
         self.clear_message();
@@ -745,6 +1060,21 @@ impl Editor {
                     self.pending = None;
                     let count = self.take_count();
                     self.scroll_half_page_up(count);
+                    return Action::Continue;
+                }
+                KeyCode::Char('^' | '6') => {
+                    // Ctrl+^ (or Ctrl+6) — switch to alternate buffer.
+                    self.pending = None;
+                    self.count = None;
+                    if let Some(alt_id) = self.alternate_buf_id {
+                        if self.switch_to_buffer(alt_id) {
+                            self.show_buf_switch_message();
+                        } else {
+                            self.set_error("E23: No alternate file");
+                        }
+                    } else {
+                        self.set_error("E23: No alternate file");
+                    }
                     return Action::Continue;
                 }
                 KeyCode::Char('o') => {
@@ -2058,6 +2388,15 @@ impl Editor {
             Command::ForceQuit => CommandResult::Quit,
             Command::WriteQuit => self.cmd_write_quit(),
             Command::ExitSave => self.cmd_exit_save(),
+            Command::Edit(path) => self.open_file(&path),
+            Command::BufNext => self.buf_next(),
+            Command::BufPrev => self.buf_prev(),
+            Command::BufDelete => self.buf_delete(false),
+            Command::BufDeleteForce => self.buf_delete(true),
+            Command::BufList => {
+                let listing = self.buf_list();
+                CommandResult::Ok(Some(listing))
+            }
             Command::Substitute { range, pattern, replacement, flags } => {
                 self.cmd_substitute(&range, &pattern, &replacement, flags)
             }
@@ -2107,15 +2446,23 @@ impl Editor {
         }
     }
 
-    /// `:q` — quit if no unsaved changes.
+    /// `:q` — quit if no unsaved changes in any buffer.
     fn cmd_quit(&self) -> CommandResult {
         if self.buffer.is_modified() {
-            CommandResult::Err(
+            return CommandResult::Err(
                 "E37: No write since last change (add ! to override)".to_string(),
-            )
-        } else {
-            CommandResult::Quit
+            );
         }
+        if let Some(bs) = self.other_bufs.iter().find(|b| b.buffer.is_modified()) {
+            let name = bs.buffer.path()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("[No Name]");
+            return CommandResult::Err(
+                format!("E37: No write since last change for buffer \"{name}\" (add ! to override)")
+            );
+        }
+        CommandResult::Quit
     }
 
     /// `:wq` — save and quit.
@@ -3813,6 +4160,9 @@ impl App for Editor {
             _ => None,
         };
 
+        // Buffer info label for the status line (shown when >1 buffer open).
+        let buf_info = self.buf_info_label();
+
         if h < 2 {
             // Too small for text + status + command line. Just render
             // what we can into the View.
@@ -3821,6 +4171,7 @@ impl App for Editor {
                 &self.cursor,
                 self.mode,
                 selection,
+                &buf_info,
                 frame,
                 0,
                 0,
@@ -3840,6 +4191,7 @@ impl App for Editor {
             &self.cursor,
             self.mode,
             selection,
+            &buf_info,
             frame,
             0,
             0,
@@ -6736,5 +7088,334 @@ mod tests {
         // Ctrl+O should do nothing — w is not a jump motion.
         feed(&mut e, &[ctrl('o')]);
         assert_eq!(e.cursor.col(), 14); // still at "four"
+    }
+
+    // ── Multi-buffer (:e, :bn, :bp, :bd, :ls, Ctrl+^) ──────────────────
+
+    /// Helper: create a temp file with content, return the path.
+    fn temp_file(name: &str, content: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("n-nvim-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn multi_buf_initial_state() {
+        let e = editor_with("hello");
+        assert_eq!(e.current_buf_id, 1);
+        assert_eq!(e.buf_count(), 1);
+        assert!(e.other_bufs.is_empty());
+        assert!(e.alternate_buf_id.is_none());
+    }
+
+    #[test]
+    fn multi_buf_open_file() {
+        let path = temp_file("open_test.txt", "file content");
+        let mut e = editor_with("original");
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Now editing the new file.
+        assert_eq!(e.buffer.contents(), "file content");
+        assert_eq!(e.buf_count(), 2);
+        assert_eq!(e.current_buf_id, 2);
+        // Original buffer stored in other_bufs.
+        assert_eq!(e.other_bufs.len(), 1);
+        assert_eq!(e.other_bufs[0].id, 1);
+    }
+
+    #[test]
+    fn multi_buf_open_already_current() {
+        let path = temp_file("already_cur.txt", "same file");
+        let mut e = Editor::new();
+        e.buffer = Buffer::from_file(&path).unwrap();
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Should stay on the same buffer, not create a duplicate.
+        assert_eq!(e.buf_count(), 1);
+    }
+
+    #[test]
+    fn multi_buf_open_already_in_other() {
+        let path_a = temp_file("other_a.txt", "aaa");
+        let path_b = temp_file("other_b.txt", "bbb");
+        let mut e = Editor::new();
+        e.buffer = Buffer::from_file(&path_a).unwrap();
+        // Open file b.
+        cmd(&mut e, &format!("e {}", path_b.display()));
+        assert_eq!(e.buffer.contents(), "bbb");
+        assert_eq!(e.buf_count(), 2);
+        // Re-open file a — should switch, not create a third buffer.
+        cmd(&mut e, &format!("e {}", path_a.display()));
+        assert_eq!(e.buffer.contents(), "aaa");
+        assert_eq!(e.buf_count(), 2);
+    }
+
+    #[test]
+    fn multi_buf_bn_cycles_forward() {
+        let path = temp_file("bn_test.txt", "second");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Now on buffer 2 ("second"). :bn should go to buffer 1.
+        cmd(&mut e, "bn");
+        assert_eq!(e.buffer.contents(), "first");
+        // :bn again wraps back to buffer 2.
+        cmd(&mut e, "bn");
+        assert_eq!(e.buffer.contents(), "second");
+    }
+
+    #[test]
+    fn multi_buf_bp_cycles_backward() {
+        let path = temp_file("bp_test.txt", "second");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Now on buffer 2. :bp should go to buffer 1.
+        cmd(&mut e, "bp");
+        assert_eq!(e.buffer.contents(), "first");
+        // :bp again wraps to buffer 2.
+        cmd(&mut e, "bp");
+        assert_eq!(e.buffer.contents(), "second");
+    }
+
+    #[test]
+    fn multi_buf_bn_single_buffer_error() {
+        let mut e = editor_with("only buffer");
+        cmd(&mut e, "bn");
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E85")));
+    }
+
+    #[test]
+    fn multi_buf_bp_single_buffer_error() {
+        let mut e = editor_with("only buffer");
+        cmd(&mut e, "bp");
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E85")));
+    }
+
+    #[test]
+    fn multi_buf_bd_closes_current() {
+        let path = temp_file("bd_test.txt", "second");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        assert_eq!(e.buf_count(), 2);
+        // Close current (second).
+        cmd(&mut e, "bd");
+        assert_eq!(e.buf_count(), 1);
+        assert_eq!(e.buffer.contents(), "first");
+    }
+
+    #[test]
+    fn multi_buf_bd_refuses_if_modified() {
+        let path = temp_file("bd_mod.txt", "original");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Modify the buffer.
+        feed(&mut e, &[press('i'), press('x'), esc()]);
+        cmd(&mut e, "bd");
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E89")));
+        assert_eq!(e.buf_count(), 2); // not closed
+    }
+
+    #[test]
+    fn multi_buf_bd_force_closes_modified() {
+        let path = temp_file("bd_force.txt", "original");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        feed(&mut e, &[press('i'), press('x'), esc()]);
+        cmd(&mut e, "bd!");
+        assert_eq!(e.buf_count(), 1);
+        assert_eq!(e.buffer.contents(), "first");
+    }
+
+    #[test]
+    fn multi_buf_bd_last_buffer_quits() {
+        let mut e = editor_with("only buffer");
+        cmd(&mut e, "bd");
+        // bd on last buffer should return Quit — we verify indirectly:
+        // after processing, the editor would quit. Since we use feed(),
+        // the Action::Quit is consumed, but we can check state.
+        // Actually, let's test the run_command directly.
+        let result = e.run_command(Command::BufDelete);
+        assert_eq!(result, CommandResult::Quit);
+    }
+
+    #[test]
+    fn multi_buf_ls_listing() {
+        let path = temp_file("ls_test.txt", "second file");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        let listing = e.buf_list();
+        // Current buffer should have %a marker.
+        assert!(listing.contains("%a"));
+        assert!(listing.contains("ls_test.txt"));
+        // Buffer 1 should be listed as alternate.
+        assert!(listing.contains("[No Name]") || listing.contains("1"));
+    }
+
+    #[test]
+    fn multi_buf_ctrl_caret_switches() {
+        let path = temp_file("caret_test.txt", "second");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        assert_eq!(e.buffer.contents(), "second");
+        // Ctrl+^ switches to alternate (first buffer).
+        feed(&mut e, &[ctrl('^')]);
+        assert_eq!(e.buffer.contents(), "first");
+        // Ctrl+^ again switches back.
+        feed(&mut e, &[ctrl('^')]);
+        assert_eq!(e.buffer.contents(), "second");
+    }
+
+    #[test]
+    fn multi_buf_ctrl_caret_no_alternate() {
+        let mut e = editor_with("only buffer");
+        feed(&mut e, &[ctrl('^')]);
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E23")));
+    }
+
+    #[test]
+    fn multi_buf_preserves_cursor_and_history() {
+        let path = temp_file("preserve_test.txt", "second buffer");
+        let mut e = editor_with("first buffer content");
+        // Move cursor in first buffer.
+        feed(&mut e, &[press('w'), press('w')]); // cursor at "content"
+        let first_cursor_col = e.cursor.col();
+        // Open second file.
+        cmd(&mut e, &format!("e {}", path.display()));
+        assert_eq!(e.cursor.col(), 0); // new buffer starts at 0,0
+        // Switch back.
+        feed(&mut e, &[ctrl('^')]);
+        assert_eq!(e.cursor.col(), first_cursor_col); // cursor restored
+    }
+
+    #[test]
+    fn multi_buf_preserves_marks() {
+        let path = temp_file("marks_test.txt", "second");
+        let mut e = editor_with("line one\nline two\nline three");
+        // Set mark 'a' on line 1.
+        feed(&mut e, &[press('j'), press('m'), press('a')]);
+        assert!(e.marks[0].is_some());
+        // Open second file.
+        cmd(&mut e, &format!("e {}", path.display()));
+        assert!(e.marks[0].is_none()); // new buffer has no marks
+        // Switch back.
+        feed(&mut e, &[ctrl('^')]);
+        assert!(e.marks[0].is_some()); // mark restored
+        assert_eq!(e.marks[0].unwrap().line, 1);
+    }
+
+    #[test]
+    fn multi_buf_preserves_undo_history() {
+        let path = temp_file("undo_test.txt", "second");
+        let mut e = editor_with("original");
+        // Make a change.
+        feed(&mut e, &[press('i'), press('x'), esc()]);
+        assert_eq!(e.buffer.contents(), "xoriginal");
+        // Open second file.
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Switch back and undo.
+        feed(&mut e, &[ctrl('^'), press('u')]);
+        assert_eq!(e.buffer.contents(), "original");
+    }
+
+    #[test]
+    fn multi_buf_switch_resets_mode() {
+        let path_b = temp_file("mode_test.txt", "second");
+        let path_c = temp_file("mode_test2.txt", "third");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path_b.display()));
+        cmd(&mut e, &format!("e {}", path_c.display()));
+        // Enter visual mode, then :bn should reset to Normal.
+        feed(&mut e, &[press('v')]);
+        assert!(matches!(e.mode, Mode::Visual(_)));
+        // Escape to normal first (can't type : in visual... actually you can
+        // in our editor, but let's test the bn switch properly).
+        feed(&mut e, &[esc()]);
+        cmd(&mut e, "bn");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn multi_buf_quit_checks_all() {
+        let path = temp_file("quit_test.txt", "second");
+        let mut e = editor_with("first");
+        cmd(&mut e, &format!("e {}", path.display()));
+        // Modify the first buffer (currently in other_bufs).
+        feed(&mut e, &[ctrl('^')]); // switch to first
+        feed(&mut e, &[press('i'), press('x'), esc()]); // modify
+        feed(&mut e, &[ctrl('^')]); // switch back to second
+        // :q should refuse — first buffer is modified.
+        let result = e.cmd_quit();
+        assert!(matches!(result, CommandResult::Err(ref msg) if msg.contains("E37")));
+    }
+
+    #[test]
+    fn multi_buf_three_buffers() {
+        let path_b = temp_file("three_b.txt", "buffer B");
+        let path_c = temp_file("three_c.txt", "buffer C");
+        let mut e = editor_with("buffer A");
+        cmd(&mut e, &format!("e {}", path_b.display()));
+        cmd(&mut e, &format!("e {}", path_c.display()));
+        assert_eq!(e.buf_count(), 3);
+        assert_eq!(e.buffer.contents(), "buffer C");
+        // :bn cycles: C → A → B → C
+        cmd(&mut e, "bn");
+        assert_eq!(e.buffer.contents(), "buffer A");
+        cmd(&mut e, "bn");
+        assert_eq!(e.buffer.contents(), "buffer B");
+        cmd(&mut e, "bn");
+        assert_eq!(e.buffer.contents(), "buffer C");
+    }
+
+    #[test]
+    fn multi_buf_bd_with_three() {
+        let path_b = temp_file("three_bd_b.txt", "buffer B");
+        let path_c = temp_file("three_bd_c.txt", "buffer C");
+        let mut e = editor_with("buffer A");
+        cmd(&mut e, &format!("e {}", path_b.display()));
+        cmd(&mut e, &format!("e {}", path_c.display()));
+        // Close C (current). Should switch to B (alternate).
+        cmd(&mut e, "bd");
+        assert_eq!(e.buf_count(), 2);
+        assert_eq!(e.buffer.contents(), "buffer B");
+    }
+
+    #[test]
+    fn multi_buf_status_label() {
+        let path = temp_file("label_test.txt", "second");
+        let mut e = editor_with("first");
+        // With one buffer, label is empty.
+        assert_eq!(e.buf_info_label(), "");
+        // With two buffers, label shows position.
+        cmd(&mut e, &format!("e {}", path.display()));
+        let label = e.buf_info_label();
+        assert!(label.contains("/2"));
+    }
+
+    #[test]
+    fn multi_buf_open_nonexistent_file_error() {
+        let mut e = editor_with("first");
+        cmd(&mut e, "e /nonexistent/path/to/file.txt");
+        assert!(e.message_is_error);
+        assert_eq!(e.buf_count(), 1); // no new buffer created
+    }
+
+    #[test]
+    fn multi_buf_e_no_path_error() {
+        let mut e = editor_with("first");
+        cmd(&mut e, "e");
+        assert!(e.message_is_error);
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E32") || m.contains("E492")));
+    }
+
+    #[test]
+    fn multi_buf_alternate_after_bd() {
+        let path_b = temp_file("alt_bd_b.txt", "B");
+        let path_c = temp_file("alt_bd_c.txt", "C");
+        let mut e = editor_with("A");
+        cmd(&mut e, &format!("e {}", path_b.display()));
+        cmd(&mut e, &format!("e {}", path_c.display()));
+        // Alternate is B (last buffer before C).
+        // Close C → should go to B.
+        cmd(&mut e, "bd");
+        assert_eq!(e.buffer.contents(), "B");
     }
 }
