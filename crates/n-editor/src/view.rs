@@ -594,6 +594,98 @@ fn fill_empty(frame: &mut FrameBuffer, x: u16, y: u16, width: u16) {
     }
 }
 
+/// Render the command line (`:` prompt with input text).
+///
+/// Returns the screen position of the command-line cursor as `(x, y)`.
+/// The leading `:` is added automatically — `input` should not include it.
+pub fn render_command_line(
+    frame: &mut FrameBuffer,
+    input: &str,
+    cursor_col: usize,
+    x: u16,
+    y: u16,
+    width: u16,
+) -> Option<(u16, u16)> {
+    if width == 0 {
+        return None;
+    }
+
+    // Leading ':'
+    frame.set(x, y, Cell::new(':'));
+    let mut col: u16 = 1;
+
+    // Input text
+    for ch in input.chars() {
+        if col >= width {
+            break;
+        }
+        frame.set(x + col, y, Cell::new(ch));
+        col += 1;
+    }
+
+    // Fill remaining with empty cells
+    while col < width {
+        frame.set(x + col, y, Cell::EMPTY);
+        col += 1;
+    }
+
+    // Cursor position: after ':' + cursor_col
+    #[allow(clippy::cast_possible_truncation)]
+    let cursor_x = 1 + cursor_col as u16;
+    if cursor_x < width {
+        Some((x + cursor_x, y))
+    } else {
+        None
+    }
+}
+
+/// Render a message on the bottom line.
+///
+/// Error messages are shown with the BOLD attribute and red foreground.
+/// Normal messages are shown with default styling.
+pub fn render_message_line(
+    frame: &mut FrameBuffer,
+    message: &str,
+    is_error: bool,
+    x: u16,
+    y: u16,
+    width: u16,
+) {
+    if width == 0 {
+        return;
+    }
+
+    let mut col: u16 = 0;
+
+    for ch in message.chars() {
+        if col >= width {
+            break;
+        }
+        if is_error {
+            frame.set(
+                x + col,
+                y,
+                Cell::styled(
+                    ch,
+                    CellColor::Ansi256(1), // red
+                    CellColor::Default,
+                    Attr::BOLD,
+                    UnderlineStyle::None,
+                ),
+            );
+        } else {
+            frame.set(x + col, y, Cell::new(ch));
+        }
+        col += 1;
+    }
+
+    // Fill remaining with empty cells
+    while col < width {
+        frame.set(x + col, y, Cell::EMPTY);
+        col += 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1378,5 +1470,139 @@ mod tests {
         assert_eq!(row[3].character(), Some('b'));
         assert_eq!(row[4].character(), Some('中'));
         assert!(row[5].is_continuation());
+    }
+
+    // ── render_command_line ──────────────────────────────────────────────
+
+    #[test]
+    fn command_line_basic() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_command_line(&mut frame, "wq", 2, 0, 0, 20);
+
+        let row = row_chars(&frame, 0);
+        assert!(row.starts_with(":wq"), "row = '{row}'");
+        // Cursor after "wq" → col 3 (: + w + q)
+        assert_eq!(pos, Some((3, 0)));
+    }
+
+    #[test]
+    fn command_line_empty_input() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_command_line(&mut frame, "", 0, 0, 0, 20);
+
+        let row = row_chars(&frame, 0);
+        assert!(row.starts_with(':'), "row = '{row}'");
+        // Cursor right after ':'
+        assert_eq!(pos, Some((1, 0)));
+    }
+
+    #[test]
+    fn command_line_cursor_in_middle() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_command_line(&mut frame, "write", 2, 0, 0, 20);
+
+        // Cursor at char offset 2 → screen col 3 (: + w + r)
+        assert_eq!(pos, Some((3, 0)));
+    }
+
+    #[test]
+    fn command_line_zero_width() {
+        let mut frame = FrameBuffer::new(20, 1);
+        let pos = render_command_line(&mut frame, "wq", 0, 0, 0, 0);
+        assert!(pos.is_none());
+    }
+
+    #[test]
+    fn command_line_with_offset() {
+        let mut frame = FrameBuffer::new(40, 24);
+        let pos = render_command_line(&mut frame, "q!", 2, 5, 10, 20);
+
+        // x offset = 5, cursor at 5 + 1 + 2 = 8
+        assert_eq!(pos, Some((8, 10)));
+    }
+
+    #[test]
+    fn command_line_fills_remaining() {
+        let mut frame = FrameBuffer::new(10, 1);
+
+        // Pre-fill with X to detect clearing.
+        for col in 0..10u16 {
+            frame.set(col, 0, Cell::new('X'));
+        }
+
+        render_command_line(&mut frame, "w", 1, 0, 0, 10);
+
+        // ":w" occupies cols 0-1, rest should be empty (space).
+        let row = frame.row(0).unwrap();
+        assert_eq!(row[0].character(), Some(':'));
+        assert_eq!(row[1].character(), Some('w'));
+        for col in 2..10 {
+            assert_eq!(row[col].character(), Some(' '), "col {col} not cleared");
+        }
+    }
+
+    // ── render_message_line ──────────────────────────────────────────────
+
+    #[test]
+    fn message_line_normal() {
+        let mut frame = FrameBuffer::new(30, 1);
+        render_message_line(&mut frame, "written 42B", false, 0, 0, 30);
+
+        let row = row_chars(&frame, 0);
+        assert!(row.starts_with("written 42B"), "row = '{row}'");
+
+        // Normal message: should NOT be bold.
+        let cell = frame.get(0, 0).unwrap();
+        assert!(!cell.attrs.contains(Attr::BOLD));
+    }
+
+    #[test]
+    fn message_line_error() {
+        let mut frame = FrameBuffer::new(30, 1);
+        render_message_line(&mut frame, "E37: No write", true, 0, 0, 30);
+
+        let row = row_chars(&frame, 0);
+        assert!(row.starts_with("E37: No write"), "row = '{row}'");
+
+        // Error message: should be bold + red.
+        let cell = frame.get(0, 0).unwrap();
+        assert!(cell.attrs.contains(Attr::BOLD));
+        assert_eq!(cell.fg, CellColor::Ansi256(1));
+    }
+
+    #[test]
+    fn message_line_empty() {
+        let mut frame = FrameBuffer::new(10, 1);
+
+        for col in 0..10u16 {
+            frame.set(col, 0, Cell::new('X'));
+        }
+
+        render_message_line(&mut frame, "", false, 0, 0, 10);
+
+        // All cells should be empty (space).
+        for col in 0..10 {
+            assert_eq!(
+                frame.get(col, 0).unwrap().character(),
+                Some(' '),
+                "col {col} not cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn message_line_zero_width() {
+        let mut frame = FrameBuffer::new(20, 1);
+        // Should not panic.
+        render_message_line(&mut frame, "hello", false, 0, 0, 0);
+    }
+
+    #[test]
+    fn message_line_truncates() {
+        let mut frame = FrameBuffer::new(5, 1);
+        render_message_line(&mut frame, "hello world", false, 0, 0, 5);
+
+        let row = row_chars(&frame, 0);
+        assert_eq!(row, "hello");
     }
 }
