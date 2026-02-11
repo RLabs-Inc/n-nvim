@@ -44,6 +44,35 @@ use n_term::event_loop::{Action, App, EventLoop};
 use n_term::input::{Event, KeyCode, KeyEvent, Modifiers};
 use n_term::terminal::Size;
 
+// ─── Character find direction ───────────────────────────────────────────────
+
+/// Direction and mode for `f`/`F`/`t`/`T` character-find motions.
+///
+/// Stored in `Editor::last_char_find` so `;` and `,` can repeat the last find.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharFindKind {
+    /// `f` — find char forward, land on it.
+    Forward,
+    /// `F` — find char backward, land on it.
+    Backward,
+    /// `t` — find char forward, land one before it.
+    TillForward,
+    /// `T` — find char backward, land one after it.
+    TillBackward,
+}
+
+impl CharFindKind {
+    /// Return the opposite direction (for `,` repeat).
+    const fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+            Self::TillForward => Self::TillBackward,
+            Self::TillBackward => Self::TillForward,
+        }
+    }
+}
+
 // ─── Pending state ──────────────────────────────────────────────────────────
 
 /// Multi-key command state for operator-pending mode.
@@ -55,6 +84,7 @@ use n_term::terminal::Size;
 /// - The same key again → line operation (`dd`, `yy`, `cc`)
 /// - A motion key → operate from cursor to motion target (`dw`, `d$`, `cw`)
 /// - `i`/`a` + object key → operate on a text object (`diw`, `ci"`, `ya(`)
+/// - `f`/`F`/`t`/`T` + char → operate to the character find target (`dfa`)
 ///
 /// The `count` field stores the operator's count (typed before the operator).
 /// A second count can be typed before the motion; the effective count is
@@ -67,6 +97,15 @@ enum Pending {
     /// Operator + text-object prefix (`di`, `ca`, `yi`). Waiting for the
     /// object key (`w`, `"`, `(`, etc.).
     TextObject { op: char, inner: bool, count: usize },
+    /// Standalone char find (`f`, `F`, `t`, `T`). Waiting for the target char.
+    CharFind { kind: CharFindKind, count: usize },
+    /// Operator + char find (`df`, `ct`, etc.). Waiting for the target char.
+    OperatorCharFind {
+        op: char,
+        op_count: usize,
+        kind: CharFindKind,
+        motion_count: usize,
+    },
 }
 
 // ─── Dot-repeat ─────────────────────────────────────────────────────────────
@@ -143,6 +182,10 @@ struct Editor {
     /// (opposite direction).
     last_search_direction: SearchDirection,
 
+    /// Last character find for `;` and `,` repeat. Stores the target char
+    /// and the kind (f/F/t/T) of the most recent character find.
+    last_char_find: Option<(char, CharFindKind)>,
+
     /// True when recording keys for dot-repeat. Insert-mode keys are
     /// recorded verbatim; normal-mode digit keys are excluded (counts
     /// are tracked separately in `dot_effective_count`).
@@ -181,6 +224,7 @@ impl Editor {
             search: None,
             last_search: String::new(),
             last_search_direction: SearchDirection::Forward,
+            last_char_find: None,
             dot_recording: false,
             dot_keys: Vec::new(),
             dot_effective_count: None,
@@ -212,6 +256,7 @@ impl Editor {
             search: None,
             last_search: String::new(),
             last_search_direction: SearchDirection::Forward,
+            last_char_find: None,
             dot_recording: false,
             dot_keys: Vec::new(),
             dot_effective_count: None,
@@ -411,9 +456,91 @@ impl Editor {
                 }
             }
 
+            // Character find repeat (single-key motions — no pending needed).
+            KeyCode::Char(';') => {
+                if let Some((ch, kind)) = self.last_char_find {
+                    self.execute_char_find_motion(ch, kind, count, pe);
+                }
+            }
+            KeyCode::Char(',') => {
+                if let Some((ch, kind)) = self.last_char_find {
+                    self.execute_char_find_motion(ch, kind.opposite(), count, pe);
+                }
+            }
+
             _ => return false,
         }
         true
+    }
+
+    /// Execute a character-find motion (used by f/F/t/T and ;/,).
+    fn execute_char_find_motion(
+        &mut self,
+        ch: char,
+        kind: CharFindKind,
+        count: usize,
+        pe: bool,
+    ) {
+        match kind {
+            CharFindKind::Forward => {
+                self.cursor.char_find_forward(&self.buffer, ch, count, pe);
+            }
+            CharFindKind::Backward => {
+                self.cursor.char_find_backward(&self.buffer, ch, count, pe);
+            }
+            CharFindKind::TillForward => {
+                self.cursor.char_till_forward(&self.buffer, ch, count, pe);
+            }
+            CharFindKind::TillBackward => {
+                self.cursor.char_till_backward(&self.buffer, ch, count, pe);
+            }
+        }
+    }
+
+    /// Compute the operator range for a character-find motion.
+    ///
+    /// All character-find motions (f/F/t/T) are inclusive — the character at
+    /// the end of the range is included in the operation.
+    fn char_find_operator_range(
+        &self,
+        ch: char,
+        kind: CharFindKind,
+        count: usize,
+    ) -> Option<Range> {
+        let start = self.cursor.position();
+        let mut c = self.cursor.clone();
+
+        let moved = match kind {
+            CharFindKind::Forward => c.char_find_forward(&self.buffer, ch, count, false),
+            CharFindKind::Backward => c.char_find_backward(&self.buffer, ch, count, false),
+            CharFindKind::TillForward => c.char_till_forward(&self.buffer, ch, count, false),
+            CharFindKind::TillBackward => c.char_till_backward(&self.buffer, ch, count, false),
+        };
+
+        if !moved {
+            return None;
+        }
+
+        let end = c.position();
+        if start == end {
+            return None;
+        }
+
+        // Inclusive: extend to include the character at the far end.
+        let (from, to) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        let end_line_len = self.buffer.line_content_len(to.line).unwrap_or(0);
+        let extended = if to.col < end_line_len {
+            Position::new(to.line, to.col + 1)
+        } else {
+            Position::new(to.line, end_line_len)
+        };
+
+        Some(Range::new(from, extended))
     }
 
     // ── Normal mode ──────────────────────────────────────────────────────
@@ -564,6 +691,59 @@ impl Editor {
                     return Action::Continue;
                 }
 
+                // Character find prefix: f/F/t/T need one more key.
+                let char_find_kind = match key.code {
+                    KeyCode::Char('f') => Some(CharFindKind::Forward),
+                    KeyCode::Char('F') => Some(CharFindKind::Backward),
+                    KeyCode::Char('t') => Some(CharFindKind::TillForward),
+                    KeyCode::Char('T') => Some(CharFindKind::TillBackward),
+                    _ => None,
+                };
+                if let Some(kind) = char_find_kind {
+                    let raw_motion_count = self.take_raw_count();
+                    let motion_count = raw_motion_count.unwrap_or(1);
+                    if self.dot_recording && !self.dot_replaying {
+                        self.dot_effective_count =
+                            Self::merge_counts(self.dot_effective_count, raw_motion_count);
+                    }
+                    self.pending = Some(Pending::OperatorCharFind {
+                        op,
+                        op_count,
+                        kind,
+                        motion_count,
+                    });
+                    return Action::Continue;
+                }
+
+                // `;`/`,` repeat the last character find as an operator motion.
+                if key.code == KeyCode::Char(';') || key.code == KeyCode::Char(',') {
+                    if let Some((ch, stored_kind)) = self.last_char_find {
+                        let kind = if key.code == KeyCode::Char(',') {
+                            stored_kind.opposite()
+                        } else {
+                            stored_kind
+                        };
+                        let raw_motion_count = self.take_raw_count();
+                        let effective = op_count * raw_motion_count.unwrap_or(1);
+                        if self.dot_recording && !self.dot_replaying {
+                            self.dot_effective_count =
+                                Self::merge_counts(self.dot_effective_count, raw_motion_count);
+                        }
+                        if let Some(range) = self.char_find_operator_range(ch, kind, effective) {
+                            let action = self.apply_operator(op, range, false);
+                            if self.dot_recording
+                                && !self.dot_replaying
+                                && self.mode != Mode::Insert
+                            {
+                                self.dot_finish();
+                            }
+                            return action;
+                        }
+                    }
+                    self.dot_cancel();
+                    return Action::Continue;
+                }
+
                 // Try as a motion. The motion's own count multiplies with
                 // the operator count, except for g/G where it's a line number.
                 let raw_motion_count = self.take_raw_count();
@@ -615,6 +795,53 @@ impl Editor {
                 }
 
                 // Unrecognized text object key — cancel silently.
+                self.dot_cancel();
+                Action::Continue
+            }
+            Pending::CharFind { kind, count } => {
+                // Standalone f/F/t/T: waiting for the target character.
+                if key.code == KeyCode::Escape {
+                    return Action::Continue;
+                }
+                if let KeyCode::Char(ch) = key.code {
+                    self.last_char_find = Some((ch, kind));
+                    let pe = self.mode.cursor_past_end();
+                    self.execute_char_find_motion(ch, kind, count, pe);
+                }
+                Action::Continue
+            }
+            Pending::OperatorCharFind {
+                op,
+                op_count,
+                kind,
+                motion_count,
+            } => {
+                // Operator + f/F/t/T: waiting for the target character.
+                if key.code == KeyCode::Escape {
+                    self.dot_cancel();
+                    return Action::Continue;
+                }
+
+                // Record the target char for dot-repeat.
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_keys.push(*key);
+                }
+
+                if let KeyCode::Char(ch) = key.code {
+                    self.last_char_find = Some((ch, kind));
+                    let effective = op_count * motion_count;
+                    if let Some(range) = self.char_find_operator_range(ch, kind, effective) {
+                        let action = self.apply_operator(op, range, false);
+                        if self.dot_recording
+                            && !self.dot_replaying
+                            && self.mode != Mode::Insert
+                        {
+                            self.dot_finish();
+                        }
+                        return action;
+                    }
+                }
+
                 self.dot_cancel();
                 Action::Continue
             }
@@ -740,6 +967,32 @@ impl Editor {
                 if let Some(pos) = last_pos {
                     self.cursor.set_position(pos, &self.buffer, pe);
                 }
+            }
+
+            // -- Character find (enter pending, waiting for target char) --
+            KeyCode::Char('f') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::Forward,
+                    count,
+                });
+            }
+            KeyCode::Char('F') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::Backward,
+                    count,
+                });
+            }
+            KeyCode::Char('t') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::TillForward,
+                    count,
+                });
+            }
+            KeyCode::Char('T') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::TillBackward,
+                    count,
+                });
             }
 
             // -- Search --
@@ -1322,6 +1575,7 @@ impl Editor {
 
     // ── Visual mode ────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     fn handle_visual(&mut self, key: &KeyEvent) -> Action {
         self.clear_message();
 
@@ -1351,6 +1605,17 @@ impl Editor {
             }
         }
 
+        // Handle pending char find (f/F/t/T waiting for target char).
+        if let Some(pending) = self.pending.take() {
+            if let Pending::CharFind { kind, count } = pending {
+                if let KeyCode::Char(ch) = key.code {
+                    self.last_char_find = Some((ch, kind));
+                    self.execute_char_find_motion(ch, kind, count, pe);
+                }
+            }
+            return Action::Continue;
+        }
+
         // Digit accumulation (same logic as normal mode).
         match key.code {
             KeyCode::Char(d @ '1'..='9') => {
@@ -1365,6 +1630,7 @@ impl Editor {
         }
 
         let raw_count = self.take_raw_count();
+        let count = raw_count.unwrap_or(1);
 
         // Try motion keys (shared with normal mode). Motions move the
         // cursor but leave the anchor in place, extending the selection.
@@ -1376,6 +1642,32 @@ impl Editor {
             KeyCode::Escape => {
                 self.cursor.clear_anchor();
                 self.mode = Mode::Normal;
+            }
+
+            // -- Character find (enter pending, waiting for target char) --
+            KeyCode::Char('f') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::Forward,
+                    count,
+                });
+            }
+            KeyCode::Char('F') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::Backward,
+                    count,
+                });
+            }
+            KeyCode::Char('t') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::TillForward,
+                    count,
+                });
+            }
+            KeyCode::Char('T') => {
+                self.pending = Some(Pending::CharFind {
+                    kind: CharFindKind::TillBackward,
+                    count,
+                });
             }
 
             // -- Mode toggles --
@@ -2732,5 +3024,282 @@ mod tests {
         // P: paste 'a' before col 2 → "bcad". cursor at 'a' (col 2).
         // .: replays P → paste 'a' before col 2 → "bcaad". cursor at 'a' (col 2).
         assert_eq!(e.buffer.contents(), "bcaad");
+    }
+
+    // ── Character find: f/F/t/T ─────────────────────────────────────────
+
+    #[test]
+    fn f_forward_basic() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('f'), press('w')]);
+        assert_eq!(e.cursor.col(), 6);
+    }
+
+    #[test]
+    fn f_forward_not_found() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('f'), press('z')]);
+        assert_eq!(e.cursor.col(), 0); // didn't move
+    }
+
+    #[test]
+    fn f_forward_with_count() {
+        let mut e = editor_with("abracadabra");
+        // 3fa → 3rd 'a' after col 0 is at col 7.
+        feed(&mut e, &[press('3'), press('f'), press('a')]);
+        assert_eq!(e.cursor.col(), 7);
+    }
+
+    #[test]
+    fn f_backward_basic() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('$')]); // cursor on 'd' (col 10)
+        feed(&mut e, &[press('F'), press('o')]);
+        assert_eq!(e.cursor.col(), 7);
+    }
+
+    #[test]
+    fn t_forward_basic() {
+        let mut e = editor_with("hello world");
+        // tw → one before 'w' at col 6 → lands on col 5 (space).
+        feed(&mut e, &[press('t'), press('w')]);
+        assert_eq!(e.cursor.col(), 5);
+    }
+
+    #[test]
+    fn t_forward_adjacent_no_move() {
+        let mut e = editor_with("ab");
+        // tb → 'b' is adjacent. t lands on col 0 = cursor. No move.
+        feed(&mut e, &[press('t'), press('b')]);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn t_backward_basic() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('$')]); // col 10
+        // To → 'o' at col 7. T lands on col 8.
+        feed(&mut e, &[press('T'), press('o')]);
+        assert_eq!(e.cursor.col(), 8);
+    }
+
+    // ── Character find with operators: df, dt, cf, ct ────────────────────
+
+    #[test]
+    fn df_delete_to_char() {
+        let mut e = editor_with("hello.world");
+        // dfw → delete from 'h' through 'w' (inclusive). Range [0,7).
+        // Wait: f finds 'w' at col 6 (in "world"). Inclusive → [0, 7).
+        // Hmm, actually: "hello.world" — 'w' is at col 6.
+        // dfw: range [0, 7) → deletes "hello.w" → "orld".
+        feed(&mut e, &[press('d'), press('f'), press('w')]);
+        assert_eq!(e.buffer.contents(), "orld");
+    }
+
+    #[test]
+    fn dt_delete_till_char() {
+        let mut e = editor_with("hello.world");
+        // dtw → t finds 'w' at col 6, lands on col 5 ('.'). Inclusive → [0, 6).
+        // Deletes "hello." → "world".
+        feed(&mut e, &[press('d'), press('t'), press('w')]);
+        assert_eq!(e.buffer.contents(), "world");
+    }
+
+    #[test]
+    fn df_backward() {
+        let mut e = editor_with("hello.world");
+        feed(&mut e, &[press('$')]); // col 10 ('d')
+        // dFo → F finds 'o' at col 7. Inclusive → [7, 11) → deletes "orld".
+        feed(&mut e, &[press('d'), press('F'), press('o')]);
+        assert_eq!(e.buffer.contents(), "hello.w");
+    }
+
+    #[test]
+    fn cf_change_to_char() {
+        let mut e = editor_with("hello world");
+        // cf<space> → delete "hello " (h through space inclusive), enter insert.
+        // Space is at col 5. Range [0, 6). Delete "hello " → "world". Insert.
+        feed(
+            &mut e,
+            &[
+                press('c'),
+                press('f'),
+                press(' '),
+                press('H'),
+                press('I'),
+                press(' '),
+                esc(),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "HI world");
+    }
+
+    #[test]
+    fn df_with_count() {
+        let mut e = editor_with("a.b.c.d");
+        // d2f. → delete from 'a' through 2nd '.' (col 3). Inclusive → [0, 4).
+        feed(
+            &mut e,
+            &[press('d'), press('2'), press('f'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "c.d");
+    }
+
+    #[test]
+    fn df_motion_not_found_no_deletion() {
+        let mut e = editor_with("hello world");
+        // dfz → 'z' not found. No deletion.
+        feed(&mut e, &[press('d'), press('f'), press('z')]);
+        assert_eq!(e.buffer.contents(), "hello world");
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    // ── ; and , repeat ──────────────────────────────────────────────────
+
+    #[test]
+    fn semicolon_repeats_forward_find() {
+        let mut e = editor_with("abracadabra");
+        // fa → col 3 (2nd 'a'). Wait, col 0 is 'a', so fa finds next 'a'.
+        // "abracadabra" — a(0) b(1) r(2) a(3) c(4) a(5) d(6) a(7) b(8) r(9) a(10)
+        // fa from col 0 → col 3.
+        feed(&mut e, &[press('f'), press('a')]);
+        assert_eq!(e.cursor.col(), 3);
+
+        // ; → repeats fa, finds next 'a' at col 5.
+        feed(&mut e, &[press(';')]);
+        assert_eq!(e.cursor.col(), 5);
+
+        // ; → col 7.
+        feed(&mut e, &[press(';')]);
+        assert_eq!(e.cursor.col(), 7);
+    }
+
+    #[test]
+    fn comma_repeats_opposite_direction() {
+        let mut e = editor_with("abracadabra");
+        // fa → col 3. ; → col 5.
+        feed(&mut e, &[press('f'), press('a'), press(';')]);
+        assert_eq!(e.cursor.col(), 5);
+
+        // , → opposite direction (Fa), finds 'a' backward → col 3.
+        feed(&mut e, &[press(',')]);
+        assert_eq!(e.cursor.col(), 3);
+    }
+
+    #[test]
+    fn semicolon_repeats_backward_find() {
+        let mut e = editor_with("abracadabra");
+        // Move to end, then Fa.
+        feed(&mut e, &[press('$')]); // col 10
+        feed(&mut e, &[press('F'), press('a')]);
+        assert_eq!(e.cursor.col(), 7);
+
+        // ; → repeats Fa backward → col 5.
+        feed(&mut e, &[press(';')]);
+        assert_eq!(e.cursor.col(), 5);
+    }
+
+    #[test]
+    fn semicolon_repeats_till() {
+        let mut e = editor_with("a.b.c.d");
+        // t. → one before first '.', col 0. But wait: cursor at 0, '.' at col 1.
+        // t goes one before = col 0 = current pos. No move.
+        // Let me use a different starting point.
+        // Actually from col 0, the first '.' is at col 1. t. target = col 0 = cursor. No move.
+        // Start from col 0: f. first.
+        feed(&mut e, &[press('f'), press('.')]); // col 1
+        assert_eq!(e.cursor.col(), 1);
+        // ; → next '.' at col 3.
+        feed(&mut e, &[press(';')]);
+        assert_eq!(e.cursor.col(), 3);
+    }
+
+    #[test]
+    fn semicolon_no_prior_find() {
+        let mut e = editor_with("hello world");
+        // ; with no prior find — no-op.
+        feed(&mut e, &[press(';')]);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    // ── ; and , with operators ──────────────────────────────────────────
+
+    #[test]
+    fn d_semicolon_delete_to_repeat() {
+        let mut e = editor_with("a.b.c.d");
+        // f. → col 1. Then d; deletes from col 1 to next '.' at col 3 (inclusive).
+        feed(&mut e, &[press('f'), press('.')]);
+        assert_eq!(e.cursor.col(), 1);
+        // d; → range [1, 4) → deletes ".b." → "ac.d"
+        feed(&mut e, &[press('d'), press(';')]);
+        assert_eq!(e.buffer.contents(), "ac.d");
+    }
+
+    // ── f/F/t/T in visual mode ──────────────────────────────────────────
+
+    #[test]
+    fn vf_extends_selection() {
+        let mut e = editor_with("hello world");
+        // v enters visual, fw extends selection to 'w'.
+        feed(&mut e, &[press('v'), press('f'), press('w')]);
+        assert_eq!(e.mode, Mode::Visual(VisualKind::Char));
+        assert_eq!(e.cursor.col(), 6);
+        assert_eq!(e.cursor.anchor(), Some(Position::ZERO));
+    }
+
+    // ── Dot-repeat with character find ───────────────────────────────────
+
+    #[test]
+    fn dot_repeat_df() {
+        let mut e = editor_with("a.b.c\nx.y.z");
+        // df. deletes "a." → "b.c\nx.y.z"
+        feed(&mut e, &[press('d'), press('f'), press('.')]);
+        assert_eq!(e.buffer.contents(), "b.c\nx.y.z");
+
+        // j goes to next line. . replays df. → deletes "x." → "b.c\ny.z"
+        feed(&mut e, &[press('j'), press('.')]);
+        assert_eq!(e.buffer.contents(), "b.c\ny.z");
+    }
+
+    #[test]
+    fn dot_repeat_cf() {
+        let mut e = editor_with("(old) (old)");
+        // cf) → change from '(' through ')'. Range [0, 5).
+        // Deletes "(old)", types "NEW".
+        feed(
+            &mut e,
+            &[
+                press('c'),
+                press('f'),
+                press(')'),
+                press('N'),
+                press('E'),
+                press('W'),
+                esc(),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "NEW (old)");
+
+        // Move to '(', . repeats cf) + "NEW" + Esc.
+        feed(&mut e, &[press('f'), press('('), press('.')]);
+        assert_eq!(e.buffer.contents(), "NEW NEW");
+    }
+
+    #[test]
+    fn f_escape_cancels() {
+        let mut e = editor_with("hello world");
+        // f then Escape — no movement, no pending state left.
+        feed(&mut e, &[press('f'), esc()]);
+        assert_eq!(e.cursor.col(), 0);
+        assert!(e.pending.is_none());
+    }
+
+    #[test]
+    fn df_escape_cancels() {
+        let mut e = editor_with("hello world");
+        // df then Escape — cancels operator and char find.
+        feed(&mut e, &[press('d'), press('f'), esc()]);
+        assert_eq!(e.cursor.col(), 0);
+        assert_eq!(e.buffer.contents(), "hello world");
     }
 }

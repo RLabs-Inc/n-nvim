@@ -316,6 +316,101 @@ impl Cursor {
         self.sticky_col = self.pos.col;
     }
 
+    // -- Character find motions ---------------------------------------------
+
+    /// Move forward to the `count`th occurrence of `ch` on the current line.
+    /// This is `f{ch}` in Vim. Returns `true` if the cursor moved.
+    /// Resets sticky column.
+    pub fn char_find_forward(
+        &mut self,
+        buf: &Buffer,
+        ch: char,
+        count: usize,
+        past_end: bool,
+    ) -> bool {
+        if let Some(col) = find_on_line_forward(buf, self.pos.line, self.pos.col, ch, count) {
+            let max = max_col_for_line(buf, self.pos.line, past_end);
+            self.pos.col = col.min(max);
+            self.sticky_col = self.pos.col;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move forward to just before the `count`th occurrence of `ch` on the
+    /// current line. This is `t{ch}` in Vim. Returns `true` if the cursor
+    /// moved to a new position.
+    /// Resets sticky column.
+    pub fn char_till_forward(
+        &mut self,
+        buf: &Buffer,
+        ch: char,
+        count: usize,
+        past_end: bool,
+    ) -> bool {
+        if let Some(col) = find_on_line_forward(buf, self.pos.line, self.pos.col, ch, count) {
+            // `t` lands one before the found character.
+            let target = col.saturating_sub(1);
+            if target > self.pos.col {
+                let max = max_col_for_line(buf, self.pos.line, past_end);
+                self.pos.col = target.min(max);
+                self.sticky_col = self.pos.col;
+                true
+            } else {
+                // Found char is immediately after cursor — nowhere to go.
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Move backward to the `count`th occurrence of `ch` on the current line.
+    /// This is `F{ch}` in Vim. Returns `true` if the cursor moved.
+    /// Resets sticky column.
+    pub fn char_find_backward(
+        &mut self,
+        buf: &Buffer,
+        ch: char,
+        count: usize,
+        _past_end: bool,
+    ) -> bool {
+        if let Some(col) = find_on_line_backward(buf, self.pos.line, self.pos.col, ch, count) {
+            self.pos.col = col;
+            self.sticky_col = self.pos.col;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move backward to just after the `count`th occurrence of `ch` on the
+    /// current line. This is `T{ch}` in Vim. Returns `true` if the cursor
+    /// moved to a new position.
+    /// Resets sticky column.
+    pub fn char_till_backward(
+        &mut self,
+        buf: &Buffer,
+        ch: char,
+        count: usize,
+        _past_end: bool,
+    ) -> bool {
+        if let Some(col) = find_on_line_backward(buf, self.pos.line, self.pos.col, ch, count) {
+            let target = col + 1;
+            if target < self.pos.col {
+                self.pos.col = target;
+                self.sticky_col = self.pos.col;
+                true
+            } else {
+                // Found char is immediately before cursor — nowhere to go.
+                false
+            }
+        } else {
+            false
+        }
+    }
+
     // -- Clamping -----------------------------------------------------------
 
     /// Ensure the cursor is within buffer bounds. Call this after the buffer
@@ -353,6 +448,51 @@ fn max_col_for_line(buf: &Buffer, line: usize, past_end: bool) -> usize {
         // Normal mode: cursor on a character. Empty line → 0.
         content_len.saturating_sub(1)
     }
+}
+
+/// Find the `count`th occurrence of `ch` forward from `from_col` (exclusive)
+/// on the given line. Returns the column of the match, or `None`.
+fn find_on_line_forward(
+    buf: &Buffer,
+    line: usize,
+    from_col: usize,
+    ch: char,
+    count: usize,
+) -> Option<usize> {
+    let rope_line = buf.line(line)?;
+    let content_len = buf.line_content_len(line).unwrap_or(0);
+    let mut found = 0;
+    for i in (from_col + 1)..content_len {
+        if rope_line.char(i) == ch {
+            found += 1;
+            if found == count {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Find the `count`th occurrence of `ch` backward from `from_col` (exclusive)
+/// on the given line. Returns the column of the match, or `None`.
+fn find_on_line_backward(
+    buf: &Buffer,
+    line: usize,
+    from_col: usize,
+    ch: char,
+    count: usize,
+) -> Option<usize> {
+    let rope_line = buf.line(line)?;
+    let mut found = 0;
+    for i in (0..from_col).rev() {
+        if rope_line.char(i) == ch {
+            found += 1;
+            if found == count {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 /// Clamp a position to valid buffer bounds.
@@ -1113,5 +1253,244 @@ mod tests {
 
         c.clamp(&buf, false);
         assert_eq!(c.col(), 4); // "hello" max normal = 4
+    }
+
+    // -- Character find helpers ---------------------------------------------
+
+    #[test]
+    fn find_forward_basic() {
+        let buf = Buffer::from_text("hello world");
+        assert_eq!(find_on_line_forward(&buf, 0, 0, 'o', 1), Some(4));
+    }
+
+    #[test]
+    fn find_forward_second_occurrence() {
+        let buf = Buffer::from_text("hello world");
+        assert_eq!(find_on_line_forward(&buf, 0, 0, 'o', 2), Some(7));
+    }
+
+    #[test]
+    fn find_forward_not_found() {
+        let buf = Buffer::from_text("hello world");
+        assert_eq!(find_on_line_forward(&buf, 0, 0, 'z', 1), None);
+    }
+
+    #[test]
+    fn find_forward_count_exceeds() {
+        let buf = Buffer::from_text("hello world");
+        // Only 2 'o's, asking for 3rd.
+        assert_eq!(find_on_line_forward(&buf, 0, 0, 'o', 3), None);
+    }
+
+    #[test]
+    fn find_forward_excludes_cursor() {
+        let buf = Buffer::from_text("ooo");
+        // Cursor on first 'o' (col 0), finds second 'o' at col 1.
+        assert_eq!(find_on_line_forward(&buf, 0, 0, 'o', 1), Some(1));
+    }
+
+    #[test]
+    fn find_forward_at_end_of_line() {
+        let buf = Buffer::from_text("abc");
+        // Cursor at col 2 ('c'), nothing after it.
+        assert_eq!(find_on_line_forward(&buf, 0, 2, 'a', 1), None);
+    }
+
+    #[test]
+    fn find_backward_basic() {
+        let buf = Buffer::from_text("hello world");
+        // From col 7 ('o' in "world"), find 'l' backward.
+        assert_eq!(find_on_line_backward(&buf, 0, 7, 'l', 1), Some(3));
+    }
+
+    #[test]
+    fn find_backward_second_occurrence() {
+        let buf = Buffer::from_text("hello world");
+        // From col 10 ('d'), find 'l' backward: first is col 9, second is col 3.
+        assert_eq!(find_on_line_backward(&buf, 0, 10, 'l', 2), Some(3));
+    }
+
+    #[test]
+    fn find_backward_not_found() {
+        let buf = Buffer::from_text("hello world");
+        assert_eq!(find_on_line_backward(&buf, 0, 5, 'z', 1), None);
+    }
+
+    #[test]
+    fn find_backward_excludes_cursor() {
+        let buf = Buffer::from_text("ooo");
+        // Cursor on last 'o' (col 2), finds 'o' at col 1.
+        assert_eq!(find_on_line_backward(&buf, 0, 2, 'o', 1), Some(1));
+    }
+
+    #[test]
+    fn find_backward_at_start() {
+        let buf = Buffer::from_text("abc");
+        // Cursor at col 0, nothing before it.
+        assert_eq!(find_on_line_backward(&buf, 0, 0, 'a', 1), None);
+    }
+
+    // -- char_find_forward --------------------------------------------------
+
+    #[test]
+    fn char_find_forward_basic() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::new();
+
+        assert!(c.char_find_forward(&buf, 'w', 1, false));
+        assert_eq!(c.col(), 6);
+        assert_eq!(c.sticky_col(), 6);
+    }
+
+    #[test]
+    fn char_find_forward_not_found() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::new();
+
+        assert!(!c.char_find_forward(&buf, 'z', 1, false));
+        assert_eq!(c.col(), 0); // didn't move
+    }
+
+    #[test]
+    fn char_find_forward_with_count() {
+        let buf = Buffer::from_text("abracadabra");
+        let mut c = Cursor::new();
+
+        assert!(c.char_find_forward(&buf, 'a', 3, false));
+        assert_eq!(c.col(), 7); // 3rd 'a' after col 0: cols 3, 5, 7
+    }
+
+    // -- char_find_backward -------------------------------------------------
+
+    #[test]
+    fn char_find_backward_basic() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::at(Position::new(0, 10));
+
+        assert!(c.char_find_backward(&buf, 'o', 1, false));
+        assert_eq!(c.col(), 7);
+    }
+
+    #[test]
+    fn char_find_backward_not_found() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::new();
+
+        assert!(!c.char_find_backward(&buf, 'z', 1, false));
+        assert_eq!(c.col(), 0);
+    }
+
+    #[test]
+    fn char_find_backward_with_count() {
+        let buf = Buffer::from_text("abracadabra");
+        let mut c = Cursor::at(Position::new(0, 10));
+
+        // From 'a' at col 10, find 2nd 'a' backward: col 7, then col 5.
+        assert!(c.char_find_backward(&buf, 'a', 2, false));
+        assert_eq!(c.col(), 5);
+    }
+
+    // -- char_till_forward --------------------------------------------------
+
+    #[test]
+    fn char_till_forward_basic() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::new();
+
+        // `to` → lands at col 3 (one before 'o' at col 4).
+        assert!(c.char_till_forward(&buf, 'o', 1, false));
+        assert_eq!(c.col(), 3);
+    }
+
+    #[test]
+    fn char_till_forward_adjacent_no_move() {
+        let buf = Buffer::from_text("ab");
+        let mut c = Cursor::new(); // col 0
+
+        // `tb` → 'b' is at col 1. Target = col 0 = cursor. No movement.
+        assert!(!c.char_till_forward(&buf, 'b', 1, false));
+        assert_eq!(c.col(), 0);
+    }
+
+    #[test]
+    fn char_till_forward_not_found() {
+        let buf = Buffer::from_text("hello");
+        let mut c = Cursor::new();
+
+        assert!(!c.char_till_forward(&buf, 'z', 1, false));
+        assert_eq!(c.col(), 0);
+    }
+
+    #[test]
+    fn char_till_forward_with_count() {
+        let buf = Buffer::from_text("aXbXcXd");
+        let mut c = Cursor::new(); // col 0
+
+        // `2tX` → 2nd 'X' is at col 3. Target = col 2 (one before).
+        assert!(c.char_till_forward(&buf, 'X', 2, false));
+        assert_eq!(c.col(), 2);
+    }
+
+    // -- char_till_backward -------------------------------------------------
+
+    #[test]
+    fn char_till_backward_basic() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::at(Position::new(0, 10));
+
+        // `To` → 'o' at col 7. Target = col 8 (one after).
+        assert!(c.char_till_backward(&buf, 'o', 1, false));
+        assert_eq!(c.col(), 8);
+    }
+
+    #[test]
+    fn char_till_backward_adjacent_no_move() {
+        let buf = Buffer::from_text("ba");
+        let mut c = Cursor::at(Position::new(0, 1)); // col 1
+
+        // `Tb` → 'b' at col 0. Target = col 1 = cursor. No movement.
+        assert!(!c.char_till_backward(&buf, 'b', 1, false));
+        assert_eq!(c.col(), 1);
+    }
+
+    #[test]
+    fn char_till_backward_not_found() {
+        let buf = Buffer::from_text("hello");
+        let mut c = Cursor::at(Position::new(0, 4));
+
+        assert!(!c.char_till_backward(&buf, 'z', 1, false));
+        assert_eq!(c.col(), 4);
+    }
+
+    #[test]
+    fn char_till_backward_with_count() {
+        let buf = Buffer::from_text("aXbXcXd");
+        let mut c = Cursor::at(Position::new(0, 6)); // col 6 ('d')
+
+        // `2TX` → 2nd 'X' back from col 6 is col 3. Target = col 4.
+        assert!(c.char_till_backward(&buf, 'X', 2, false));
+        assert_eq!(c.col(), 4);
+    }
+
+    // -- char find on multiline buffer (stays on current line) ---------------
+
+    #[test]
+    fn char_find_forward_stays_on_line() {
+        let buf = Buffer::from_text("abc\ndef");
+        let mut c = Cursor::new();
+
+        // 'd' is on line 1, not reachable from line 0.
+        assert!(!c.char_find_forward(&buf, 'd', 1, false));
+        assert_eq!(c.col(), 0);
+    }
+
+    #[test]
+    fn char_find_backward_stays_on_line() {
+        let buf = Buffer::from_text("abc\ndef");
+        let mut c = Cursor::at(Position::new(1, 2)); // 'f' on line 1
+
+        // 'a' is on line 0, not reachable from line 1.
+        assert!(!c.char_find_backward(&buf, 'a', 1, false));
+        assert_eq!(c.col(), 2);
     }
 }
