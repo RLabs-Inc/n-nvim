@@ -106,6 +106,8 @@ enum Pending {
         kind: CharFindKind,
         motion_count: usize,
     },
+    /// Replace char (`r`). Waiting for the replacement character.
+    Replace { count: usize },
 }
 
 // ─── Dot-repeat ─────────────────────────────────────────────────────────────
@@ -203,6 +205,11 @@ struct Editor {
     /// True during `.` replay — suppresses recording so replayed keys
     /// don't overwrite `last_change`.
     dot_replaying: bool,
+
+    /// Height of the text area (rows available for text, excluding status
+    /// and command lines) from the last paint. Used by `Ctrl+D`/`Ctrl+U`
+    /// to compute half-page scroll distance.
+    last_text_height: usize,
 }
 
 impl Editor {
@@ -230,6 +237,7 @@ impl Editor {
             dot_effective_count: None,
             last_change: None,
             dot_replaying: false,
+            last_text_height: 24, // Sensible default until first paint.
         }
     }
 
@@ -262,6 +270,7 @@ impl Editor {
             dot_effective_count: None,
             last_change: None,
             dot_replaying: false,
+            last_text_height: 24,
         }
     }
 
@@ -578,6 +587,18 @@ impl Editor {
                     self.mode = Mode::Visual(VisualKind::Block);
                     return Action::Continue;
                 }
+                KeyCode::Char('d') => {
+                    self.pending = None;
+                    let count = self.take_count();
+                    self.scroll_half_page_down(count);
+                    return Action::Continue;
+                }
+                KeyCode::Char('u') => {
+                    self.pending = None;
+                    let count = self.take_count();
+                    self.scroll_half_page_up(count);
+                    return Action::Continue;
+                }
                 _ => {}
             }
         }
@@ -810,6 +831,27 @@ impl Editor {
                 }
                 Action::Continue
             }
+            Pending::Replace { count } => {
+                // `r` + char: replace `count` characters under the cursor.
+                if key.code == KeyCode::Escape {
+                    self.dot_cancel();
+                    return Action::Continue;
+                }
+
+                // Record the replacement char for dot-repeat.
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_keys.push(*key);
+                }
+
+                if let KeyCode::Char(ch) = key.code {
+                    self.replace_chars(ch, count);
+                    self.dot_finish();
+                } else {
+                    self.dot_cancel();
+                }
+
+                Action::Continue
+            }
             Pending::OperatorCharFind {
                 op,
                 op_count,
@@ -932,6 +974,24 @@ impl Editor {
             KeyCode::Char('x') => {
                 self.dot_immediate(key, raw_count);
                 self.delete_chars_at_cursor(count);
+            }
+
+            // -- Join lines --
+            KeyCode::Char('J') => {
+                self.dot_immediate(key, raw_count);
+                self.join_lines(count);
+            }
+
+            // -- Toggle case --
+            KeyCode::Char('~') => {
+                self.dot_immediate(key, raw_count);
+                self.toggle_case(count);
+            }
+
+            // -- Replace char (enter pending, waiting for replacement) --
+            KeyCode::Char('r') => {
+                self.dot_start(key, raw_count);
+                self.pending = Some(Pending::Replace { count });
             }
 
             // -- Yank line shortcut (not a change) --
@@ -1588,7 +1648,7 @@ impl Editor {
 
         // Ctrl combinations cancel any accumulated count.
         if key.modifiers.contains(Modifiers::CTRL) {
-            self.count = None;
+            let count = self.take_count();
             match key.code {
                 KeyCode::Char('c') => return Action::Quit,
                 KeyCode::Char('v') => {
@@ -1599,6 +1659,14 @@ impl Editor {
                     } else {
                         self.mode = Mode::Visual(VisualKind::Block);
                     }
+                    return Action::Continue;
+                }
+                KeyCode::Char('d') => {
+                    self.scroll_half_page_down(count);
+                    return Action::Continue;
+                }
+                KeyCode::Char('u') => {
+                    self.scroll_half_page_up(count);
                     return Action::Continue;
                 }
                 _ => {}
@@ -2279,6 +2347,215 @@ impl Editor {
 
     // ── Edit commands ────────────────────────────────────────────────────
 
+    /// Scroll down by half a page (`Ctrl+D` in Vim).
+    ///
+    /// Moves both the viewport and the cursor down by `count * half_page`
+    /// lines. The cursor stays at the same relative position in the viewport.
+    fn scroll_half_page_down(&mut self, count: usize) {
+        let pe = self.mode.cursor_past_end();
+        let half = self.last_text_height.max(2) / 2;
+        let distance = half * count;
+        let last_line = self.buffer.line_count().saturating_sub(1);
+
+        // Move cursor down.
+        self.cursor.move_down(distance, &self.buffer, pe);
+
+        // Move viewport down by the same amount (clamped so we don't scroll
+        // past the last line).
+        let new_top = (self.view.top_line() + distance).min(last_line);
+        self.view.set_top_line(new_top);
+    }
+
+    /// Scroll up by half a page (`Ctrl+U` in Vim).
+    ///
+    /// Moves both the viewport and the cursor up by `count * half_page` lines.
+    fn scroll_half_page_up(&mut self, count: usize) {
+        let pe = self.mode.cursor_past_end();
+        let half = self.last_text_height.max(2) / 2;
+        let distance = half * count;
+
+        // Move cursor up.
+        self.cursor.move_up(distance, &self.buffer, pe);
+
+        // Move viewport up.
+        let new_top = self.view.top_line().saturating_sub(distance);
+        self.view.set_top_line(new_top);
+    }
+
+    /// Join `count` lines starting from the cursor line (`J` / `3J` in Vim).
+    ///
+    /// Each join removes the newline at the end of the current line, strips
+    /// leading whitespace from the next line, and inserts a single space
+    /// (unless the current line ends with a space or the next line is empty).
+    /// The cursor is placed at the join point (end of original line content).
+    ///
+    /// `3J` joins 3 lines into one (performs 2 joins).
+    fn join_lines(&mut self, count: usize) {
+        // J with count N joins N lines, which means N-1 join operations.
+        let joins = if count > 1 { count - 1 } else { 1 };
+
+        let line = self.cursor.line();
+        if line + 1 >= self.buffer.line_count() {
+            return; // Nothing below to join.
+        }
+
+        self.history.begin(self.cursor.position());
+
+        let mut join_col = 0; // Track where the last join happened.
+
+        for _ in 0..joins {
+            let cur_line = self.cursor.line();
+            if cur_line + 1 >= self.buffer.line_count() {
+                break; // No more lines below.
+            }
+
+            let cur_content_len = self.buffer.line_content_len(cur_line).unwrap_or(0);
+
+            // Check if current line ends with whitespace (skip adding space).
+            let ends_with_space = if cur_content_len > 0 {
+                let last_char_pos = Position::new(cur_line, cur_content_len - 1);
+                self.buffer
+                    .char_at(last_char_pos)
+                    .is_some_and(|c| c == ' ' || c == '\t')
+            } else {
+                false
+            };
+
+            // Count leading whitespace on the next line.
+            let next_line = cur_line + 1;
+            let next_leading = self.buffer.line(next_line).map_or(0, |line_text| {
+                line_text
+                    .chars()
+                    .take_while(|ch| (*ch == ' ' || *ch == '\t') && *ch != '\n')
+                    .count()
+            });
+
+            let next_content_len = self.buffer.line_content_len(next_line).unwrap_or(0);
+            let next_is_empty = next_content_len == 0 || next_content_len == next_leading;
+
+            // Delete from end of current line content through the leading
+            // whitespace of the next line (this removes the newline + whitespace).
+            let from = Position::new(cur_line, cur_content_len);
+            let to = Position::new(next_line, next_leading);
+            let range = Range::new(from, to);
+
+            let deleted = self
+                .buffer
+                .slice(range)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            self.history.record_delete(from, &deleted);
+            self.buffer.delete(range);
+
+            // Insert a space at the join point (unless current line ends
+            // with space, or next line was empty/all-whitespace).
+            if !ends_with_space && !next_is_empty && cur_content_len > 0 {
+                let insert_pos = Position::new(cur_line, cur_content_len);
+                self.history.record_insert(insert_pos, " ");
+                self.buffer.insert(insert_pos, " ");
+            }
+            join_col = cur_content_len;
+        }
+
+        // Place cursor at the join point.
+        let final_pos = Position::new(self.cursor.line(), join_col);
+        self.cursor.set_position(final_pos, &self.buffer, false);
+        self.history.commit(self.cursor.position());
+    }
+
+    /// Toggle case of `count` characters at the cursor (`~` / `3~` in Vim).
+    ///
+    /// Swaps uppercase ↔ lowercase for each character, advancing the cursor.
+    /// Does not cross line boundaries.
+    fn toggle_case(&mut self, count: usize) {
+        let pos = self.cursor.position();
+        let line_len = self.buffer.line_content_len(pos.line).unwrap_or(0);
+
+        if line_len == 0 || pos.col >= line_len {
+            return;
+        }
+
+        let end_col = (pos.col + count).min(line_len);
+        let range = Range::new(pos, Position::new(pos.line, end_col));
+
+        let old_text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // Toggle each character's case.
+        let new_text: String = old_text
+            .chars()
+            .map(|c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().next().unwrap_or(c)
+                } else if c.is_lowercase() {
+                    c.to_uppercase().next().unwrap_or(c)
+                } else {
+                    c
+                }
+            })
+            .collect();
+
+        if old_text == new_text && count <= 1 {
+            // Nothing changed but still advance cursor (Vim behavior).
+            let new_col = (pos.col + 1).min(line_len.saturating_sub(1));
+            self.cursor
+                .set_position(Position::new(pos.line, new_col), &self.buffer, false);
+            return;
+        }
+
+        self.history.begin(pos);
+        self.history.record_delete(pos, &old_text);
+        self.buffer.delete(range);
+        self.history.record_insert(pos, &new_text);
+        self.buffer.insert(pos, &new_text);
+
+        // Cursor advances past the toggled region (Vim lands on last char
+        // if at end of line, otherwise one past).
+        let new_col = end_col.min(line_len.saturating_sub(1));
+        self.cursor
+            .set_position(Position::new(pos.line, new_col), &self.buffer, false);
+        self.history.commit(self.cursor.position());
+    }
+
+    /// Replace `count` characters at the cursor with `ch` (`r` / `3ra` in Vim).
+    ///
+    /// Stays in normal mode. Does not cross line boundaries. If fewer than
+    /// `count` characters remain on the line, does nothing (Vim behavior).
+    fn replace_chars(&mut self, ch: char, count: usize) {
+        let pos = self.cursor.position();
+        let line_len = self.buffer.line_content_len(pos.line).unwrap_or(0);
+
+        // Vim: `r` requires exactly `count` characters available.
+        if line_len == 0 || pos.col + count > line_len {
+            return;
+        }
+
+        let end = Position::new(pos.line, pos.col + count);
+        let range = Range::new(pos, end);
+
+        let old_text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let new_text: String = std::iter::repeat_n(ch, count).collect();
+
+        self.history.begin(pos);
+        self.history.record_delete(pos, &old_text);
+        self.buffer.delete(range);
+        self.history.record_insert(pos, &new_text);
+        self.buffer.insert(pos, &new_text);
+        // Cursor lands on the last replaced character.
+        let final_col = pos.col + count - 1;
+        self.cursor
+            .set_position(Position::new(pos.line, final_col), &self.buffer, false);
+        self.history.commit(self.cursor.position());
+    }
+
     /// Delete `count` characters at the cursor (`x` / `3x` in Vim).
     ///
     /// Stores the deleted text in the unnamed register (Vim behavior:
@@ -2375,6 +2652,9 @@ impl App for Editor {
 
         // Give the View all rows except the bottom one (command/message line).
         let view_height = h - 1;
+        // Store text height for Ctrl+D/Ctrl+U (status line takes 1 row
+        // from view_height, so text rows = view_height - 1).
+        self.last_text_height = view_height.saturating_sub(1) as usize;
         self.cursor_screen = self.view.render(
             &self.buffer,
             &self.cursor,
@@ -2517,6 +2797,15 @@ mod tests {
         Event::Key(KeyEvent {
             code: KeyCode::Backspace,
             modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Press,
+        })
+    }
+
+    /// Create a Ctrl+key press event.
+    fn ctrl(ch: char) -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers: Modifiers::CTRL,
             kind: KeyEventKind::Press,
         })
     }
@@ -3301,5 +3590,326 @@ mod tests {
         feed(&mut e, &[press('d'), press('f'), esc()]);
         assert_eq!(e.cursor.col(), 0);
         assert_eq!(e.buffer.contents(), "hello world");
+    }
+
+    // ── r (replace char) ──────────────────────────────────────────────────
+
+    #[test]
+    fn r_replace_single_char() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('r'), press('X')]);
+        assert_eq!(e.buffer.contents(), "Xello");
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn r_replace_middle_of_line() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('l'), press('l'), press('r'), press('X')]);
+        assert_eq!(e.buffer.contents(), "heXlo");
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn r_with_count() {
+        let mut e = editor_with("abcdef");
+        feed(&mut e, &[press('3'), press('r'), press('X')]);
+        assert_eq!(e.buffer.contents(), "XXXdef");
+        // Cursor on last replaced char.
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn r_count_exceeds_line_does_nothing() {
+        let mut e = editor_with("ab");
+        feed(&mut e, &[press('5'), press('r'), press('X')]);
+        // Count 5 > line length 2: no replacement (Vim behavior).
+        assert_eq!(e.buffer.contents(), "ab");
+    }
+
+    #[test]
+    fn r_on_empty_line_does_nothing() {
+        let mut e = editor_with("");
+        feed(&mut e, &[press('r'), press('X')]);
+        assert_eq!(e.buffer.contents(), "");
+    }
+
+    #[test]
+    fn r_escape_cancels() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('r'), esc()]);
+        assert_eq!(e.buffer.contents(), "hello");
+        assert!(e.pending.is_none());
+    }
+
+    #[test]
+    fn r_undo_restores() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('r'), press('X'), press('u')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn r_dot_repeat() {
+        let mut e = editor_with("abcdef");
+        // ra replaces 'a' with 'a'... wait, let's use rX, move right, .
+        feed(
+            &mut e,
+            &[press('r'), press('X'), press('l'), press('.')],
+        );
+        // rX: "Xbcdef" cursor at 0. l: cursor at 1 ('b'). .: rX on 'b' → "XXcdef"
+        assert_eq!(e.buffer.contents(), "XXcdef");
+    }
+
+    #[test]
+    fn r_dot_repeat_with_count() {
+        let mut e = editor_with("abcdefgh");
+        // 3rX replaces 'abc' → "XXXdefgh", cursor at 2.
+        // l → cursor at 3 ('d'). . → repeats 3rX → "XXXXXXgh"
+        feed(
+            &mut e,
+            &[press('3'), press('r'), press('X'), press('l'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "XXXXXXgh");
+    }
+
+    #[test]
+    fn r_dot_repeat_count_override() {
+        let mut e = editor_with("abcdefgh");
+        // rX → "Xbcdefgh" at 0, l to 1. 3. → replaces 3 chars.
+        feed(
+            &mut e,
+            &[
+                press('r'),
+                press('X'),
+                press('l'),
+                press('3'),
+                press('.'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "XXXXefgh");
+    }
+
+    // ── J (join lines) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn j_join_basic() {
+        let mut e = editor_with("hello\nworld");
+        feed(&mut e, &[press('J')]);
+        assert_eq!(e.buffer.contents(), "hello world");
+        // Cursor at the join point (the space).
+        assert_eq!(e.cursor.col(), 5);
+    }
+
+    #[test]
+    fn j_join_strips_leading_whitespace() {
+        let mut e = editor_with("hello\n    world");
+        feed(&mut e, &[press('J')]);
+        assert_eq!(e.buffer.contents(), "hello world");
+    }
+
+    #[test]
+    fn j_join_with_count() {
+        let mut e = editor_with("one\ntwo\nthree");
+        // 3J joins 3 lines (2 join operations).
+        feed(&mut e, &[press('3'), press('J')]);
+        assert_eq!(e.buffer.contents(), "one two three");
+    }
+
+    #[test]
+    fn j_join_empty_next_line() {
+        let mut e = editor_with("hello\n\nworld");
+        // Joining with an empty line: no space inserted.
+        feed(&mut e, &[press('J')]);
+        assert_eq!(e.buffer.contents(), "hello\nworld");
+    }
+
+    #[test]
+    fn j_join_on_last_line_does_nothing() {
+        let mut e = editor_with("only line");
+        feed(&mut e, &[press('J')]);
+        assert_eq!(e.buffer.contents(), "only line");
+    }
+
+    #[test]
+    fn j_join_cursor_already_ends_with_space() {
+        let mut e = editor_with("hello \nworld");
+        feed(&mut e, &[press('J')]);
+        // Line already ends with space — don't add another.
+        assert_eq!(e.buffer.contents(), "hello world");
+    }
+
+    #[test]
+    fn j_join_undo() {
+        let mut e = editor_with("hello\nworld");
+        feed(&mut e, &[press('J'), press('u')]);
+        assert_eq!(e.buffer.contents(), "hello\nworld");
+    }
+
+    #[test]
+    fn j_dot_repeat() {
+        let mut e = editor_with("a\nb\nc\nd");
+        // J joins "a\nb" → "a b", . joins "a b\nc" → "a b c"
+        feed(&mut e, &[press('J'), press('.')]);
+        assert_eq!(e.buffer.contents(), "a b c\nd");
+    }
+
+    #[test]
+    fn j_join_empty_current_line() {
+        let mut e = editor_with("\nhello");
+        // Current line is empty, next line has content.
+        // No space should be inserted (current line has 0 content).
+        feed(&mut e, &[press('J')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    // ── ~ (toggle case) ────────────────────────────────────────────────────
+
+    #[test]
+    fn tilde_lowercase_to_upper() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('~')]);
+        assert_eq!(e.buffer.contents(), "Hello");
+        // Cursor advances to next char.
+        assert_eq!(e.cursor.col(), 1);
+    }
+
+    #[test]
+    fn tilde_uppercase_to_lower() {
+        let mut e = editor_with("HELLO");
+        feed(&mut e, &[press('~')]);
+        assert_eq!(e.buffer.contents(), "hELLO");
+        assert_eq!(e.cursor.col(), 1);
+    }
+
+    #[test]
+    fn tilde_with_count() {
+        let mut e = editor_with("heLLo");
+        feed(&mut e, &[press('5'), press('~')]);
+        assert_eq!(e.buffer.contents(), "HEllO");
+        // Cursor on last char (col 4, line has 5 chars).
+        assert_eq!(e.cursor.col(), 4);
+    }
+
+    #[test]
+    fn tilde_non_alpha_advances() {
+        let mut e = editor_with("123ab");
+        feed(&mut e, &[press('~')]);
+        // '1' has no case — cursor still advances.
+        assert_eq!(e.buffer.contents(), "123ab");
+        assert_eq!(e.cursor.col(), 1);
+    }
+
+    #[test]
+    fn tilde_at_end_of_line() {
+        let mut e = editor_with("aBc");
+        // Move to last char, toggle.
+        feed(&mut e, &[press('$'), press('~')]);
+        assert_eq!(e.buffer.contents(), "aBC");
+        // Cursor stays on last char (can't advance further).
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn tilde_on_empty_line() {
+        let mut e = editor_with("");
+        feed(&mut e, &[press('~')]);
+        assert_eq!(e.buffer.contents(), "");
+    }
+
+    #[test]
+    fn tilde_undo() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('3'), press('~'), press('u')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn tilde_dot_repeat() {
+        let mut e = editor_with("abcdef");
+        // ~ toggles 'a' → 'A', cursor at 1. . toggles 'b' → 'B', cursor at 2.
+        feed(&mut e, &[press('~'), press('.')]);
+        assert_eq!(e.buffer.contents(), "ABcdef");
+    }
+
+    #[test]
+    fn tilde_dot_repeat_with_count() {
+        let mut e = editor_with("abcdefgh");
+        // 3~ toggles "abc" → "ABC", cursor at 3. . repeats 3~ on "def" → "DEF"
+        feed(&mut e, &[press('3'), press('~'), press('.')]);
+        assert_eq!(e.buffer.contents(), "ABCDEFgh");
+    }
+
+    #[test]
+    fn tilde_count_clamps_to_line_end() {
+        let mut e = editor_with("ab");
+        // 10~ on a 2-char line: toggles both, cursor on last char.
+        feed(&mut e, &[press('1'), press('0'), press('~')]);
+        assert_eq!(e.buffer.contents(), "AB");
+        assert_eq!(e.cursor.col(), 1);
+    }
+
+    // ── Ctrl+D / Ctrl+U (half-page scroll) ──────────────────────────────
+
+    #[test]
+    fn ctrl_d_moves_cursor_down() {
+        let mut e = editor_with(
+            &(0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        );
+        // Default last_text_height is 24, half = 12.
+        feed(&mut e, &[ctrl('d')]);
+        assert_eq!(e.cursor.line(), 12);
+    }
+
+    #[test]
+    fn ctrl_u_moves_cursor_up() {
+        let mut e = editor_with(
+            &(0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        );
+        // Move to line 30 first.
+        feed(&mut e, &[press('3'), press('0'), press('j')]);
+        assert_eq!(e.cursor.line(), 30);
+        feed(&mut e, &[ctrl('u')]);
+        assert_eq!(e.cursor.line(), 18); // 30 - 12 = 18
+    }
+
+    #[test]
+    fn ctrl_d_clamps_at_end() {
+        let mut e = editor_with("a\nb\nc\nd\ne");
+        feed(&mut e, &[ctrl('d')]);
+        // Only 5 lines. Cursor clamped to last line.
+        assert_eq!(e.cursor.line(), 4);
+    }
+
+    #[test]
+    fn ctrl_u_clamps_at_top() {
+        let mut e = editor_with(
+            &(0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        );
+        // Already at top — stays at line 0.
+        feed(&mut e, &[ctrl('u')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn ctrl_d_with_count() {
+        let mut e = editor_with(
+            &(0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        );
+        // 3 Ctrl+D = 3 * 12 = 36 lines down.
+        feed(&mut e, &[press('3'), ctrl('d')]);
+        assert_eq!(e.cursor.line(), 36);
+    }
+
+    #[test]
+    fn ctrl_d_in_visual_mode() {
+        let mut e = editor_with(
+            &(0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n"),
+        );
+        // Enter visual, Ctrl+D — selection extends.
+        feed(&mut e, &[press('v'), ctrl('d')]);
+        assert_eq!(e.cursor.line(), 12);
+        assert!(e.cursor.has_selection());
+        assert_eq!(e.cursor.anchor().unwrap().line, 0);
     }
 }
