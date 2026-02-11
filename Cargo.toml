@@ -34,3 +34,4 @@ workspace = true
 [dependencies]
 n-term = { path = "crates/n-term" }
 n-editor = { path = "crates/n-editor" }
+regex = "1.12.3"

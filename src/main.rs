@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use n_editor::buffer::Buffer;
-use n_editor::command::{Command, CommandLine, CommandResult};
+use n_editor::command::{CmdRange, Command, CommandLine, CommandResult, SubFlags};
 use n_editor::cursor::Cursor;
 use n_editor::history::History;
 use n_editor::mode::{Mode, VisualKind};
@@ -43,6 +43,8 @@ use n_term::buffer::FrameBuffer;
 use n_term::event_loop::{Action, App, EventLoop};
 use n_term::input::{Event, KeyCode, KeyEvent, Modifiers};
 use n_term::terminal::Size;
+
+use regex::Regex;
 
 // ─── Character find direction ───────────────────────────────────────────────
 
@@ -252,6 +254,13 @@ struct Editor {
 
     /// Recursion depth during macro replay, to prevent infinite `@a` → `@a`.
     macro_depth: usize,
+
+    /// Last substitution for `:s` repeat and `&`. Stores (pattern, replacement, flags).
+    last_sub: Option<(String, String, SubFlags)>,
+
+    /// Last visual selection line range (0-indexed, inclusive) for `'<,'>`.
+    /// Stored when leaving visual mode.
+    last_visual_lines: Option<(usize, usize)>,
 }
 
 impl Editor {
@@ -287,6 +296,8 @@ impl Editor {
             macro_replaying: false,
             last_macro: None,
             macro_depth: 0,
+            last_sub: None,
+            last_visual_lines: None,
         }
     }
 
@@ -327,6 +338,8 @@ impl Editor {
             macro_replaying: false,
             last_macro: None,
             macro_depth: 0,
+            last_sub: None,
+            last_visual_lines: None,
         }
     }
 
@@ -1278,6 +1291,16 @@ impl Editor {
                 self.paste_before(count);
             }
 
+            // -- Repeat last substitution --
+            KeyCode::Char('&') => {
+                let result = self.cmd_sub_repeat(&CmdRange::CurrentLine);
+                match result {
+                    CommandResult::Ok(Some(msg)) => self.set_message(msg),
+                    CommandResult::Ok(None) | CommandResult::Quit => {}
+                    CommandResult::Err(msg) => self.set_error(msg),
+                }
+            }
+
             // -- Dot-repeat --
             KeyCode::Char('.') => {
                 return self.dot_replay(raw_count);
@@ -1881,6 +1904,10 @@ impl Editor {
             Command::ForceQuit => CommandResult::Quit,
             Command::WriteQuit => self.cmd_write_quit(),
             Command::ExitSave => self.cmd_exit_save(),
+            Command::Substitute { range, pattern, replacement, flags } => {
+                self.cmd_substitute(&range, &pattern, &replacement, flags)
+            }
+            Command::SubRepeat { range } => self.cmd_sub_repeat(&range),
             Command::Unknown(input) => {
                 if input.is_empty() {
                     CommandResult::Ok(None)
@@ -1952,6 +1979,198 @@ impl Editor {
         } else {
             CommandResult::Quit
         }
+    }
+
+    // ── Substitution ────────────────────────────────────────────────────
+
+    /// `:[range]s/pattern/replacement/flags` — find and replace.
+    fn cmd_substitute(
+        &mut self,
+        range: &CmdRange,
+        pattern: &str,
+        replacement: &str,
+        flags: SubFlags,
+    ) -> CommandResult {
+        if pattern.is_empty() {
+            return CommandResult::Err("E486: Pattern is empty".to_string());
+        }
+
+        // Store for `:s` repeat and `&`.
+        self.last_sub = Some((pattern.to_string(), replacement.to_string(), flags));
+
+        self.execute_substitute(range, pattern, replacement, flags)
+    }
+
+    /// `:s` (no args) — repeat last substitution.
+    fn cmd_sub_repeat(&mut self, range: &CmdRange) -> CommandResult {
+        let Some((pattern, replacement, flags)) = self.last_sub.clone() else {
+            return CommandResult::Err("E33: No previous substitute regular expression".to_string());
+        };
+        self.execute_substitute(range, &pattern, &replacement, flags)
+    }
+
+    /// Core substitution engine shared by `:s/pat/rep/flags` and `:s` repeat.
+    fn execute_substitute(
+        &mut self,
+        range: &CmdRange,
+        pattern: &str,
+        replacement: &str,
+        flags: SubFlags,
+    ) -> CommandResult {
+        // Resolve the line range.
+        let (first, last) = match self.resolve_range(range) {
+            Ok(r) => r,
+            Err(msg) => return CommandResult::Err(msg),
+        };
+
+        // Clamp to buffer.
+        let line_count = self.buffer.line_count();
+        if line_count == 0 {
+            return CommandResult::Err("E486: Pattern not found: ".to_string() + pattern);
+        }
+        let last = last.min(line_count - 1);
+        if first > last {
+            return CommandResult::Err("E486: Pattern not found: ".to_string() + pattern);
+        }
+
+        // Compile the regex.
+        let regex_pattern = if flags.case_insensitive {
+            format!("(?i){pattern}")
+        } else {
+            pattern.to_string()
+        };
+        let re = match Regex::new(&regex_pattern) {
+            Ok(r) => r,
+            Err(e) => return CommandResult::Err(format!("E486: Invalid pattern: {e}")),
+        };
+
+        // Translate Vim-style replacement to regex-crate syntax.
+        let rep = translate_replacement(replacement);
+
+        // Perform the substitution.
+        let mut total_subs: usize = 0;
+        let mut total_lines: usize = 0;
+
+        if flags.count_only {
+            // `n` flag: count matches without replacing.
+            for line_idx in first..=last {
+                let content = self.line_content(line_idx);
+                let count = if flags.global {
+                    re.find_iter(&content).count()
+                } else {
+                    usize::from(re.is_match(&content))
+                };
+                if count > 0 {
+                    total_subs += count;
+                    total_lines += 1;
+                }
+            }
+
+            return if total_subs > 0 {
+                CommandResult::Ok(Some(format!(
+                    "{total_subs} match{} on {total_lines} line{}",
+                    if total_subs == 1 { "" } else { "es" },
+                    if total_lines == 1 { "" } else { "s" },
+                )))
+            } else {
+                CommandResult::Err("E486: Pattern not found: ".to_string() + pattern)
+            };
+        }
+
+        // Replacing: iterate backwards so line positions stay valid.
+        self.history.begin(self.cursor.position());
+
+        for line_idx in (first..=last).rev() {
+            let content = self.line_content(line_idx);
+            let new_content = if flags.global {
+                re.replace_all(&content, rep.as_str()).into_owned()
+            } else {
+                re.replace(&content, rep.as_str()).into_owned()
+            };
+
+            if new_content != content {
+                let count = if flags.global {
+                    re.find_iter(&content).count()
+                } else {
+                    1
+                };
+                total_subs += count;
+                total_lines += 1;
+
+                // Replace the line content in the buffer.
+                let content_len = self.buffer.line_content_len(line_idx).unwrap_or(0);
+                let start = Position::new(line_idx, 0);
+                let end = Position::new(line_idx, content_len);
+                let range = Range::new(start, end);
+
+                self.history.record_delete(start, &content);
+                self.buffer.delete(range);
+                self.history.record_insert(start, &new_content);
+                self.buffer.insert(start, &new_content);
+            }
+        }
+
+        // Place cursor on the first line of the range (Vim behavior).
+        if total_subs > 0 {
+            self.cursor
+                .set_position(Position::new(first, 0), &self.buffer, false);
+            self.cursor.move_to_first_non_blank(&self.buffer, false);
+        }
+
+        self.history.commit(self.cursor.position());
+
+        if total_subs > 0 {
+            if total_lines > 1 || total_subs > 1 {
+                CommandResult::Ok(Some(format!(
+                    "{total_subs} substitution{} on {total_lines} line{}",
+                    if total_subs == 1 { "" } else { "s" },
+                    if total_lines == 1 { "" } else { "s" },
+                )))
+            } else {
+                CommandResult::Ok(None)
+            }
+        } else {
+            // No history to commit if nothing changed.
+            CommandResult::Err("E486: Pattern not found: ".to_string() + pattern)
+        }
+    }
+
+    /// Resolve a [`CmdRange`] to an inclusive line range `(first, last)`.
+    fn resolve_range(&self, range: &CmdRange) -> Result<(usize, usize), String> {
+        match range {
+            CmdRange::CurrentLine => {
+                let line = self.cursor.position().line;
+                Ok((line, line))
+            }
+            CmdRange::All => {
+                let last = self.buffer.line_count().saturating_sub(1);
+                Ok((0, last))
+            }
+            CmdRange::Lines(start, end) => {
+                if *start > *end {
+                    return Err("E493: Backwards range given".to_string());
+                }
+                Ok((*start, *end))
+            }
+            CmdRange::Visual => {
+                if let Some((start, end)) = self.last_visual_lines {
+                    Ok((start, end))
+                } else {
+                    Err("E20: Mark not set".to_string())
+                }
+            }
+        }
+    }
+
+    /// Get the content of a line (without trailing newline) as a `String`.
+    fn line_content(&self, line_idx: usize) -> String {
+        self.buffer
+            .line(line_idx)
+            .map(|rope_slice| {
+                let s: String = rope_slice.chars().collect();
+                s.trim_end_matches(['\n', '\r']).to_string()
+            })
+            .unwrap_or_default()
     }
 
     // ── Visual mode ────────────────────────────────────────────────────
@@ -2112,6 +2331,18 @@ impl Editor {
             KeyCode::Char('y') => self.visual_yank(),
             KeyCode::Char('c') => self.visual_change(),
 
+            // -- Enter command mode (prefill with '<,'>) --
+            KeyCode::Char(':') => {
+                self.save_visual_lines();
+                self.cursor.clear_anchor();
+                self.mode = Mode::Command;
+                self.cmdline.clear();
+                // Prefill with the visual range markers (like Vim).
+                for ch in "'<,'>".chars() {
+                    self.cmdline.insert_char(ch);
+                }
+            }
+
             // -- Indent / outdent --
             KeyCode::Char('>') => self.visual_indent(),
             KeyCode::Char('<') => self.visual_outdent(),
@@ -2141,6 +2372,13 @@ impl Editor {
     }
 
     // ── Visual selection ranges ──────────────────────────────────────────
+
+    /// Save the current visual selection's line range for `'<,'>`.
+    fn save_visual_lines(&mut self) {
+        if let Some(range) = self.cursor.selection() {
+            self.last_visual_lines = Some((range.start.line, range.end.line));
+        }
+    }
 
     /// Compute the effective char-wise selection range.
     ///
@@ -3227,6 +3465,68 @@ impl Editor {
 /// Supports `()`, `[]`, `{}`. Handles nesting by tracking depth. Scans
 /// forward for open brackets, backward for close brackets. Returns `None`
 /// if the character at `pos` is not a bracket or no match is found.
+/// Translate a Vim-style replacement string to `regex` crate syntax.
+///
+/// Vim uses `&` for the whole match and `\1`-`\9` for capture groups.
+/// The `regex` crate uses `$0` and `$1`-`$9`. We also handle:
+///
+/// - `\&` → literal `&`
+/// - `\\` → literal `\`
+/// - `\n` → newline
+fn translate_replacement(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some(&next @ '1'..='9') => {
+                    // `\1`-`\9` → `$1`-`$9` (capture group).
+                    result.push('$');
+                    result.push(next);
+                    chars.next();
+                }
+                Some(&'0') => {
+                    // `\0` → `$0` (whole match).
+                    result.push('$');
+                    result.push('0');
+                    chars.next();
+                }
+                Some(&'&') => {
+                    // `\&` → literal `&`.
+                    result.push('&');
+                    chars.next();
+                }
+                Some(&'\\') => {
+                    // `\\` → literal `\`.
+                    result.push('\\');
+                    chars.next();
+                }
+                Some(&'n') => {
+                    // `\n` → newline.
+                    result.push('\n');
+                    chars.next();
+                }
+                _ => {
+                    // Pass through other `\X` sequences.
+                    result.push('\\');
+                }
+            }
+        } else if ch == '&' {
+            // `&` → `$0` (whole match).
+            result.push_str("$0");
+        } else if ch == '$' {
+            // Escape literal `$` to prevent the regex crate from
+            // interpreting it as a capture group reference.
+            result.push_str("$$");
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 fn find_matching_bracket(buf: &Buffer, pos: Position) -> Option<Position> {
     let ch = buf.char_at(pos)?;
 
@@ -5601,5 +5901,312 @@ mod tests {
         // Replay: should delete 'c' and 'd'.
         feed(&mut e, &[press('@'), press('a')]);
         assert_eq!(e.buffer.contents(), "ef");
+    }
+
+    // ── Substitution (:s) ─────────────────────────────────────────────────
+
+    /// Feed a command string (e.g., "s/foo/bar/g") to the editor.
+    /// Types `:`, then the command, then Enter.
+    fn cmd(editor: &mut Editor, input: &str) {
+        let mut events = vec![press(':')];
+        for ch in input.chars() {
+            events.push(press(ch));
+        }
+        events.push(enter());
+        feed(editor, &events);
+    }
+
+    #[test]
+    fn sub_basic_current_line() {
+        let mut e = editor_with("foo bar foo");
+        cmd(&mut e, "s/foo/baz/");
+        assert_eq!(e.buffer.contents(), "baz bar foo");
+    }
+
+    #[test]
+    fn sub_global_flag() {
+        let mut e = editor_with("foo bar foo");
+        cmd(&mut e, "s/foo/baz/g");
+        assert_eq!(e.buffer.contents(), "baz bar baz");
+    }
+
+    #[test]
+    fn sub_percent_all_lines() {
+        let mut e = editor_with("foo\nfoo\nbar");
+        cmd(&mut e, "%s/foo/baz/");
+        assert_eq!(e.buffer.contents(), "baz\nbaz\nbar");
+    }
+
+    #[test]
+    fn sub_percent_global() {
+        let mut e = editor_with("foo foo\nbar foo\nbaz");
+        cmd(&mut e, "%s/foo/x/g");
+        assert_eq!(e.buffer.contents(), "x x\nbar x\nbaz");
+    }
+
+    #[test]
+    fn sub_line_range() {
+        let mut e = editor_with("foo\nfoo\nfoo\nfoo");
+        cmd(&mut e, "2,3s/foo/bar/");
+        assert_eq!(e.buffer.contents(), "foo\nbar\nbar\nfoo");
+    }
+
+    #[test]
+    fn sub_delete_pattern() {
+        // Empty replacement deletes the match.
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "s/world//");
+        assert_eq!(e.buffer.contents(), "hello ");
+    }
+
+    #[test]
+    fn sub_case_insensitive() {
+        let mut e = editor_with("Hello hello HELLO");
+        cmd(&mut e, "s/hello/x/gi");
+        assert_eq!(e.buffer.contents(), "x x x");
+    }
+
+    #[test]
+    fn sub_count_only() {
+        let mut e = editor_with("foo foo foo");
+        cmd(&mut e, "s/foo/bar/gn");
+        // `n` flag means don't actually replace.
+        assert_eq!(e.buffer.contents(), "foo foo foo");
+        // Should show count message.
+        assert!(e.message.is_some());
+        assert!(e.message.as_deref().unwrap().contains("3 matches"));
+    }
+
+    #[test]
+    fn sub_regex_pattern() {
+        let mut e = editor_with("foo123bar456");
+        cmd(&mut e, r"s/[0-9]+/NUM/g");
+        assert_eq!(e.buffer.contents(), "fooNUMbarNUM");
+    }
+
+    #[test]
+    fn sub_capture_groups() {
+        let mut e = editor_with("hello world");
+        cmd(&mut e, r"s/(\w+) (\w+)/\2 \1/");
+        assert_eq!(e.buffer.contents(), "world hello");
+    }
+
+    #[test]
+    fn sub_ampersand_whole_match() {
+        let mut e = editor_with("foo bar");
+        cmd(&mut e, "s/foo/[&]/");
+        assert_eq!(e.buffer.contents(), "[foo] bar");
+    }
+
+    #[test]
+    fn sub_alternate_delimiter() {
+        let mut e = editor_with("path/to/file");
+        cmd(&mut e, "s#path/to#new/dir#");
+        assert_eq!(e.buffer.contents(), "new/dir/file");
+    }
+
+    #[test]
+    fn sub_undo() {
+        let mut e = editor_with("foo bar foo");
+        cmd(&mut e, "%s/foo/baz/g");
+        assert_eq!(e.buffer.contents(), "baz bar baz");
+        // Undo should restore everything in one step.
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "foo bar foo");
+    }
+
+    #[test]
+    fn sub_undo_multi_line() {
+        let mut e = editor_with("aaa\nbbb\naaa");
+        cmd(&mut e, "%s/aaa/xxx/");
+        assert_eq!(e.buffer.contents(), "xxx\nbbb\nxxx");
+        // One undo reverses all substitutions.
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\naaa");
+    }
+
+    #[test]
+    fn sub_no_match_error() {
+        let mut e = editor_with("hello world");
+        cmd(&mut e, "s/xyz/abc/");
+        // Should show error.
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("E486"));
+    }
+
+    #[test]
+    fn sub_empty_pattern_error() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "s//bar/");
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("E486"));
+    }
+
+    #[test]
+    fn sub_repeat_with_s() {
+        let mut e = editor_with("foo\nfoo");
+        cmd(&mut e, "s/foo/bar/");
+        assert_eq!(e.buffer.contents(), "bar\nfoo");
+        // Move to next line and repeat.
+        feed(&mut e, &[press('j')]);
+        cmd(&mut e, "s");
+        assert_eq!(e.buffer.contents(), "bar\nbar");
+    }
+
+    #[test]
+    fn sub_repeat_no_previous_error() {
+        let mut e = editor_with("foo");
+        cmd(&mut e, "s");
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("E33"));
+    }
+
+    #[test]
+    fn sub_ampersand_normal_mode() {
+        let mut e = editor_with("foo bar\nfoo baz");
+        cmd(&mut e, "s/foo/x/");
+        assert_eq!(e.buffer.contents(), "x bar\nfoo baz");
+        // Move to line 2 and press &.
+        feed(&mut e, &[press('j'), press('&')]);
+        assert_eq!(e.buffer.contents(), "x bar\nx baz");
+    }
+
+    #[test]
+    fn sub_ampersand_no_previous_error() {
+        let mut e = editor_with("foo");
+        feed(&mut e, &[press('&')]);
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("E33"));
+    }
+
+    #[test]
+    fn sub_message_multi_line() {
+        let mut e = editor_with("foo\nfoo\nfoo");
+        cmd(&mut e, "%s/foo/bar/");
+        assert!(e.message.is_some());
+        let msg = e.message.as_deref().unwrap();
+        assert!(msg.contains("3 substitutions"));
+        assert!(msg.contains("3 lines"));
+    }
+
+    #[test]
+    fn sub_message_single_sub_no_message() {
+        // Single substitution on a single line shows no message (like Vim).
+        let mut e = editor_with("foo bar");
+        cmd(&mut e, "s/foo/baz/");
+        assert!(e.message.is_none());
+    }
+
+    #[test]
+    fn sub_visual_range() {
+        // Enter visual mode, select lines 2-3, then :s.
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        // Go to line 2, enter visual line, go down.
+        feed(&mut e, &[press('j')]);
+        feed(&mut e, &[press('V'), press('j')]);
+        // Press : — should auto-insert '<,'>
+        // Then type s/b/x/g and Enter.
+        let mut events = vec![press(':')];
+        for ch in "s/b/x/g".chars() {
+            events.push(press(ch));
+        }
+        events.push(enter());
+        feed(&mut e, &events);
+        // Lines 2-3 should be affected.
+        assert_eq!(e.buffer.contents(), "aaa\nxxx\nccc\nddd");
+    }
+
+    #[test]
+    fn sub_cursor_position_after() {
+        // Cursor should be at first non-blank of first substituted line.
+        let mut e = editor_with("  foo\n  foo\n  bar");
+        cmd(&mut e, "%s/foo/baz/");
+        assert_eq!(e.cursor.position().line, 0);
+        assert_eq!(e.cursor.position().col, 2); // First non-blank.
+    }
+
+    #[test]
+    fn sub_literal_dollar_in_replacement() {
+        // `$` in replacement should be literal, not a capture reference.
+        let mut e = editor_with("price: 100");
+        cmd(&mut e, "s/100/$200/");
+        assert_eq!(e.buffer.contents(), "price: $200");
+    }
+
+    #[test]
+    fn sub_backslash_n_in_replacement() {
+        // `\n` in replacement should insert a newline.
+        let mut e = editor_with("hello world");
+        cmd(&mut e, r"s/ /\n/");
+        assert_eq!(e.buffer.contents(), "hello\nworld");
+    }
+
+    #[test]
+    fn sub_escaped_ampersand_in_replacement() {
+        // `\&` should be a literal `&`.
+        let mut e = editor_with("foo bar");
+        cmd(&mut e, r"s/foo/a\&b/");
+        assert_eq!(e.buffer.contents(), "a&b bar");
+    }
+
+    #[test]
+    fn sub_backwards_range_error() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        cmd(&mut e, "3,1s/a/b/");
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("E493"));
+    }
+
+    #[test]
+    fn sub_invalid_regex_error() {
+        let mut e = editor_with("hello");
+        cmd(&mut e, "s/[unclosed/bar/");
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("E486"));
+    }
+
+    #[test]
+    fn sub_percent_repeat_with_range() {
+        // `:s/a/b/` then `:%s` should repeat on all lines.
+        let mut e = editor_with("aaa\naaa\naaa");
+        cmd(&mut e, "s/aaa/bbb/");
+        assert_eq!(e.buffer.contents(), "bbb\naaa\naaa");
+        cmd(&mut e, "%s");
+        assert_eq!(e.buffer.contents(), "bbb\nbbb\nbbb");
+    }
+
+    #[test]
+    fn translate_replacement_ampersand() {
+        assert_eq!(translate_replacement("&"), "$0");
+    }
+
+    #[test]
+    fn translate_replacement_capture_groups() {
+        assert_eq!(translate_replacement(r"\1 and \2"), "$1 and $2");
+    }
+
+    #[test]
+    fn translate_replacement_escaped_ampersand() {
+        assert_eq!(translate_replacement(r"\&"), "&");
+    }
+
+    #[test]
+    fn translate_replacement_escaped_backslash() {
+        assert_eq!(translate_replacement(r"\\"), "\\");
+    }
+
+    #[test]
+    fn translate_replacement_newline() {
+        assert_eq!(translate_replacement(r"\n"), "\n");
+    }
+
+    #[test]
+    fn translate_replacement_literal_dollar() {
+        assert_eq!(translate_replacement("$100"), "$$100");
+    }
+
+    #[test]
+    fn translate_replacement_mixed() {
+        assert_eq!(translate_replacement(r"[\1] & $"), "[$1] $0 $$");
     }
 }
