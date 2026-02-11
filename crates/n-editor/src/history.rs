@@ -162,14 +162,22 @@ impl History {
     ///
     /// Empty transactions (no edits recorded) are silently discarded.
     /// New transactions clear the redo stack.
-    pub fn commit(&mut self, cursor: Position) {
+    ///
+    /// Returns `Some(cursor_before)` if a non-empty transaction was
+    /// committed — the position where the change started (for the change
+    /// list). Returns `None` if the transaction was empty or missing.
+    pub fn commit(&mut self, cursor: Position) -> Option<Position> {
         if let Some(mut txn) = self.pending.take() {
             if txn.edits.is_empty() {
-                return;
+                return None;
             }
+            let change_pos = txn.cursor_before;
             txn.cursor_after = cursor;
             self.redo_stack.clear();
             self.undo_stack.push(txn);
+            Some(change_pos)
+        } else {
+            None
         }
     }
 

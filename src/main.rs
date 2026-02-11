@@ -31,6 +31,7 @@ use n_editor::buffer::Buffer;
 use n_editor::command::{CmdRange, Command, CommandLine, CommandResult, SubFlags};
 use n_editor::cursor::Cursor;
 use n_editor::history::History;
+use n_editor::jumplist::{ChangeList, JumpList};
 use n_editor::mode::{Mode, VisualKind};
 use n_editor::position::{Position, Range};
 use n_editor::register::{RegisterFile, RegisterKind};
@@ -124,6 +125,14 @@ enum Pending {
     MacroRecord,
     /// Macro play (`@`). Waiting for the register letter or `@` for repeat.
     MacroPlay { count: usize },
+    /// `g` prefix. Waiting for second key: `g` (gg), `;` (changelist back),
+    /// `,` (changelist forward).
+    GPrefix { count: Option<usize> },
+    /// `g` prefix after an operator (`dg`). Waiting for `g` to form `dgg`.
+    OperatorGPrefix {
+        op: char,
+        raw_motion_count: Option<usize>,
+    },
 }
 
 // ─── Dot-repeat ─────────────────────────────────────────────────────────────
@@ -261,6 +270,12 @@ struct Editor {
     /// Last visual selection line range (0-indexed, inclusive) for `'<,'>`.
     /// Stored when leaving visual mode.
     last_visual_lines: Option<(usize, usize)>,
+
+    /// Jump list — position history for `Ctrl+O` / `Ctrl+I` navigation.
+    jump_list: JumpList,
+
+    /// Change list — positions where edits occurred, for `g;` / `g,`.
+    change_list: ChangeList,
 }
 
 impl Editor {
@@ -298,6 +313,8 @@ impl Editor {
             macro_depth: 0,
             last_sub: None,
             last_visual_lines: None,
+            jump_list: JumpList::new(),
+            change_list: ChangeList::new(),
         }
     }
 
@@ -340,6 +357,8 @@ impl Editor {
             macro_depth: 0,
             last_sub: None,
             last_visual_lines: None,
+            jump_list: JumpList::new(),
+            change_list: ChangeList::new(),
         }
     }
 
@@ -359,6 +378,14 @@ impl Editor {
     fn clear_message(&mut self) {
         self.message = None;
         self.message_is_error = false;
+    }
+
+    /// Commit the current history transaction and record the change position
+    /// in the changelist (if the transaction was non-empty).
+    fn commit_history(&mut self) {
+        if let Some(change_pos) = self.history.commit(self.cursor.position()) {
+            self.change_list.push(change_pos);
+        }
     }
 
     // ── Count accumulation ─────────────────────────────────────────────
@@ -557,15 +584,10 @@ impl Editor {
             KeyCode::Char('B') => self.cursor.big_word_backward(count, &self.buffer, pe),
             KeyCode::Char('E') => self.cursor.big_word_end_forward(count, &self.buffer, pe),
 
-            // File motions: count = line number (1-indexed), no count = first/last
-            KeyCode::Char('g') => {
-                if let Some(n) = raw_count {
-                    self.cursor.goto_line(n.saturating_sub(1), &self.buffer, pe);
-                } else {
-                    self.cursor.move_to_first_line(&self.buffer, pe);
-                }
-            }
+            // File motion: G — jump (pushes to jump list)
+            // Note: `g` (gg) is now a prefix key handled via Pending::GPrefix.
             KeyCode::Char('G') => {
+                self.jump_list.push(self.cursor.position());
                 if let Some(n) = raw_count {
                     self.cursor.goto_line(n.saturating_sub(1), &self.buffer, pe);
                 } else {
@@ -573,17 +595,20 @@ impl Editor {
                 }
             }
 
-            // Paragraph motions
+            // Paragraph motions — jumps (push to jump list)
             KeyCode::Char('}') => {
+                self.jump_list.push(self.cursor.position());
                 self.cursor.paragraph_forward(count, &self.buffer, pe);
             }
             KeyCode::Char('{') => {
+                self.jump_list.push(self.cursor.position());
                 self.cursor.paragraph_backward(count, &self.buffer, pe);
             }
 
-            // Matching bracket (count is ignored for %)
+            // Matching bracket — jump (pushes to jump list)
             KeyCode::Char('%') => {
                 if let Some(pos) = find_matching_bracket(&self.buffer, self.cursor.position()) {
+                    self.jump_list.push(self.cursor.position());
                     self.cursor.set_position(pos, &self.buffer, pe);
                 }
             }
@@ -722,8 +747,41 @@ impl Editor {
                     self.scroll_half_page_up(count);
                     return Action::Continue;
                 }
+                KeyCode::Char('o') => {
+                    // Ctrl+O — jump backward through the jump list.
+                    self.pending = None;
+                    let count = self.take_count();
+                    let mut last_pos = None;
+                    for _ in 0..count {
+                        if let Some(pos) = self.jump_list.back(self.cursor.position()) {
+                            self.cursor.set_position(pos, &self.buffer, pe);
+                            last_pos = Some(pos);
+                        } else {
+                            break;
+                        }
+                    }
+                    if last_pos.is_none() {
+                        // Already at the start of the jump list — no bell,
+                        // but we could show a message if desired.
+                    }
+                    return Action::Continue;
+                }
                 _ => {}
             }
+        }
+
+        // Tab = Ctrl+I — jump forward through the jump list.
+        if key.code == KeyCode::Tab && !key.modifiers.contains(Modifiers::SHIFT) {
+            self.pending = None;
+            let count = self.take_count();
+            for _ in 0..count {
+                if let Some(pos) = self.jump_list.forward() {
+                    self.cursor.set_position(pos, &self.buffer, pe);
+                } else {
+                    break;
+                }
+            }
+            return Action::Continue;
         }
 
         // Handle pending operator state (multi-key commands).
@@ -915,8 +973,22 @@ impl Editor {
                     return Action::Continue;
                 }
 
+                // `g` prefix — need a second key for `gg` motion.
+                if key.code == KeyCode::Char('g') {
+                    let raw_motion_count = self.take_raw_count();
+                    if self.dot_recording && !self.dot_replaying {
+                        self.dot_effective_count =
+                            Self::merge_counts(self.dot_effective_count, raw_motion_count);
+                    }
+                    self.pending = Some(Pending::OperatorGPrefix {
+                        op,
+                        raw_motion_count,
+                    });
+                    return Action::Continue;
+                }
+
                 // Try as a motion. The motion's own count multiplies with
-                // the operator count, except for g/G where it's a line number.
+                // the operator count, except for G where it's a line number.
                 let raw_motion_count = self.take_raw_count();
                 let effective = op_count * raw_motion_count.unwrap_or(1);
                 if let Some(range) =
@@ -1056,8 +1128,9 @@ impl Editor {
                 Action::Continue
             }
             Pending::GotoMark { exact } => {
-                // `` `a `` or `'a`: jump to mark.
+                // `` `a `` or `'a`: jump to mark (pushes to jump list).
                 if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                    self.jump_list.push(self.cursor.position());
                     self.goto_mark(ch, exact);
                 }
                 // Non-letter or Escape — cancel silently.
@@ -1125,6 +1198,85 @@ impl Editor {
                     }
                     _ => {} // Escape or unrecognized — cancel silently.
                 }
+                Action::Continue
+            }
+            Pending::GPrefix { count } => {
+                let pe = self.mode.cursor_past_end();
+                match key.code {
+                    KeyCode::Char('g') => {
+                        // `gg` — goto first line (or Nth line with count).
+                        self.jump_list.push(self.cursor.position());
+                        if let Some(n) = count {
+                            self.cursor
+                                .goto_line(n.saturating_sub(1), &self.buffer, pe);
+                        } else {
+                            self.cursor.move_to_first_line(&self.buffer, pe);
+                        }
+                    }
+                    KeyCode::Char(';') => {
+                        // `g;` — jump to older change position.
+                        let n = count.unwrap_or(1);
+                        for _ in 0..n {
+                            if let Some(pos) = self.change_list.back() {
+                                self.cursor.set_position(pos, &self.buffer, pe);
+                            } else {
+                                self.set_error("E662: At start of changelist");
+                                break;
+                            }
+                        }
+                    }
+                    KeyCode::Char(',') => {
+                        // `g,` — jump to newer change position.
+                        let n = count.unwrap_or(1);
+                        for _ in 0..n {
+                            if let Some(pos) = self.change_list.forward() {
+                                self.cursor.set_position(pos, &self.buffer, pe);
+                            } else {
+                                self.set_error("E663: At end of changelist");
+                                break;
+                            }
+                        }
+                    }
+                    _ => {} // Unrecognized — cancel silently.
+                }
+                Action::Continue
+            }
+            Pending::OperatorGPrefix {
+                op,
+                raw_motion_count,
+            } => {
+                // `dgg`, `cgg`, `ygg` — operator to first/Nth line.
+                if key.code == KeyCode::Escape {
+                    self.dot_cancel();
+                    return Action::Continue;
+                }
+
+                // Record this key for dot-repeat.
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_keys.push(*key);
+                }
+
+                if key.code == KeyCode::Char('g') {
+                    let start = self.cursor.position();
+                    let mut c = self.cursor.clone();
+                    if let Some(n) = raw_motion_count {
+                        c.goto_line(n.saturating_sub(1), &self.buffer, false);
+                    } else {
+                        c.move_to_first_line(&self.buffer, false);
+                    }
+                    if let Some(range) = self.linewise_range(start, c.position()) {
+                        let action = self.execute_operator(op, range, true);
+                        if self.dot_recording
+                            && !self.dot_replaying
+                            && self.mode != Mode::Insert
+                        {
+                            self.dot_finish();
+                        }
+                        return action;
+                    }
+                }
+
+                self.dot_cancel();
                 Action::Continue
             }
         }
@@ -1363,23 +1515,32 @@ impl Editor {
                 self.pending = Some(Pending::GotoMark { exact: false });
             }
 
-            // -- Search --
+            // -- g prefix (gg, g;, g,) --
+            KeyCode::Char('g') => {
+                self.pending = Some(Pending::GPrefix { count: raw_count });
+            }
+
+            // -- Search (all are jump motions) --
             KeyCode::Char('/') => self.start_search(SearchDirection::Forward),
             KeyCode::Char('?') => self.start_search(SearchDirection::Backward),
             KeyCode::Char('n') => {
+                self.jump_list.push(self.cursor.position());
                 for _ in 0..count {
                     self.search_next();
                 }
             }
             KeyCode::Char('N') => {
+                self.jump_list.push(self.cursor.position());
                 for _ in 0..count {
                     self.search_prev();
                 }
             }
             KeyCode::Char('*') => {
+                self.jump_list.push(self.cursor.position());
                 self.search_word_under_cursor(SearchDirection::Forward);
             }
             KeyCode::Char('#') => {
+                self.jump_list.push(self.cursor.position());
                 self.search_word_under_cursor(SearchDirection::Backward);
             }
 
@@ -1502,14 +1663,7 @@ impl Editor {
                 }
                 return self.linewise_range(start, c.position());
             }
-            KeyCode::Char('g') => {
-                if let Some(n) = raw_motion_count {
-                    c.goto_line(n.saturating_sub(1), &self.buffer, false);
-                } else {
-                    c.move_to_first_line(&self.buffer, false);
-                }
-                return self.linewise_range(start, c.position());
-            }
+            // Note: `g` (gg) is handled via Pending::OperatorGPrefix.
 
             // Paragraph motions — linewise when used with operators.
             KeyCode::Char('}') => {
@@ -1652,7 +1806,7 @@ impl Editor {
                 if linewise {
                     self.cursor.move_to_first_non_blank(&self.buffer, false);
                 }
-                self.history.commit(self.cursor.position());
+                self.commit_history();
             }
             'c' => {
                 self.registers.yank(reg_name, reg_text, reg_kind);
@@ -1662,7 +1816,7 @@ impl Editor {
                 self.cursor
                     .set_position(range.start, &self.buffer, true);
                 self.cursor.clamp(&self.buffer, true);
-                self.history.commit(self.cursor.position());
+                self.commit_history();
                 // Begin a new transaction for the insert session.
                 self.history.begin(self.cursor.position());
                 self.mode = Mode::Insert;
@@ -1741,7 +1895,7 @@ impl Editor {
         match key.code {
             KeyCode::Escape => {
                 // Commit the insert-mode transaction and return to normal.
-                self.history.commit(self.cursor.position());
+                self.commit_history();
                 self.mode = Mode::Normal;
                 self.cursor.move_left(1, &self.buffer, false);
 
@@ -2117,7 +2271,7 @@ impl Editor {
             self.cursor.move_to_first_non_blank(&self.buffer, false);
         }
 
-        self.history.commit(self.cursor.position());
+        self.commit_history();
 
         if total_subs > 0 {
             if total_lines > 1 || total_subs > 1 {
@@ -2224,8 +2378,22 @@ impl Editor {
                 }
                 Pending::GotoMark { exact } => {
                     if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                        self.jump_list.push(self.cursor.position());
                         self.goto_mark(ch, exact);
                     }
+                }
+                Pending::GPrefix { count } => {
+                    if key.code == KeyCode::Char('g') {
+                        // `gg` — goto first/Nth line.
+                        self.jump_list.push(self.cursor.position());
+                        if let Some(n) = count {
+                            self.cursor
+                                .goto_line(n.saturating_sub(1), &self.buffer, pe);
+                        } else {
+                            self.cursor.move_to_first_line(&self.buffer, pe);
+                        }
+                    }
+                    // g; and g, are not valid in visual mode — cancel.
                 }
                 Pending::Scroll => {
                     match key.code {
@@ -2357,6 +2525,11 @@ impl Editor {
                 self.pending = Some(Pending::RegisterSelect);
             }
 
+            // -- g prefix (gg) --
+            KeyCode::Char('g') => {
+                self.pending = Some(Pending::GPrefix { count: raw_count });
+            }
+
             // -- Goto mark --
             KeyCode::Char('`') => {
                 self.pending = Some(Pending::GotoMark { exact: true });
@@ -2485,7 +2658,7 @@ impl Editor {
         self.cursor
             .set_position(range.start, &self.buffer, false);
         self.cursor.clamp(&self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
         self.mode = Mode::Normal;
     }
 
@@ -2609,7 +2782,7 @@ impl Editor {
         self.cursor
             .set_position(range.start, &self.buffer, true);
         self.cursor.clamp(&self.buffer, true);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
 
         // Begin a new transaction for the insert session.
         self.history.begin(self.cursor.position());
@@ -2730,6 +2903,8 @@ impl Editor {
                     .set_position(ss.saved_pos(), &self.buffer, false);
                 self.view.set_top_line(ss.saved_top_line());
             } else {
+                // Push pre-search position to jump list (search is a jump).
+                self.jump_list.push(ss.saved_pos());
                 self.last_search = pattern;
                 self.last_search_direction = direction;
             }
@@ -2927,7 +3102,7 @@ impl Editor {
         }
 
         self.cursor.clamp(&self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
     }
 
     /// Paste before the cursor (`P` / `3P` in normal mode).
@@ -2961,7 +3136,7 @@ impl Editor {
         }
 
         self.cursor.clamp(&self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
     }
 
     // ── Line-opening commands ─────────────────────────────────────────────
@@ -3106,7 +3281,7 @@ impl Editor {
         // Place cursor at the join point.
         let final_pos = Position::new(self.cursor.line(), join_col);
         self.cursor.set_position(final_pos, &self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
     }
 
     /// Toggle case of `count` characters at the cursor (`~` / `3~` in Vim).
@@ -3163,7 +3338,7 @@ impl Editor {
         let new_col = end_col.min(line_len.saturating_sub(1));
         self.cursor
             .set_position(Position::new(pos.line, new_col), &self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
     }
 
     /// Replace `count` characters at the cursor with `ch` (`r` / `3ra` in Vim).
@@ -3199,7 +3374,7 @@ impl Editor {
         let final_col = pos.col + count - 1;
         self.cursor
             .set_position(Position::new(pos.line, final_col), &self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
     }
 
     // ── Indent / outdent ────────────────────────────────────────────────
@@ -3287,7 +3462,7 @@ impl Editor {
         self.cursor
             .set_position(Position::new(first, 0), &self.buffer, false);
         self.cursor.move_to_first_non_blank(&self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
 
         let count = last - first + 1;
         if count > 1 {
@@ -3337,7 +3512,7 @@ impl Editor {
         self.cursor
             .set_position(Position::new(first, 0), &self.buffer, false);
         self.cursor.move_to_first_non_blank(&self.buffer, false);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
 
         let count = last - first + 1;
         if count > 1 {
@@ -3453,7 +3628,7 @@ impl Editor {
         self.history.record_delete(pos, &text);
         self.buffer.delete(range);
         self.cursor.clamp(&self.buffer, pe);
-        self.history.commit(self.cursor.position());
+        self.commit_history();
     }
 
 }
@@ -4260,9 +4435,9 @@ mod tests {
         );
         assert_eq!(e.buffer.contents(), "X\nYab");
 
-        // Move to end of first line, . repeats
-        feed(&mut e, &[press('g'), press('.')]);
-        // g goes to first line. Cursor at 'X' (col 0).
+        // Move to first line, . repeats
+        feed(&mut e, &[press('g'), press('g'), press('.')]);
+        // gg goes to first line. Cursor at 'X' (col 0).
         // . replays [i, X, Enter, Y, Esc]
         // i at col 0, types X → "XX\nYab". Enter → "X\nX\nYab". Y → "X\nYX\nYab". Esc.
         assert_eq!(e.buffer.contents(), "X\nYX\nYab");
@@ -5514,7 +5689,7 @@ mod tests {
         feed(&mut e, &[press('j'), press('l'), press('l'), press('l')]);
         feed(&mut e, &[press('m'), press('a')]);
         // Move elsewhere.
-        feed(&mut e, &[press('g')]);
+        feed(&mut e, &[press('g'), press('g')]);
         assert_eq!(e.cursor.line(), 0);
         // `a jumps back to exact position.
         feed(&mut e, &[press('`'), press('a')]);
@@ -5532,7 +5707,7 @@ mod tests {
         );
         feed(&mut e, &[press('m'), press('a')]);
         // Move elsewhere.
-        feed(&mut e, &[press('g')]);
+        feed(&mut e, &[press('g'), press('g')]);
         // 'a jumps to first non-blank of mark's line.
         feed(&mut e, &[press('\''), press('a')]);
         assert_eq!(e.cursor.line(), 1);
@@ -5590,7 +5765,7 @@ mod tests {
         // Set mark on line 2.
         feed(&mut e, &[press('G'), press('m'), press('a')]);
         // Go to line 0, insert text.
-        feed(&mut e, &[press('g'), press('i'), press('x'), esc()]);
+        feed(&mut e, &[press('g'), press('g'), press('i'), press('x'), esc()]);
         // `a should still go to line 2 (mark position unchanged).
         feed(&mut e, &[press('`'), press('a')]);
         assert_eq!(e.cursor.line(), 2);
@@ -5876,7 +6051,7 @@ mod tests {
         // Record a macro that just moves down.
         feed(&mut e, &[press('q'), press('a'), press('j'), press('q')]);
         // During replay, the 'j' replays fine. No new recording starts.
-        feed(&mut e, &[press('g'), press('@'), press('a')]);
+        feed(&mut e, &[press('g'), press('g'), press('@'), press('a')]);
         assert!(e.macro_recording.is_none());
     }
 
@@ -6208,5 +6383,358 @@ mod tests {
     #[test]
     fn translate_replacement_mixed() {
         assert_eq!(translate_replacement(r"[\1] & $"), "[$1] $0 $$");
+    }
+
+    // ── Helper: Tab key ───────────────────────────────────────────────────
+
+    /// Create a Tab key press event (Ctrl+I in terminal = jump forward).
+    fn tab() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Tab,
+            modifiers: Modifiers::empty(),
+            kind: KeyEventKind::Press,
+        })
+    }
+
+    // ── Jump list (Ctrl+O / Ctrl+I) ──────────────────────────────────────
+
+    #[test]
+    fn ctrl_o_after_gg_goes_back() {
+        let mut e = editor_with("line0\nline1\nline2\nline3\nline4");
+        // Move to line 3.
+        feed(&mut e, &[press('3'), press('j')]);
+        assert_eq!(e.cursor.line(), 3);
+        // gg is a jump — should push line 3 to jump list.
+        feed(&mut e, &[press('g'), press('g')]);
+        assert_eq!(e.cursor.line(), 0);
+        // Ctrl+O goes back to line 3.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 3);
+    }
+
+    #[test]
+    fn ctrl_i_after_ctrl_o_goes_forward() {
+        let mut e = editor_with("line0\nline1\nline2\nline3\nline4");
+        feed(&mut e, &[press('3'), press('j')]);
+        feed(&mut e, &[press('g'), press('g')]);
+        feed(&mut e, &[ctrl('o')]); // back to line 3
+        assert_eq!(e.cursor.line(), 3);
+        // Tab (Ctrl+I) goes forward to line 0.
+        feed(&mut e, &[tab()]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_after_search_confirm() {
+        let mut e = editor_with("aaa\nbbb\nccc\naaa\nddd");
+        // Cursor at line 0. Search for "ccc".
+        feed(
+            &mut e,
+            &[press('/'), press('c'), press('c'), press('c'), enter()],
+        );
+        assert_eq!(e.cursor.line(), 2);
+        // Ctrl+O should go back to line 0 (pre-search position).
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_after_n_search_next() {
+        let mut e = editor_with("aaa\nbbb\naaa\nccc\naaa");
+        // Search for "aaa" — incremental search finds it at line 0 (current line).
+        feed(
+            &mut e,
+            &[press('/'), press('a'), press('a'), press('a'), enter()],
+        );
+        assert_eq!(e.cursor.line(), 0);
+        // n jumps to next match (line 2).
+        feed(&mut e, &[press('n')]);
+        assert_eq!(e.cursor.line(), 2);
+        // n again to line 4.
+        feed(&mut e, &[press('n')]);
+        assert_eq!(e.cursor.line(), 4);
+        // Ctrl+O goes back to where we were before the last n (line 2).
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn ctrl_o_after_star_search() {
+        let mut e = editor_with("hello world\nfoo bar\nhello again");
+        // * searches for word under cursor.
+        feed(&mut e, &[press('*')]);
+        assert_eq!(e.cursor.line(), 2);
+        // Ctrl+O goes back to line 0.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_after_percent_bracket() {
+        let mut e = editor_with("if (true) {\n  x\n}");
+        // Move to the opening {.
+        feed(&mut e, &[press('f'), press('{')]);
+        assert_eq!(e.cursor.line(), 0);
+        // % jumps to matching }.
+        feed(&mut e, &[press('%')]);
+        assert_eq!(e.cursor.line(), 2);
+        // Ctrl+O goes back to line 0.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_after_paragraph_motion() {
+        let mut e = editor_with("line1\nline2\n\nline4\nline5\n\nline7");
+        // } jumps to next blank line.
+        feed(&mut e, &[press('}')]);
+        assert_eq!(e.cursor.line(), 2);
+        feed(&mut e, &[press('}')]);
+        assert_eq!(e.cursor.line(), 5);
+        // Ctrl+O goes back to line 2.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn ctrl_o_after_goto_mark() {
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        // Set mark a on line 2.
+        feed(&mut e, &[press('2'), press('j'), press('m'), press('a')]);
+        // Go to line 0.
+        feed(&mut e, &[press('g'), press('g')]);
+        // Jump to mark a.
+        feed(&mut e, &[press('`'), press('a')]);
+        assert_eq!(e.cursor.line(), 2);
+        // Ctrl+O goes back to line 0 (where we were before `a).
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_at_start_stays_put() {
+        let mut e = editor_with("hello\nworld");
+        // No jump history — Ctrl+O should do nothing.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn ctrl_i_at_end_stays_put() {
+        let mut e = editor_with("hello\nworld");
+        // No forward history — Tab should do nothing.
+        feed(&mut e, &[tab()]);
+        assert_eq!(e.cursor.line(), 0);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn ctrl_o_multiple_back_and_forward() {
+        let mut e = editor_with("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+        // Make a series of jumps: G, gg, G.
+        feed(&mut e, &[press('G')]); // line 9
+        feed(&mut e, &[press('g'), press('g')]); // line 0
+        feed(&mut e, &[press('G')]); // line 9
+        // Now walk back: Ctrl+O × 3.
+        feed(&mut e, &[ctrl('o')]); // back to line 0
+        assert_eq!(e.cursor.line(), 0);
+        feed(&mut e, &[ctrl('o')]); // back to line 9
+        assert_eq!(e.cursor.line(), 9);
+        // Forward.
+        feed(&mut e, &[tab()]); // forward to line 0
+        assert_eq!(e.cursor.line(), 0);
+        feed(&mut e, &[tab()]); // forward to line 9
+        assert_eq!(e.cursor.line(), 9);
+    }
+
+    #[test]
+    fn new_jump_from_mid_list_truncates_future() {
+        let mut e = editor_with("l0\nl1\nl2\nl3\nl4\nl5");
+        // Jump: G (to line 5), gg (to line 0).
+        feed(&mut e, &[press('G')]);
+        feed(&mut e, &[press('g'), press('g')]);
+        // Back one: to line 5.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 5);
+        // New jump from here — should truncate the forward history.
+        feed(&mut e, &[press('3'), press('G')]);
+        assert_eq!(e.cursor.line(), 2);
+        // Tab should not go anywhere (future was truncated).
+        feed(&mut e, &[tab()]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn ctrl_o_with_count() {
+        let mut e = editor_with("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+        // Make several jumps.
+        feed(&mut e, &[press('G')]); // line 9
+        feed(&mut e, &[press('g'), press('g')]); // line 0
+        feed(&mut e, &[press('G')]); // line 9
+        // 2 Ctrl+O — go back 2 steps.
+        feed(&mut e, &[press('2'), ctrl('o')]);
+        assert_eq!(e.cursor.line(), 9);
+    }
+
+    #[test]
+    fn ctrl_o_g_big_with_count() {
+        let mut e = editor_with("l0\nl1\nl2\nl3\nl4");
+        // G with count: jump to line 3 (1-indexed).
+        feed(&mut e, &[press('3'), press('G')]);
+        assert_eq!(e.cursor.line(), 2);
+        // Ctrl+O goes back to line 0.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    // ── gg as proper prefix key ──────────────────────────────────────────
+
+    #[test]
+    fn gg_goto_first_line() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('G')]); // last line
+        assert_eq!(e.cursor.line(), 2);
+        feed(&mut e, &[press('g'), press('g')]); // first line
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn gg_with_count_goto_line() {
+        let mut e = editor_with("l1\nl2\nl3\nl4\nl5");
+        feed(&mut e, &[press('3'), press('g'), press('g')]);
+        assert_eq!(e.cursor.line(), 2); // 3rd line (0-indexed = 2)
+    }
+
+    #[test]
+    fn g_prefix_cancel_on_unknown_key() {
+        let mut e = editor_with("aaa\nbbb");
+        feed(&mut e, &[press('j')]); // line 1
+        // g + x = unknown second key, should cancel silently.
+        feed(&mut e, &[press('g'), press('x')]);
+        assert_eq!(e.cursor.line(), 1); // didn't move
+    }
+
+    // ── Change list (g; / g,) ────────────────────────────────────────────
+
+    #[test]
+    fn g_semicolon_jumps_to_last_change() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // Make a change on line 1.
+        feed(&mut e, &[press('j'), press('i'), press('X'), esc()]);
+        // Move somewhere else.
+        feed(&mut e, &[press('G')]);
+        assert_eq!(e.cursor.line(), 2);
+        // g; should jump to line 1 (where the change was).
+        feed(&mut e, &[press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 1);
+    }
+
+    #[test]
+    fn g_comma_jumps_to_newer_change() {
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        // Change on line 0.
+        feed(&mut e, &[press('i'), press('X'), esc()]);
+        // Change on line 2.
+        feed(&mut e, &[press('2'), press('j'), press('i'), press('Y'), esc()]);
+        // g; twice — goes to line 2, then line 0.
+        feed(&mut e, &[press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 2);
+        feed(&mut e, &[press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 0);
+        // g, goes back to newer change (line 2).
+        feed(&mut e, &[press('g'), press(',')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn g_semicolon_at_start_shows_error() {
+        let mut e = editor_with("aaa");
+        // No changes made — g; should show error.
+        feed(&mut e, &[press('g'), press(';')]);
+        assert!(e.message_is_error);
+        assert_eq!(
+            e.message.as_deref(),
+            Some("E662: At start of changelist")
+        );
+    }
+
+    #[test]
+    fn g_comma_at_end_shows_error() {
+        let mut e = editor_with("aaa");
+        // Make one change.
+        feed(&mut e, &[press('i'), press('X'), esc()]);
+        // g; to go back, then g, should show error (at end).
+        feed(&mut e, &[press('g'), press(';')]);
+        feed(&mut e, &[press('g'), press(',')]);
+        assert!(e.message_is_error);
+        assert_eq!(
+            e.message.as_deref(),
+            Some("E663: At end of changelist")
+        );
+    }
+
+    #[test]
+    fn g_semicolon_after_multiple_edits() {
+        let mut e = editor_with("l0\nl1\nl2\nl3\nl4");
+        // Edits on multiple lines.
+        feed(&mut e, &[press('i'), press('A'), esc()]); // line 0
+        feed(&mut e, &[press('j'), press('i'), press('B'), esc()]); // line 1
+        feed(
+            &mut e,
+            &[press('2'), press('j'), press('i'), press('C'), esc()],
+        ); // line 3
+        // g; walks back through changes.
+        feed(&mut e, &[press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 3);
+        feed(&mut e, &[press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 1);
+        feed(&mut e, &[press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn g_semicolon_with_count() {
+        let mut e = editor_with("l0\nl1\nl2\nl3\nl4");
+        // Edits on lines 0, 2, 4.
+        feed(&mut e, &[press('i'), press('X'), esc()]);
+        feed(&mut e, &[press('2'), press('j'), press('i'), press('Y'), esc()]);
+        feed(&mut e, &[press('2'), press('j'), press('i'), press('Z'), esc()]);
+        // 2g; should go back 2 changes (from line 4 to line 2, then to line 0).
+        feed(&mut e, &[press('2'), press('g'), press(';')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    // ── gg in visual mode ────────────────────────────────────────────────
+
+    #[test]
+    fn gg_in_visual_mode() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('G')]); // line 2
+        feed(&mut e, &[press('v')]); // visual char
+        feed(&mut e, &[press('g'), press('g')]); // extend to line 0
+        assert_eq!(e.cursor.line(), 0);
+        assert!(matches!(e.mode, Mode::Visual(VisualKind::Char)));
+    }
+
+    // ── Jump list is not populated by non-jump motions ───────────────────
+
+    #[test]
+    fn hjkl_does_not_push_jump_list() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('j'), press('j')]);
+        assert_eq!(e.cursor.line(), 2);
+        // Ctrl+O should do nothing — j is not a jump motion.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn word_motion_does_not_push_jump_list() {
+        let mut e = editor_with("one two three four five");
+        feed(&mut e, &[press('w'), press('w'), press('w')]);
+        // Ctrl+O should do nothing — w is not a jump motion.
+        feed(&mut e, &[ctrl('o')]);
+        assert_eq!(e.cursor.col(), 14); // still at "four"
     }
 }

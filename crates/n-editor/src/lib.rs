@@ -11,6 +11,7 @@
 //! - **[`search`]** — Incremental search (`/`, `?`, `n`, `N`) with match highlighting
 //! - **[`view`]** — View layer that bridges buffers to n-term's framebuffer
 //! - **[`register`]** — Register file: unnamed + 26 named registers (a-z) with append
+//! - **[`jumplist`]** — Jump list (`Ctrl+O`/`Ctrl+I`) and change list (`g;`/`g,`)
 //!
 //! Future modules will add split tree layout, floating windows, and commands.
 
@@ -18,6 +19,7 @@ pub mod buffer;
 pub mod command;
 pub mod cursor;
 pub mod history;
+pub mod jumplist;
 pub mod mode;
 pub mod position;
 pub mod register;
