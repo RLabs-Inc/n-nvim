@@ -670,7 +670,7 @@ impl Editor {
                     self.dot_keys.push(*key);
                 }
 
-                // Same key = line operation (dd, yy, cc).
+                // Same key = line operation (dd, yy, cc, >>, <<).
                 // Effective count: op_count * motion_count.
                 if key.code == KeyCode::Char(op) {
                     let raw_motion_count = self.take_raw_count();
@@ -682,7 +682,12 @@ impl Editor {
                             Self::merge_counts(self.dot_effective_count, raw_motion_count);
                     }
 
-                    let action = self.operator_line(op, effective);
+                    let action = if op == '>' || op == '<' {
+                        self.indent_outdent_line_op(op, effective);
+                        Action::Continue
+                    } else {
+                        self.operator_line(op, effective)
+                    };
 
                     // Finalize unless the operator entered insert mode (cc).
                     if self.dot_recording && !self.dot_replaying && self.mode != Mode::Insert
@@ -751,7 +756,7 @@ impl Editor {
                                 Self::merge_counts(self.dot_effective_count, raw_motion_count);
                         }
                         if let Some(range) = self.char_find_operator_range(ch, kind, effective) {
-                            let action = self.apply_operator(op, range, false);
+                            let action = self.execute_operator(op, range, false);
                             if self.dot_recording
                                 && !self.dot_replaying
                                 && self.mode != Mode::Insert
@@ -777,7 +782,7 @@ impl Editor {
                             Self::merge_counts(self.dot_effective_count, raw_motion_count);
                     }
 
-                    let action = self.apply_operator(op, range, false);
+                    let action = self.execute_operator(op, range, false);
 
                     if self.dot_recording && !self.dot_replaying && self.mode != Mode::Insert
                     {
@@ -805,7 +810,7 @@ impl Editor {
                 }
 
                 if let Some(range) = self.text_object_range(key.code, inner) {
-                    let action = self.apply_operator(op, range, false);
+                    let action = self.execute_operator(op, range, false);
 
                     if self.dot_recording && !self.dot_replaying && self.mode != Mode::Insert
                     {
@@ -873,7 +878,7 @@ impl Editor {
                     self.last_char_find = Some((ch, kind));
                     let effective = op_count * motion_count;
                     if let Some(range) = self.char_find_operator_range(ch, kind, effective) {
-                        let action = self.apply_operator(op, range, false);
+                        let action = self.execute_operator(op, range, false);
                         if self.dot_recording
                             && !self.dot_replaying
                             && self.mode != Mode::Insert
@@ -971,9 +976,51 @@ impl Editor {
                 // Yank is not a buffer change — don't record for dot-repeat.
                 self.pending = Some(Pending::Operator { op: 'y', count });
             }
+            KeyCode::Char('>') => {
+                self.dot_start(key, raw_count);
+                self.pending = Some(Pending::Operator { op: '>', count });
+            }
+            KeyCode::Char('<') => {
+                self.dot_start(key, raw_count);
+                self.pending = Some(Pending::Operator { op: '<', count });
+            }
             KeyCode::Char('x') => {
                 self.dot_immediate(key, raw_count);
                 self.delete_chars_at_cursor(count);
+            }
+
+            // -- Shortcuts (C = c$, D = d$, S = cc) --
+            KeyCode::Char('D') => {
+                self.dot_immediate(key, raw_count);
+                let pos = self.cursor.position();
+                let target_line =
+                    (pos.line + count - 1).min(self.buffer.line_count().saturating_sub(1));
+                let target_len = self.buffer.line_content_len(target_line).unwrap_or(0);
+                let end = Position::new(target_line, target_len);
+                if pos < end {
+                    let range = Range::new(pos, end);
+                    self.apply_operator('d', range, false);
+                }
+            }
+            KeyCode::Char('C') => {
+                self.dot_start(key, raw_count);
+                let pos = self.cursor.position();
+                let target_line =
+                    (pos.line + count - 1).min(self.buffer.line_count().saturating_sub(1));
+                let target_len = self.buffer.line_content_len(target_line).unwrap_or(0);
+                let end = Position::new(target_line, target_len);
+                if pos < end {
+                    let range = Range::new(pos, end);
+                    self.apply_operator('c', range, false);
+                } else {
+                    // At end of line — just enter insert mode.
+                    self.history.begin(pos);
+                    self.mode = Mode::Insert;
+                }
+            }
+            KeyCode::Char('S') => {
+                self.dot_start(key, raw_count);
+                self.operator_line('c', count);
             }
 
             // -- Join lines --
@@ -1770,6 +1817,10 @@ impl Editor {
             KeyCode::Char('y') => self.visual_yank(),
             KeyCode::Char('c') => self.visual_change(),
 
+            // -- Indent / outdent --
+            KeyCode::Char('>') => self.visual_indent(),
+            KeyCode::Char('<') => self.visual_outdent(),
+
             _ => {}
         }
 
@@ -2009,6 +2060,43 @@ impl Editor {
         // Begin a new transaction for the insert session.
         self.history.begin(self.cursor.position());
         self.mode = Mode::Insert;
+    }
+
+    /// Indent the visual selection (`>` in visual mode).
+    ///
+    /// Indents all lines in the selection, then exits visual mode.
+    fn visual_indent(&mut self) {
+        if !matches!(self.mode, Mode::Visual(_)) {
+            return;
+        }
+        let Some(range) = self.cursor.selection() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        self.cursor.clear_anchor();
+        self.mode = Mode::Normal;
+        self.indent_lines(range.start.line, range.end.line);
+    }
+
+    /// Outdent the visual selection (`<` in visual mode).
+    ///
+    /// Removes one level of indentation from all lines in the selection,
+    /// then exits visual mode.
+    fn visual_outdent(&mut self) {
+        if !matches!(self.mode, Mode::Visual(_)) {
+            return;
+        }
+        let Some(range) = self.cursor.selection() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        self.cursor.clear_anchor();
+        self.mode = Mode::Normal;
+        self.outdent_lines(range.start.line, range.end.line);
     }
 
     // ── Search mode ─────────────────────────────────────────────────────
@@ -2555,6 +2643,151 @@ impl Editor {
             .set_position(Position::new(pos.line, final_col), &self.buffer, false);
         self.history.commit(self.cursor.position());
     }
+
+    // ── Indent / outdent ────────────────────────────────────────────────
+
+    /// Width of one indentation level (in spaces).
+    const INDENT_WIDTH: usize = 4;
+
+    /// Dispatch an operator: routes `>` / `<` to indent/outdent, others to
+    /// the standard `apply_operator` path.
+    fn execute_operator(&mut self, op: char, range: Range, linewise: bool) -> Action {
+        match op {
+            '>' | '<' => {
+                self.indent_outdent_range(op, range);
+                Action::Continue
+            }
+            _ => self.apply_operator(op, range, linewise),
+        }
+    }
+
+    /// Indent or outdent lines covered by an arbitrary range.
+    ///
+    /// All `>` / `<` operations are linewise — even `>w` indents the full
+    /// line(s) the motion spans. If the range ends at column 0 of a line,
+    /// that line is excluded (it's the exclusive end of a linewise range).
+    fn indent_outdent_range(&mut self, op: char, range: Range) {
+        // If the range starts at or past the content end of its line (e.g.,
+        // an inner-brace text object starting right after the `{` at the end
+        // of a line), the first indentable line is the next one.
+        let start_content_len = self.buffer.line_content_len(range.start.line).unwrap_or(0);
+        let first_line = if start_content_len > 0 && range.start.col >= start_content_len {
+            range.start.line + 1
+        } else {
+            range.start.line
+        };
+
+        let last_line = if range.end.col == 0 && range.end.line > first_line {
+            range.end.line - 1
+        } else {
+            range.end.line
+        };
+
+        if first_line > last_line {
+            return;
+        }
+
+        match op {
+            '>' => self.indent_lines(first_line, last_line),
+            '<' => self.outdent_lines(first_line, last_line),
+            _ => {}
+        }
+    }
+
+    /// Indent or outdent `count` lines starting from the cursor (`>>` / `<<`).
+    fn indent_outdent_line_op(&mut self, op: char, count: usize) {
+        let first = self.cursor.line();
+        let last = (first + count - 1).min(self.buffer.line_count().saturating_sub(1));
+
+        match op {
+            '>' => self.indent_lines(first, last),
+            '<' => self.outdent_lines(first, last),
+            _ => {}
+        }
+    }
+
+    /// Indent lines `first..=last` by one level (prepend spaces).
+    ///
+    /// Empty lines are skipped (Vim behavior). The cursor is placed at the
+    /// first non-blank of the first affected line.
+    fn indent_lines(&mut self, first: usize, last: usize) {
+        let indent: String = std::iter::repeat_n(' ', Self::INDENT_WIDTH).collect();
+
+        self.history.begin(self.cursor.position());
+
+        for line in first..=last {
+            // Skip empty lines (Vim doesn't indent empty lines).
+            if self.buffer.line_content_len(line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let pos = Position::new(line, 0);
+            self.history.record_insert(pos, &indent);
+            self.buffer.insert(pos, &indent);
+        }
+
+        // Cursor goes to first non-blank of first line.
+        self.cursor
+            .set_position(Position::new(first, 0), &self.buffer, false);
+        self.cursor.move_to_first_non_blank(&self.buffer, false);
+        self.history.commit(self.cursor.position());
+
+        let count = last - first + 1;
+        if count > 1 {
+            self.set_message(format!("{count} lines indented"));
+        }
+    }
+
+    /// Outdent lines `first..=last` by one level (remove leading whitespace).
+    ///
+    /// Removes up to `INDENT_WIDTH` leading spaces, or one leading tab.
+    /// The cursor is placed at the first non-blank of the first affected line.
+    fn outdent_lines(&mut self, first: usize, last: usize) {
+        self.history.begin(self.cursor.position());
+
+        for line in first..=last {
+            let line_text = self.buffer.line(line).map(|s| s.to_string());
+            let Some(text) = line_text else { continue };
+
+            // Count leading whitespace to remove (up to one indent level).
+            let mut remove = 0;
+            for ch in text.chars() {
+                if ch == '\t' && remove == 0 {
+                    remove = 1;
+                    break;
+                } else if ch == ' ' && remove < Self::INDENT_WIDTH {
+                    remove += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if remove > 0 {
+                let from = Position::new(line, 0);
+                let to = Position::new(line, remove);
+                let range = Range::new(from, to);
+                let deleted = self
+                    .buffer
+                    .slice(range)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                self.history.record_delete(from, &deleted);
+                self.buffer.delete(range);
+            }
+        }
+
+        // Cursor goes to first non-blank of first line.
+        self.cursor
+            .set_position(Position::new(first, 0), &self.buffer, false);
+        self.cursor.move_to_first_non_blank(&self.buffer, false);
+        self.history.commit(self.cursor.position());
+
+        let count = last - first + 1;
+        if count > 1 {
+            self.set_message(format!("{count} lines outdented"));
+        }
+    }
+
+    // ── Edit commands ────────────────────────────────────────────────────
 
     /// Delete `count` characters at the cursor (`x` / `3x` in Vim).
     ///
@@ -3911,5 +4144,355 @@ mod tests {
         assert_eq!(e.cursor.line(), 12);
         assert!(e.cursor.has_selection());
         assert_eq!(e.cursor.anchor().unwrap().line, 0);
+    }
+
+    // ── Indent (>>) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn indent_single_line() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('>'), press('>')]);
+        assert_eq!(e.buffer.contents(), "    hello");
+        // Cursor at first non-blank (col 4).
+        assert_eq!(e.cursor.col(), 4);
+    }
+
+    #[test]
+    fn indent_with_count() {
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        // 3>> = indent 3 lines.
+        feed(&mut e, &[press('3'), press('>'), press('>')]);
+        assert_eq!(e.buffer.contents(), "    aaa\n    bbb\n    ccc\nddd");
+    }
+
+    #[test]
+    fn indent_skips_empty_lines() {
+        let mut e = editor_with("aaa\n\nccc");
+        feed(&mut e, &[press('3'), press('>'), press('>')]);
+        // Empty line stays empty.
+        assert_eq!(e.buffer.contents(), "    aaa\n\n    ccc");
+    }
+
+    #[test]
+    fn indent_stacks() {
+        let mut e = editor_with("hello");
+        // >> twice = 8 spaces.
+        feed(&mut e, &[press('>'), press('>'), press('>'), press('>')]);
+        assert_eq!(e.buffer.contents(), "        hello");
+    }
+
+    #[test]
+    fn indent_with_motion_j() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // >j = indent current line and the one below.
+        feed(&mut e, &[press('>'), press('j')]);
+        assert_eq!(e.buffer.contents(), "    aaa\n    bbb\nccc");
+    }
+
+    #[test]
+    fn indent_with_motion_to_last_line() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // >G = indent from cursor line to end of file.
+        feed(&mut e, &[press('>'), press('G')]);
+        assert_eq!(e.buffer.contents(), "    aaa\n    bbb\n    ccc");
+    }
+
+    #[test]
+    fn indent_undo() {
+        let mut e = editor_with("hello\nworld");
+        feed(&mut e, &[press('>'), press('>'), press('u')]);
+        assert_eq!(e.buffer.contents(), "hello\nworld");
+    }
+
+    #[test]
+    fn indent_dot_repeat() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // >> on first line, j to next, . to repeat.
+        feed(
+            &mut e,
+            &[press('>'), press('>'), press('j'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "    aaa\n    bbb\nccc");
+    }
+
+    #[test]
+    fn indent_dot_repeat_with_count() {
+        let mut e = editor_with("a\nb\nc\nd\ne");
+        // 2>> indents 2 lines (a, b). Cursor on line 0.
+        // j j moves to line 2. 3. overrides count → 3>> → indents 3 lines (c, d, e).
+        feed(
+            &mut e,
+            &[
+                press('2'), press('>'), press('>'),
+                press('j'), press('j'),
+                press('3'), press('.'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "    a\n    b\n    c\n    d\n    e");
+    }
+
+    // ── Outdent (<<) ────────────────────────────────────────────────────
+
+    #[test]
+    fn outdent_single_line() {
+        let mut e = editor_with("    hello");
+        feed(&mut e, &[press('<'), press('<')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn outdent_partial_spaces() {
+        // Only 2 spaces — remove what's there.
+        let mut e = editor_with("  hello");
+        feed(&mut e, &[press('<'), press('<')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn outdent_tab() {
+        let mut e = editor_with("\thello");
+        feed(&mut e, &[press('<'), press('<')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn outdent_no_leading_whitespace() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('<'), press('<')]);
+        // Nothing to remove — stays the same.
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn outdent_with_count() {
+        let mut e = editor_with("    aaa\n    bbb\n    ccc\nddd");
+        // 3<< = outdent 3 lines.
+        feed(&mut e, &[press('3'), press('<'), press('<')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc\nddd");
+    }
+
+    #[test]
+    fn outdent_with_motion_j() {
+        let mut e = editor_with("    aaa\n    bbb\nccc");
+        feed(&mut e, &[press('<'), press('j')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+    }
+
+    #[test]
+    fn outdent_undo() {
+        let mut e = editor_with("    hello");
+        feed(&mut e, &[press('<'), press('<'), press('u')]);
+        assert_eq!(e.buffer.contents(), "    hello");
+    }
+
+    #[test]
+    fn outdent_dot_repeat() {
+        let mut e = editor_with("    aaa\n    bbb\nccc");
+        feed(
+            &mut e,
+            &[press('<'), press('<'), press('j'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+    }
+
+    #[test]
+    fn outdent_more_than_indent_width() {
+        // 8 spaces: << removes 4, leaving 4.
+        let mut e = editor_with("        hello");
+        feed(&mut e, &[press('<'), press('<')]);
+        assert_eq!(e.buffer.contents(), "    hello");
+    }
+
+    // ── Visual indent / outdent ─────────────────────────────────────────
+
+    #[test]
+    fn visual_indent_char_mode() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // v j > = select 2 lines, indent.
+        feed(&mut e, &[press('v'), press('j'), press('>')]);
+        assert_eq!(e.buffer.contents(), "    aaa\n    bbb\nccc");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_indent_line_mode() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // V j > = select 2 lines, indent.
+        feed(&mut e, &[press('V'), press('j'), press('>')]);
+        assert_eq!(e.buffer.contents(), "    aaa\n    bbb\nccc");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_outdent() {
+        let mut e = editor_with("    aaa\n    bbb\nccc");
+        feed(&mut e, &[press('V'), press('j'), press('<')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    // ── Indent with text objects ────────────────────────────────────────
+
+    #[test]
+    fn indent_inner_curly_braces() {
+        let mut e = editor_with("fn main() {\n    x\n    y\n}");
+        // Move cursor inside braces, >iB to indent inner block.
+        feed(
+            &mut e,
+            &[press('j'), press('>'), press('i'), press('B')],
+        );
+        assert_eq!(
+            e.buffer.contents(),
+            "fn main() {\n        x\n        y\n}"
+        );
+    }
+
+    // ── D (d$) — delete to end of line ──────────────────────────────────
+
+    #[test]
+    fn d_upper_basic() {
+        let mut e = editor_with("hello world");
+        // Move to 'w' (col 6), D deletes "world".
+        feed(&mut e, &[press('f'), press('w'), press('D')]);
+        assert_eq!(e.buffer.contents(), "hello ");
+    }
+
+    #[test]
+    fn d_upper_at_end_of_line() {
+        let mut e = editor_with("hello");
+        // Move to end, D does nothing.
+        feed(&mut e, &[press('$'), press('D')]);
+        assert_eq!(e.buffer.contents(), "hell");
+    }
+
+    #[test]
+    fn d_upper_dot_repeat() {
+        let mut e = editor_with("aaa bbb\nccc ddd");
+        // fw, D, j0fw, .
+        feed(
+            &mut e,
+            &[
+                press('f'), press('b'), press('D'),
+                press('j'), press('0'),
+                press('f'), press('d'), press('.'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "aaa \nccc ");
+    }
+
+    #[test]
+    fn d_upper_stores_in_register() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('f'), press('w'), press('D')]);
+        assert_eq!(e.register.content(), "world");
+    }
+
+    // ── C (c$) — change to end of line ──────────────────────────────────
+
+    #[test]
+    fn c_upper_basic() {
+        let mut e = editor_with("hello world");
+        // fw, C, type "xyz", Esc.
+        feed(
+            &mut e,
+            &[
+                press('f'), press('w'), press('C'),
+                press('x'), press('y'), press('z'), esc(),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "hello xyz");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn c_upper_enters_insert() {
+        let mut e = editor_with("hello world");
+        feed(&mut e, &[press('C')]);
+        assert_eq!(e.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn c_upper_dot_repeat() {
+        let mut e = editor_with("aaa bbb\nccc ddd");
+        // Move to space, C to change, type "!", Esc.
+        // Then j0 to next line, move to space, dot repeat.
+        feed(
+            &mut e,
+            &[
+                press('f'), press(' '), press('C'),
+                press('!'), esc(),
+                press('j'), press('0'),
+                press('f'), press(' '), press('.'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "aaa!\nccc!");
+    }
+
+    // ── S (cc) — substitute line ────────────────────────────────────────
+
+    #[test]
+    fn s_upper_basic() {
+        let mut e = editor_with("hello world");
+        // S deletes line content, enters insert.
+        feed(
+            &mut e,
+            &[press('S'), press('h'), press('i'), esc()],
+        );
+        assert_eq!(e.buffer.contents(), "hi");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn s_upper_with_count() {
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        // 2S = substitute 2 lines. Our cc/S deletes the lines including
+        // newlines (same linewise range as dd), then enters insert.
+        feed(
+            &mut e,
+            &[press('2'), press('S'), press('x'), esc()],
+        );
+        // "aaa\nbbb\n" deleted → "ccc\nddd", then 'x' typed at start.
+        assert_eq!(e.buffer.contents(), "xccc\nddd");
+    }
+
+    #[test]
+    fn s_upper_dot_repeat() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // S on first line: deletes "aaa\n", types 'x', Esc.
+        // j to next line, . replays.
+        feed(
+            &mut e,
+            &[
+                press('S'), press('x'), esc(),
+                press('j'), press('.'),
+            ],
+        );
+        // First S: "aaa\n" deleted → "bbb\nccc", "x" typed → "xbbb\nccc".
+        // j to line 1 ("ccc"). Dot replays S on last line (joins with prev).
+        assert_eq!(e.buffer.contents(), "xbbbx");
+    }
+
+    // ── Indent message ──────────────────────────────────────────────────
+
+    #[test]
+    fn indent_multiline_shows_message() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('3'), press('>'), press('>')]);
+        assert_eq!(e.message.as_deref(), Some("3 lines indented"));
+    }
+
+    #[test]
+    fn indent_single_line_no_message() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('>'), press('>')]);
+        // Single line indent — no message.
+        assert!(e.message.is_none());
+    }
+
+    #[test]
+    fn outdent_multiline_shows_message() {
+        let mut e = editor_with("    aaa\n    bbb\n    ccc");
+        feed(&mut e, &[press('3'), press('<'), press('<')]);
+        assert_eq!(e.message.as_deref(), Some("3 lines outdented"));
     }
 }
