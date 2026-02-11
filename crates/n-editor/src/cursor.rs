@@ -411,6 +411,83 @@ impl Cursor {
         }
     }
 
+    // -- Paragraph motions --------------------------------------------------
+
+    /// Move forward to the next paragraph boundary. This is `}` in Vim.
+    ///
+    /// A paragraph boundary is a blank line (content length == 0). If the
+    /// cursor is on a blank line, skip consecutive blanks first, then skip
+    /// non-blank lines to reach the next blank line. If on a non-blank line,
+    /// find the next blank line directly. Always lands at column 0.
+    /// Resets sticky column.
+    pub fn paragraph_forward(&mut self, count: usize, buf: &Buffer, _past_end: bool) {
+        let line_count = buf.line_count();
+        if line_count == 0 {
+            return;
+        }
+
+        for _ in 0..count {
+            let mut i = self.pos.line + 1;
+
+            // If on a blank line, skip consecutive blanks first.
+            if buf.line_content_len(self.pos.line).unwrap_or(0) == 0 {
+                while i < line_count && buf.line_content_len(i).unwrap_or(0) == 0 {
+                    i += 1;
+                }
+            }
+
+            // Skip non-blank lines to the next blank.
+            while i < line_count && buf.line_content_len(i).unwrap_or(0) != 0 {
+                i += 1;
+            }
+
+            self.pos.line = i.min(line_count.saturating_sub(1));
+        }
+
+        self.pos.col = 0;
+        self.sticky_col = 0;
+    }
+
+    /// Move backward to the previous paragraph boundary. This is `{` in Vim.
+    ///
+    /// A paragraph boundary is a blank line (content length == 0). If the
+    /// cursor is on a blank line, skip consecutive blanks first, then skip
+    /// non-blank lines backward to reach the previous blank line. If on a
+    /// non-blank line, find the previous blank line directly. Always lands
+    /// at column 0. Falls back to line 0 if no blank line exists above.
+    /// Resets sticky column.
+    pub fn paragraph_backward(&mut self, count: usize, buf: &Buffer, _past_end: bool) {
+        if buf.line_count() == 0 {
+            return;
+        }
+
+        for _ in 0..count {
+            if self.pos.line == 0 {
+                break;
+            }
+
+            let mut i = self.pos.line.saturating_sub(1);
+
+            // If on a blank line, skip consecutive blanks backward first.
+            if buf.line_content_len(self.pos.line).unwrap_or(0) == 0 {
+                while i > 0 && buf.line_content_len(i).unwrap_or(0) == 0 {
+                    i -= 1;
+                }
+            }
+
+            // Skip non-blank lines backward to the previous blank line.
+            // If line 0 is non-blank, we land on line 0 (start of buffer).
+            while i > 0 && buf.line_content_len(i).unwrap_or(0) != 0 {
+                i -= 1;
+            }
+
+            self.pos.line = i;
+        }
+
+        self.pos.col = 0;
+        self.sticky_col = 0;
+    }
+
     // -- Clamping -----------------------------------------------------------
 
     /// Ensure the cursor is within buffer bounds. Call this after the buffer
@@ -1492,5 +1569,131 @@ mod tests {
         // 'a' is on line 0, not reachable from line 1.
         assert!(!c.char_find_backward(&buf, 'a', 1, false));
         assert_eq!(c.col(), 2);
+    }
+
+    // -- Paragraph motions --------------------------------------------------
+
+    #[test]
+    fn paragraph_forward_to_blank_line() {
+        let buf = Buffer::from_text("aaa\nbbb\n\nccc");
+        let mut c = Cursor::new();
+
+        c.paragraph_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(2, 0));
+    }
+
+    #[test]
+    fn paragraph_forward_from_blank_line() {
+        let buf = Buffer::from_text("aaa\n\nbbb\n\nccc");
+        let mut c = Cursor::at(Position::new(1, 0)); // blank line
+
+        c.paragraph_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(3, 0));
+    }
+
+    #[test]
+    fn paragraph_forward_to_end_of_buffer() {
+        let buf = Buffer::from_text("aaa\nbbb\nccc");
+        let mut c = Cursor::new();
+
+        // No blank lines → go to last line.
+        c.paragraph_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(2, 0));
+    }
+
+    #[test]
+    fn paragraph_forward_with_count() {
+        let buf = Buffer::from_text("a\n\nb\n\nc");
+        let mut c = Cursor::new();
+
+        c.paragraph_forward(2, &buf, false);
+        assert_eq!(c.position(), Position::new(3, 0));
+    }
+
+    #[test]
+    fn paragraph_forward_already_at_end() {
+        let buf = Buffer::from_text("hello");
+        let mut c = Cursor::at(Position::new(0, 3));
+
+        c.paragraph_forward(1, &buf, false);
+        assert_eq!(c.line(), 0); // stays on last line
+        assert_eq!(c.col(), 0); // resets to column 0
+    }
+
+    #[test]
+    fn paragraph_forward_consecutive_blanks() {
+        let buf = Buffer::from_text("aaa\n\n\nbbb");
+        let mut c = Cursor::new();
+
+        // From "aaa", } should go to the first blank line.
+        c.paragraph_forward(1, &buf, false);
+        assert_eq!(c.line(), 1);
+    }
+
+    #[test]
+    fn paragraph_backward_to_blank_line() {
+        let buf = Buffer::from_text("aaa\n\nbbb\nccc");
+        let mut c = Cursor::at(Position::new(3, 0)); // on "ccc"
+
+        c.paragraph_backward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(1, 0));
+    }
+
+    #[test]
+    fn paragraph_backward_from_blank_line() {
+        let buf = Buffer::from_text("aaa\n\nbbb\n\nccc");
+        let mut c = Cursor::at(Position::new(3, 0)); // blank line
+
+        c.paragraph_backward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(1, 0));
+    }
+
+    #[test]
+    fn paragraph_backward_to_start_of_buffer() {
+        let buf = Buffer::from_text("aaa\nbbb\nccc");
+        let mut c = Cursor::at(Position::new(2, 0));
+
+        // No blank lines above → go to line 0.
+        c.paragraph_backward(1, &buf, false);
+        assert_eq!(c.position(), Position::ZERO);
+    }
+
+    #[test]
+    fn paragraph_backward_with_count() {
+        let buf = Buffer::from_text("a\n\nb\n\nc");
+        let mut c = Cursor::at(Position::new(4, 0)); // on "c"
+
+        c.paragraph_backward(2, &buf, false);
+        assert_eq!(c.position(), Position::new(1, 0));
+    }
+
+    #[test]
+    fn paragraph_backward_already_at_start() {
+        let buf = Buffer::from_text("hello");
+        let mut c = Cursor::at(Position::new(0, 3));
+
+        c.paragraph_backward(1, &buf, false);
+        assert_eq!(c.position(), Position::ZERO);
+    }
+
+    #[test]
+    fn paragraph_backward_consecutive_blanks() {
+        let buf = Buffer::from_text("aaa\n\n\nbbb");
+        let mut c = Cursor::at(Position::new(3, 0)); // on "bbb"
+
+        // From "bbb", { finds the nearest blank line above (line 2).
+        c.paragraph_backward(1, &buf, false);
+        assert_eq!(c.line(), 2);
+    }
+
+    #[test]
+    fn paragraph_resets_sticky_col() {
+        let buf = Buffer::from_text("hello\n\nworld");
+        let mut c = Cursor::at(Position::new(0, 4)); // col 4
+        assert_eq!(c.sticky_col(), 4);
+
+        c.paragraph_forward(1, &buf, false);
+        assert_eq!(c.col(), 0);
+        assert_eq!(c.sticky_col(), 0);
     }
 }

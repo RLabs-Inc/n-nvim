@@ -108,6 +108,14 @@ enum Pending {
     },
     /// Replace char (`r`). Waiting for the replacement character.
     Replace { count: usize },
+    /// `z` key — waiting for second key (`z` = center, `t` = top, `b` = bottom).
+    Scroll,
+    /// `m` key — waiting for the mark letter (a-z).
+    SetMark,
+    /// Standalone goto-mark (`` ` `` = exact, `'` = line). Waiting for letter.
+    GotoMark { exact: bool },
+    /// Operator + goto-mark (`d'a`, `` d`a ``). Waiting for the mark letter.
+    OperatorGotoMark { op: char, op_count: usize, exact: bool },
 }
 
 // ─── Dot-repeat ─────────────────────────────────────────────────────────────
@@ -210,6 +218,10 @@ struct Editor {
     /// and command lines) from the last paint. Used by `Ctrl+D`/`Ctrl+U`
     /// to compute half-page scroll distance.
     last_text_height: usize,
+
+    /// Buffer-local marks (a-z). Each stores the position where `ma`..`mz`
+    /// was set. Indexed by `ch - 'a'`.
+    marks: [Option<Position>; 26],
 }
 
 impl Editor {
@@ -238,6 +250,7 @@ impl Editor {
             last_change: None,
             dot_replaying: false,
             last_text_height: 24, // Sensible default until first paint.
+            marks: [None; 26],
         }
     }
 
@@ -271,6 +284,7 @@ impl Editor {
             last_change: None,
             dot_replaying: false,
             last_text_height: 24,
+            marks: [None; 26],
         }
     }
 
@@ -462,6 +476,21 @@ impl Editor {
                     self.cursor.goto_line(n.saturating_sub(1), &self.buffer, pe);
                 } else {
                     self.cursor.move_to_last_line(&self.buffer, pe);
+                }
+            }
+
+            // Paragraph motions
+            KeyCode::Char('}') => {
+                self.cursor.paragraph_forward(count, &self.buffer, pe);
+            }
+            KeyCode::Char('{') => {
+                self.cursor.paragraph_backward(count, &self.buffer, pe);
+            }
+
+            // Matching bracket (count is ignored for %)
+            KeyCode::Char('%') => {
+                if let Some(pos) = find_matching_bracket(&self.buffer, self.cursor.position()) {
+                    self.cursor.set_position(pos, &self.buffer, pe);
                 }
             }
 
@@ -741,6 +770,21 @@ impl Editor {
                     return Action::Continue;
                 }
 
+                // Goto-mark prefix: ` and ' need one more key (the mark letter).
+                if key.code == KeyCode::Char('`') || key.code == KeyCode::Char('\'') {
+                    let exact = key.code == KeyCode::Char('`');
+                    // Record this key for dot-repeat.
+                    if self.dot_recording && !self.dot_replaying {
+                        self.dot_keys.push(*key);
+                    }
+                    self.pending = Some(Pending::OperatorGotoMark {
+                        op,
+                        op_count,
+                        exact,
+                    });
+                    return Action::Continue;
+                }
+
                 // `;`/`,` repeat the last character find as an operator motion.
                 if key.code == KeyCode::Char(';') || key.code == KeyCode::Char(',') {
                     if let Some((ch, stored_kind)) = self.last_char_find {
@@ -879,6 +923,61 @@ impl Editor {
                     let effective = op_count * motion_count;
                     if let Some(range) = self.char_find_operator_range(ch, kind, effective) {
                         let action = self.execute_operator(op, range, false);
+                        if self.dot_recording
+                            && !self.dot_replaying
+                            && self.mode != Mode::Insert
+                        {
+                            self.dot_finish();
+                        }
+                        return action;
+                    }
+                }
+
+                self.dot_cancel();
+                Action::Continue
+            }
+            Pending::Scroll => {
+                // `z` + second key: scroll positioning.
+                match key.code {
+                    KeyCode::Char('z') => self.scroll_cursor_center(),
+                    KeyCode::Char('t') | KeyCode::Enter => self.scroll_cursor_top(),
+                    KeyCode::Char('b') => self.scroll_cursor_bottom(),
+                    _ => {} // Unrecognized — cancel silently.
+                }
+                Action::Continue
+            }
+            Pending::SetMark => {
+                // `m` + letter: set a mark at the current position.
+                if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                    self.marks[(ch as u8 - b'a') as usize] = Some(self.cursor.position());
+                }
+                // Non-letter or Escape — cancel silently.
+                Action::Continue
+            }
+            Pending::GotoMark { exact } => {
+                // `` `a `` or `'a`: jump to mark.
+                if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                    self.goto_mark(ch, exact);
+                }
+                // Non-letter or Escape — cancel silently.
+                Action::Continue
+            }
+            Pending::OperatorGotoMark { op, op_count, exact } => {
+                // `d'a`, `` d`a ``: operator to mark position.
+                if key.code == KeyCode::Escape {
+                    self.dot_cancel();
+                    return Action::Continue;
+                }
+
+                // Record mark key for dot-repeat.
+                if self.dot_recording && !self.dot_replaying {
+                    self.dot_keys.push(*key);
+                }
+
+                if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                    if let Some(range) = self.mark_operator_range(ch, exact, op_count) {
+                        let linewise = !exact; // 'a is linewise, `a is charwise
+                        let action = self.execute_operator(op, range, linewise);
                         if self.dot_recording
                             && !self.dot_replaying
                             && self.mode != Mode::Insert
@@ -1102,6 +1201,22 @@ impl Editor {
                 });
             }
 
+            // -- Scroll positioning (z + z/t/b) --
+            KeyCode::Char('z') => {
+                self.pending = Some(Pending::Scroll);
+            }
+
+            // -- Marks --
+            KeyCode::Char('m') => {
+                self.pending = Some(Pending::SetMark);
+            }
+            KeyCode::Char('`') => {
+                self.pending = Some(Pending::GotoMark { exact: true });
+            }
+            KeyCode::Char('\'') => {
+                self.pending = Some(Pending::GotoMark { exact: false });
+            }
+
             // -- Search --
             KeyCode::Char('/') => self.start_search(SearchDirection::Forward),
             KeyCode::Char('?') => self.start_search(SearchDirection::Backward),
@@ -1235,6 +1350,26 @@ impl Editor {
                     c.move_to_first_line(&self.buffer, false);
                 }
                 return self.linewise_range(start, c.position());
+            }
+
+            // Paragraph motions — linewise when used with operators.
+            KeyCode::Char('}') => {
+                c.paragraph_forward(effective, &self.buffer, false);
+                return self.linewise_range(start, c.position());
+            }
+            KeyCode::Char('{') => {
+                c.paragraph_backward(effective, &self.buffer, false);
+                return self.linewise_range(start, c.position());
+            }
+
+            // Matching bracket — inclusive motion.
+            KeyCode::Char('%') => {
+                if let Some(pos) = find_matching_bracket(&self.buffer, start) {
+                    c.set_position(pos, &self.buffer, false);
+                    true
+                } else {
+                    return None;
+                }
             }
 
             _ => return None,
@@ -1720,13 +1855,29 @@ impl Editor {
             }
         }
 
-        // Handle pending char find (f/F/t/T waiting for target char).
+        // Handle pending state (f/F/t/T, goto-mark, scroll).
         if let Some(pending) = self.pending.take() {
-            if let Pending::CharFind { kind, count } = pending {
-                if let KeyCode::Char(ch) = key.code {
-                    self.last_char_find = Some((ch, kind));
-                    self.execute_char_find_motion(ch, kind, count, pe);
+            match pending {
+                Pending::CharFind { kind, count } => {
+                    if let KeyCode::Char(ch) = key.code {
+                        self.last_char_find = Some((ch, kind));
+                        self.execute_char_find_motion(ch, kind, count, pe);
+                    }
                 }
+                Pending::GotoMark { exact } => {
+                    if let KeyCode::Char(ch @ 'a'..='z') = key.code {
+                        self.goto_mark(ch, exact);
+                    }
+                }
+                Pending::Scroll => {
+                    match key.code {
+                        KeyCode::Char('z') => self.scroll_cursor_center(),
+                        KeyCode::Char('t') | KeyCode::Enter => self.scroll_cursor_top(),
+                        KeyCode::Char('b') => self.scroll_cursor_bottom(),
+                        _ => {}
+                    }
+                }
+                _ => {} // Other pending types cancel silently.
             }
             return Action::Continue;
         }
@@ -1820,6 +1971,19 @@ impl Editor {
             // -- Indent / outdent --
             KeyCode::Char('>') => self.visual_indent(),
             KeyCode::Char('<') => self.visual_outdent(),
+
+            // -- Scroll positioning --
+            KeyCode::Char('z') => {
+                self.pending = Some(Pending::Scroll);
+            }
+
+            // -- Goto mark --
+            KeyCode::Char('`') => {
+                self.pending = Some(Pending::GotoMark { exact: true });
+            }
+            KeyCode::Char('\'') => {
+                self.pending = Some(Pending::GotoMark { exact: false });
+            }
 
             _ => {}
         }
@@ -2787,6 +2951,83 @@ impl Editor {
         }
     }
 
+    // ── Scroll positioning ─────────────────────────────────────────────
+
+    /// Scroll so the cursor line is at the center of the viewport (`zz`).
+    const fn scroll_cursor_center(&mut self) {
+        let half = self.last_text_height / 2;
+        let new_top = self.cursor.line().saturating_sub(half);
+        self.view.set_top_line(new_top);
+    }
+
+    /// Scroll so the cursor line is at the top of the viewport (`zt`).
+    const fn scroll_cursor_top(&mut self) {
+        self.view.set_top_line(self.cursor.line());
+    }
+
+    /// Scroll so the cursor line is at the bottom of the viewport (`zb`).
+    const fn scroll_cursor_bottom(&mut self) {
+        let new_top = self.cursor.line().saturating_sub(self.last_text_height.saturating_sub(1));
+        self.view.set_top_line(new_top);
+    }
+
+    // ── Marks ──────────────────────────────────────────────────────────
+
+    /// Jump to a mark position.
+    ///
+    /// If `exact` is true (`` ` `` prefix), jump to the exact position.
+    /// If `exact` is false (`'` prefix), jump to the first non-blank of
+    /// the mark's line.
+    fn goto_mark(&mut self, ch: char, exact: bool) {
+        let idx = (ch as u8 - b'a') as usize;
+        if let Some(pos) = self.marks[idx] {
+            let pe = self.mode.cursor_past_end();
+            if exact {
+                self.cursor.set_position(pos, &self.buffer, pe);
+            } else {
+                self.cursor
+                    .set_position(Position::new(pos.line, 0), &self.buffer, pe);
+                self.cursor.move_to_first_non_blank(&self.buffer, pe);
+            }
+        } else {
+            self.set_error(format!("E20: Mark not set: {ch}"));
+        }
+    }
+
+    /// Compute the operator range for a mark motion.
+    ///
+    /// `'a` produces a linewise range, `` `a `` produces a charwise range.
+    fn mark_operator_range(
+        &self,
+        ch: char,
+        exact: bool,
+        _op_count: usize,
+    ) -> Option<Range> {
+        let idx = (ch as u8 - b'a') as usize;
+        let mark_pos = self.marks[idx]?;
+        let start = self.cursor.position();
+
+        if exact {
+            // `` `a `` — charwise (inclusive).
+            let (from, to) = if start <= mark_pos {
+                (start, mark_pos)
+            } else {
+                (mark_pos, start)
+            };
+            // Extend to include the character at the far end.
+            let end_line_len = self.buffer.line_content_len(to.line).unwrap_or(0);
+            let extended = if to.col < end_line_len {
+                Position::new(to.line, to.col + 1)
+            } else {
+                Position::new(to.line, end_line_len)
+            };
+            Some(Range::new(from, extended))
+        } else {
+            // `'a` — linewise.
+            self.linewise_range(start, mark_pos)
+        }
+    }
+
     // ── Edit commands ────────────────────────────────────────────────────
 
     /// Delete `count` characters at the cursor (`x` / `3x` in Vim).
@@ -2820,6 +3061,63 @@ impl Editor {
         self.history.commit(self.cursor.position());
     }
 
+}
+
+// ─── Bracket matching ───────────────────────────────────────────────────────
+
+/// Find the matching bracket for the character at `pos`.
+///
+/// Supports `()`, `[]`, `{}`. Handles nesting by tracking depth. Scans
+/// forward for open brackets, backward for close brackets. Returns `None`
+/// if the character at `pos` is not a bracket or no match is found.
+fn find_matching_bracket(buf: &Buffer, pos: Position) -> Option<Position> {
+    let ch = buf.char_at(pos)?;
+
+    let (open, close, forward) = match ch {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return None,
+    };
+
+    let rope = buf.rope();
+    let total = rope.len_chars();
+    let start_idx = rope.line_to_char(pos.line) + pos.col;
+
+    let mut depth: i32 = 0;
+
+    if forward {
+        for i in start_idx..total {
+            let c = rope.char(i);
+            if c == open {
+                depth += 1;
+            }
+            if c == close {
+                depth -= 1;
+            }
+            if depth == 0 {
+                return buf.char_idx_to_pos(i);
+            }
+        }
+    } else {
+        for i in (0..=start_idx).rev() {
+            let c = rope.char(i);
+            if c == close {
+                depth += 1;
+            }
+            if c == open {
+                depth -= 1;
+            }
+            if depth == 0 {
+                return buf.char_idx_to_pos(i);
+            }
+        }
+    }
+
+    None
 }
 
 // ─── App implementation ─────────────────────────────────────────────────────
@@ -4494,5 +4792,359 @@ mod tests {
         let mut e = editor_with("    aaa\n    bbb\n    ccc");
         feed(&mut e, &[press('3'), press('<'), press('<')]);
         assert_eq!(e.message.as_deref(), Some("3 lines outdented"));
+    }
+
+    // ── % (matching bracket) ────────────────────────────────────────────
+
+    #[test]
+    fn percent_forward_paren() {
+        let mut e = editor_with("(hello)");
+        feed(&mut e, &[press('%')]);
+        assert_eq!(e.cursor.col(), 6); // on ')'
+    }
+
+    #[test]
+    fn percent_backward_paren() {
+        let mut e = editor_with("(hello)");
+        feed(&mut e, &[press('$'), press('%')]);
+        assert_eq!(e.cursor.col(), 0); // on '('
+    }
+
+    #[test]
+    fn percent_square_brackets() {
+        let mut e = editor_with("[a, b]");
+        feed(&mut e, &[press('%')]);
+        assert_eq!(e.cursor.col(), 5);
+    }
+
+    #[test]
+    fn percent_curly_braces() {
+        let mut e = editor_with("{x}");
+        feed(&mut e, &[press('%')]);
+        assert_eq!(e.cursor.col(), 2);
+    }
+
+    #[test]
+    fn percent_nested() {
+        let mut e = editor_with("((inner))");
+        feed(&mut e, &[press('%')]);
+        assert_eq!(e.cursor.col(), 8); // outer ) at col 8
+    }
+
+    #[test]
+    fn percent_multiline() {
+        let mut e = editor_with("fn main() {\n    x\n}");
+        // Move to '{' on line 0 col 11.
+        feed(&mut e, &[press('$'), press('%')]);
+        // Should jump to '}' on line 2.
+        assert_eq!(e.cursor.line(), 2);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn percent_no_bracket_no_move() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('%')]);
+        // Not on a bracket — cursor stays.
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn percent_unmatched_no_move() {
+        let mut e = editor_with("(hello");
+        feed(&mut e, &[press('%')]);
+        // No matching ')' — cursor stays.
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn d_percent_delete_to_matching() {
+        let mut e = editor_with("(abc)def");
+        feed(&mut e, &[press('d'), press('%')]);
+        assert_eq!(e.buffer.contents(), "def");
+    }
+
+    #[test]
+    fn d_percent_backward() {
+        let mut e = editor_with("(abc)def");
+        // Move to ')' at col 4, d% backward.
+        for _ in 0..4 {
+            e.on_event(&press('l'));
+        }
+        feed(&mut e, &[press('d'), press('%')]);
+        assert_eq!(e.buffer.contents(), "def");
+    }
+
+    #[test]
+    fn v_percent_extends_selection() {
+        let mut e = editor_with("(abc)");
+        feed(&mut e, &[press('v'), press('%')]);
+        assert_eq!(e.cursor.col(), 4); // selection extends to ')'
+        assert!(e.cursor.has_selection());
+    }
+
+    // ── { / } (paragraph motions) ───────────────────────────────────────
+
+    #[test]
+    fn close_brace_next_blank_line() {
+        let mut e = editor_with("aaa\nbbb\n\nccc");
+        feed(&mut e, &[press('}')]);
+        assert_eq!(e.cursor.line(), 2);
+        assert_eq!(e.cursor.col(), 0);
+    }
+
+    #[test]
+    fn open_brace_prev_blank_line() {
+        let mut e = editor_with("aaa\n\nbbb\nccc");
+        // Start on last line.
+        feed(&mut e, &[press('G'), press('{')]);
+        assert_eq!(e.cursor.line(), 1);
+    }
+
+    #[test]
+    fn close_brace_from_blank_line() {
+        let mut e = editor_with("aaa\n\nbbb\n\nccc");
+        // Move to blank line 1, then }.
+        feed(&mut e, &[press('j'), press('}')]);
+        assert_eq!(e.cursor.line(), 3); // next blank line
+    }
+
+    #[test]
+    fn open_brace_from_blank_line() {
+        let mut e = editor_with("aaa\n\nbbb\n\nccc");
+        // Move to blank line 3.
+        feed(&mut e, &[press('3'), press('j'), press('{')]);
+        assert_eq!(e.cursor.line(), 1); // previous blank line
+    }
+
+    #[test]
+    fn close_brace_no_blank_goes_to_end() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('}')]);
+        assert_eq!(e.cursor.line(), 2); // last line
+    }
+
+    #[test]
+    fn open_brace_no_blank_goes_to_start() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        feed(&mut e, &[press('G'), press('{')]);
+        assert_eq!(e.cursor.line(), 0);
+    }
+
+    #[test]
+    fn close_brace_with_count() {
+        let mut e = editor_with("a\n\nb\n\nc");
+        feed(&mut e, &[press('2'), press('}')]);
+        assert_eq!(e.cursor.line(), 3); // second blank line
+    }
+
+    #[test]
+    fn open_brace_with_count() {
+        let mut e = editor_with("a\n\nb\n\nc");
+        feed(&mut e, &[press('G'), press('2'), press('{')]);
+        assert_eq!(e.cursor.line(), 1); // second blank line back
+    }
+
+    #[test]
+    fn d_close_brace_linewise() {
+        let mut e = editor_with("aaa\nbbb\n\nccc");
+        feed(&mut e, &[press('d'), press('}')]);
+        // d} from line 0 deletes through line 2 (the blank line).
+        assert_eq!(e.buffer.contents(), "ccc");
+    }
+
+    #[test]
+    fn v_close_brace_selection() {
+        let mut e = editor_with("aaa\nbbb\n\nccc");
+        feed(&mut e, &[press('v'), press('}')]);
+        // Visual selection extends to the blank line.
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    // ── zz / zt / zb (scroll positioning) ───────────────────────────────
+
+    #[test]
+    fn zz_centers_cursor() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no");
+        e.last_text_height = 10;
+        e.view.set_top_line(0);
+        // Move cursor to line 7.
+        feed(&mut e, &[press('7'), press('j')]);
+        feed(&mut e, &[press('z'), press('z')]);
+        // Center: top_line = 7 - 5 = 2.
+        assert_eq!(e.view.top_line(), 2);
+    }
+
+    #[test]
+    fn zt_puts_cursor_at_top() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
+        e.last_text_height = 5;
+        e.view.set_top_line(0);
+        feed(&mut e, &[press('4'), press('j')]);
+        feed(&mut e, &[press('z'), press('t')]);
+        assert_eq!(e.view.top_line(), 4);
+    }
+
+    #[test]
+    fn zb_puts_cursor_at_bottom() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
+        e.last_text_height = 5;
+        feed(&mut e, &[press('7'), press('j')]);
+        feed(&mut e, &[press('z'), press('b')]);
+        // Bottom: top_line = 7 - 4 = 3.
+        assert_eq!(e.view.top_line(), 3);
+    }
+
+    #[test]
+    fn z_escape_cancels() {
+        let mut e = editor_with("hello");
+        e.view.set_top_line(0);
+        feed(&mut e, &[press('z'), esc()]);
+        // Nothing changed.
+        assert_eq!(e.view.top_line(), 0);
+    }
+
+    #[test]
+    fn z_enter_same_as_zt() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
+        e.last_text_height = 5;
+        e.view.set_top_line(0);
+        feed(&mut e, &[press('4'), press('j')]);
+        feed(&mut e, &[press('z'), enter()]);
+        assert_eq!(e.view.top_line(), 4);
+    }
+
+    #[test]
+    fn zz_with_cursor_near_top() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf");
+        e.last_text_height = 6;
+        e.view.set_top_line(0);
+        // Cursor on line 1 — center would want top_line = -2 → clamps to 0.
+        feed(&mut e, &[press('j'), press('z'), press('z')]);
+        assert_eq!(e.view.top_line(), 0);
+    }
+
+    // ── Marks (m / ` / ') ──────────────────────────────────────────────
+
+    #[test]
+    fn set_and_goto_mark_exact() {
+        let mut e = editor_with("hello\nworld\nfoo");
+        // Move to line 1, col 3, set mark 'a'.
+        feed(&mut e, &[press('j'), press('l'), press('l'), press('l')]);
+        feed(&mut e, &[press('m'), press('a')]);
+        // Move elsewhere.
+        feed(&mut e, &[press('g')]);
+        assert_eq!(e.cursor.line(), 0);
+        // `a jumps back to exact position.
+        feed(&mut e, &[press('`'), press('a')]);
+        assert_eq!(e.cursor.line(), 1);
+        assert_eq!(e.cursor.col(), 3);
+    }
+
+    #[test]
+    fn set_and_goto_mark_line() {
+        let mut e = editor_with("  hello\n  world\n  foo");
+        // Move to line 1, col 4, set mark 'a'.
+        feed(
+            &mut e,
+            &[press('j'), press('l'), press('l'), press('l'), press('l')],
+        );
+        feed(&mut e, &[press('m'), press('a')]);
+        // Move elsewhere.
+        feed(&mut e, &[press('g')]);
+        // 'a jumps to first non-blank of mark's line.
+        feed(&mut e, &[press('\''), press('a')]);
+        assert_eq!(e.cursor.line(), 1);
+        assert_eq!(e.cursor.col(), 2); // first non-blank
+    }
+
+    #[test]
+    fn goto_unset_mark_shows_error() {
+        let mut e = editor_with("hello");
+        feed(&mut e, &[press('`'), press('b')]);
+        assert!(e.message.is_some());
+        assert!(e.message_is_error);
+        assert!(e.message.as_deref().unwrap().contains("Mark not set"));
+    }
+
+    #[test]
+    fn multiple_marks() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // Set mark 'a' at line 0, mark 'b' at line 2.
+        feed(&mut e, &[press('m'), press('a')]);
+        feed(&mut e, &[press('G'), press('m'), press('b')]);
+        // Jump to 'a'.
+        feed(&mut e, &[press('`'), press('a')]);
+        assert_eq!(e.cursor.line(), 0);
+        // Jump to 'b'.
+        feed(&mut e, &[press('`'), press('b')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn d_tick_mark_linewise() {
+        let mut e = editor_with("aaa\nbbb\nccc\nddd");
+        // Set mark 'a' at line 0.
+        feed(&mut e, &[press('m'), press('a')]);
+        // Move to line 2, d'a → delete lines 0-2 (linewise to mark line).
+        feed(&mut e, &[press('2'), press('j')]);
+        feed(&mut e, &[press('d'), press('\''), press('a')]);
+        assert_eq!(e.buffer.contents(), "ddd");
+    }
+
+    #[test]
+    fn d_backtick_mark_charwise() {
+        let mut e = editor_with("hello world");
+        // Set mark 'a' at col 0.
+        feed(&mut e, &[press('m'), press('a')]);
+        // Move to col 5 ('_'), d`a → delete from col 0 to col 5 (charwise inclusive).
+        feed(&mut e, &[press('4'), press('l')]);
+        feed(&mut e, &[press('d'), press('`'), press('a')]);
+        assert_eq!(e.buffer.contents(), " world");
+    }
+
+    #[test]
+    fn mark_persists_across_edits() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // Set mark on line 2.
+        feed(&mut e, &[press('G'), press('m'), press('a')]);
+        // Go to line 0, insert text.
+        feed(&mut e, &[press('g'), press('i'), press('x'), esc()]);
+        // `a should still go to line 2 (mark position unchanged).
+        feed(&mut e, &[press('`'), press('a')]);
+        assert_eq!(e.cursor.line(), 2);
+    }
+
+    #[test]
+    fn mark_in_visual_mode() {
+        let mut e = editor_with("aaa\nbbb\nccc");
+        // Set mark 'a' at line 0.
+        feed(&mut e, &[press('m'), press('a')]);
+        // Go to line 2, enter visual mode, `a extends selection to mark.
+        feed(&mut e, &[press('G'), press('v'), press('`'), press('a')]);
+        assert_eq!(e.cursor.line(), 0);
+        assert!(e.cursor.has_selection());
+    }
+
+    #[test]
+    fn m_non_letter_cancels() {
+        let mut e = editor_with("hello");
+        // m + non-letter should not panic or set any mark.
+        feed(&mut e, &[press('m'), press('1')]);
+        assert_eq!(e.cursor.col(), 0);
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn zz_in_visual_mode() {
+        let mut e = editor_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no");
+        e.last_text_height = 10;
+        e.view.set_top_line(0);
+        // Enter visual mode, move to line 7, zz.
+        feed(&mut e, &[press('v'), press('7'), press('j')]);
+        feed(&mut e, &[press('z'), press('z')]);
+        assert_eq!(e.view.top_line(), 2);
+        // Still in visual mode with selection.
+        assert!(matches!(e.mode, Mode::Visual(_)));
     }
 }
