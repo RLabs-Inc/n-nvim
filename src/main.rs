@@ -48,20 +48,25 @@ use n_term::terminal::Size;
 
 /// Multi-key command state for operator-pending mode.
 ///
-/// Vim's grammar: `operator [motion | text-object]`. After pressing an
-/// operator key (`d`, `c`, `y`), we enter operator-pending mode and wait for:
+/// Vim's grammar: `[count] operator [count] [motion | text-object]`.
+/// After pressing an operator key (`d`, `c`, `y`), we enter operator-pending
+/// mode and wait for:
 ///
 /// - The same key again → line operation (`dd`, `yy`, `cc`)
 /// - A motion key → operate from cursor to motion target (`dw`, `d$`, `cw`)
 /// - `i`/`a` + object key → operate on a text object (`diw`, `ci"`, `ya(`)
+///
+/// The `count` field stores the operator's count (typed before the operator).
+/// A second count can be typed before the motion; the effective count is
+/// `op_count * motion_count` (e.g., `2d3w` deletes 6 words).
 #[derive(Clone, Copy)]
 enum Pending {
     /// Operator pressed (`d`, `c`, `y`). Waiting for motion, text-object
     /// prefix, or the same key for a line operation.
-    Operator(char),
+    Operator { op: char, count: usize },
     /// Operator + text-object prefix (`di`, `ca`, `yi`). Waiting for the
     /// object key (`w`, `"`, `(`, etc.).
-    TextObject { op: char, inner: bool },
+    TextObject { op: char, inner: bool, count: usize },
 }
 
 // ─── Editor ─────────────────────────────────────────────────────────────────
@@ -82,6 +87,12 @@ struct Editor {
     /// pressed, this tracks the pending state until the command is completed
     /// or cancelled.
     pending: Option<Pending>,
+
+    /// Numeric count accumulator. Built from digit keystrokes (1-9 start,
+    /// then 0-9 extend). `None` means no count entered. Consumed by the
+    /// next motion, operator, or command — `take_count()` returns the value
+    /// and resets to `None`.
+    count: Option<usize>,
 
     /// Screen position of the cursor from the last paint, used by the
     /// event loop to position the hardware terminal cursor.
@@ -122,6 +133,7 @@ impl Editor {
             mode: Mode::Normal,
             history: History::new(),
             pending: None,
+            count: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
             register: Register::new(),
@@ -147,6 +159,7 @@ impl Editor {
             mode: Mode::Normal,
             history: History::new(),
             pending: None,
+            count: None,
             cursor_screen: None,
             cmdline: CommandLine::new(),
             register: Register::new(),
@@ -176,30 +189,56 @@ impl Editor {
         self.message_is_error = false;
     }
 
+    // ── Count accumulation ─────────────────────────────────────────────
+
+    /// Take the accumulated count and reset. Returns `None` if no count was
+    /// entered, `Some(n)` if digits were pressed.
+    const fn take_raw_count(&mut self) -> Option<usize> {
+        self.count.take()
+    }
+
+    /// Take the accumulated count, defaulting to 1. Use when the count is
+    /// simply a repeat multiplier.
+    fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1)
+    }
+
+    /// Push a digit onto the count accumulator (0-9).
+    fn push_count_digit(&mut self, digit: u8) {
+        let current = self.count.unwrap_or(0);
+        // Cap at a reasonable maximum to prevent overflow from mashing digits.
+        self.count = Some(current.saturating_mul(10).saturating_add(digit as usize));
+    }
+
     // ── Shared motion dispatch ──────────────────────────────────────────
 
     /// Apply a cursor motion from the given key. Returns `true` if the key
     /// was consumed as a motion, `false` if it wasn't a recognized motion.
     ///
+    /// `raw_count` is `None` when no digits were pressed, `Some(n)` otherwise.
+    /// Most motions use the count as a repeat multiplier (default 1), but
+    /// `G` and `g` treat it as a 1-indexed line number.
+    ///
     /// This is shared between normal and visual modes so both can move the
     /// cursor with the same keys without duplicating the dispatch table.
-    fn apply_motion(&mut self, code: KeyCode, pe: bool) -> bool {
+    fn apply_motion(&mut self, code: KeyCode, pe: bool, raw_count: Option<usize>) -> bool {
+        let count = raw_count.unwrap_or(1);
         match code {
             // Basic movement
             KeyCode::Char('h') | KeyCode::Left => {
-                self.cursor.move_left(1, &self.buffer, pe);
+                self.cursor.move_left(count, &self.buffer, pe);
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.cursor.move_right(1, &self.buffer, pe);
+                self.cursor.move_right(count, &self.buffer, pe);
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.cursor.move_down(1, &self.buffer, pe);
+                self.cursor.move_down(count, &self.buffer, pe);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.cursor.move_up(1, &self.buffer, pe);
+                self.cursor.move_up(count, &self.buffer, pe);
             }
 
-            // Line motions
+            // Line motions (count doesn't affect these)
             KeyCode::Char('0') | KeyCode::Home => {
                 self.cursor.move_to_line_start();
             }
@@ -211,16 +250,28 @@ impl Editor {
             }
 
             // Word motions
-            KeyCode::Char('w') => self.cursor.word_forward(1, &self.buffer, pe),
-            KeyCode::Char('b') => self.cursor.word_backward(1, &self.buffer, pe),
-            KeyCode::Char('e') => self.cursor.word_end_forward(1, &self.buffer, pe),
-            KeyCode::Char('W') => self.cursor.big_word_forward(1, &self.buffer, pe),
-            KeyCode::Char('B') => self.cursor.big_word_backward(1, &self.buffer, pe),
-            KeyCode::Char('E') => self.cursor.big_word_end_forward(1, &self.buffer, pe),
+            KeyCode::Char('w') => self.cursor.word_forward(count, &self.buffer, pe),
+            KeyCode::Char('b') => self.cursor.word_backward(count, &self.buffer, pe),
+            KeyCode::Char('e') => self.cursor.word_end_forward(count, &self.buffer, pe),
+            KeyCode::Char('W') => self.cursor.big_word_forward(count, &self.buffer, pe),
+            KeyCode::Char('B') => self.cursor.big_word_backward(count, &self.buffer, pe),
+            KeyCode::Char('E') => self.cursor.big_word_end_forward(count, &self.buffer, pe),
 
-            // File motions
-            KeyCode::Char('g') => self.cursor.move_to_first_line(&self.buffer, pe),
-            KeyCode::Char('G') => self.cursor.move_to_last_line(&self.buffer, pe),
+            // File motions: count = line number (1-indexed), no count = first/last
+            KeyCode::Char('g') => {
+                if let Some(n) = raw_count {
+                    self.cursor.goto_line(n.saturating_sub(1), &self.buffer, pe);
+                } else {
+                    self.cursor.move_to_first_line(&self.buffer, pe);
+                }
+            }
+            KeyCode::Char('G') => {
+                if let Some(n) = raw_count {
+                    self.cursor.goto_line(n.saturating_sub(1), &self.buffer, pe);
+                } else {
+                    self.cursor.move_to_last_line(&self.buffer, pe);
+                }
+            }
 
             _ => return false,
         }
@@ -235,19 +286,29 @@ impl Editor {
 
         let pe = self.mode.cursor_past_end();
 
-        // Ctrl combinations handled first — these cancel any pending state.
+        // Ctrl combinations cancel pending state and consume the count.
         if key.modifiers.contains(Modifiers::CTRL) {
             match key.code {
                 KeyCode::Char('c') => return Action::Quit,
                 KeyCode::Char('r') => {
                     self.pending = None;
-                    if let Some(pos) = self.history.redo(&mut self.buffer) {
+                    let count = self.take_count();
+                    let mut last_pos = None;
+                    for _ in 0..count {
+                        if let Some(pos) = self.history.redo(&mut self.buffer) {
+                            last_pos = Some(pos);
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(pos) = last_pos {
                         self.cursor.set_position(pos, &self.buffer, pe);
                     }
                     return Action::Continue;
                 }
                 KeyCode::Char('v') => {
                     self.pending = None;
+                    self.count = None;
                     self.cursor.set_anchor();
                     self.mode = Mode::Visual(VisualKind::Block);
                     return Action::Continue;
@@ -257,11 +318,30 @@ impl Editor {
         }
 
         // Handle pending operator state (multi-key commands).
+        // Digits can be pressed between operator and motion (e.g., `d3w`),
+        // so digit accumulation also happens inside handle_pending.
         if let Some(pending) = self.pending.take() {
             return self.handle_pending(pending, key);
         }
 
-        self.handle_normal_key(key, pe)
+        // Digit accumulation for counts.
+        // 1-9 start a new count. 0 extends an existing count but is
+        // move-to-line-start when no count is being built.
+        match key.code {
+            KeyCode::Char(d @ '1'..='9') => {
+                self.push_count_digit(d as u8 - b'0');
+                return Action::Continue;
+            }
+            KeyCode::Char('0') if self.count.is_some() => {
+                self.push_count_digit(0);
+                return Action::Continue;
+            }
+            _ => {}
+        }
+
+        // Take the accumulated count for the command that follows.
+        let raw_count = self.take_raw_count();
+        self.handle_normal_key(key, pe, raw_count)
     }
 
     /// Dispatch a keypress in operator-pending mode.
@@ -269,40 +349,77 @@ impl Editor {
     /// After an operator (`d`, `c`, `y`) is pressed, the next key(s) determine
     /// what to operate on: a motion, a text object, or the same key for a line
     /// operation.
+    ///
+    /// Digits can appear between operator and motion (e.g., `d3w`). These build
+    /// a "motion count" that multiplies with the operator's count.
     fn handle_pending(&mut self, pending: Pending, key: &KeyEvent) -> Action {
         match pending {
-            Pending::Operator(op) => {
-                // Escape cancels the pending operator.
+            Pending::Operator { op, count: op_count } => {
+                // Escape cancels the pending operator and any motion count.
                 if key.code == KeyCode::Escape {
+                    self.count = None;
                     return Action::Continue;
+                }
+
+                // Digit accumulation for motion count (e.g., the `3` in `d3w`).
+                match key.code {
+                    KeyCode::Char(d @ '1'..='9') => {
+                        self.push_count_digit(d as u8 - b'0');
+                        self.pending = Some(Pending::Operator { op, count: op_count });
+                        return Action::Continue;
+                    }
+                    KeyCode::Char('0') if self.count.is_some() => {
+                        self.push_count_digit(0);
+                        self.pending = Some(Pending::Operator { op, count: op_count });
+                        return Action::Continue;
+                    }
+                    _ => {}
                 }
 
                 // Same key = line operation (dd, yy, cc).
+                // Effective count: op_count * motion_count.
                 if key.code == KeyCode::Char(op) {
-                    return self.operator_line(op);
+                    let motion_count = self.take_count();
+                    let effective = op_count * motion_count;
+                    return self.operator_line(op, effective);
                 }
 
                 // Text object prefix: i = inner, a = around.
+                // The operator count carries forward.
                 if key.code == KeyCode::Char('i') {
-                    self.pending = Some(Pending::TextObject { op, inner: true });
+                    self.pending = Some(Pending::TextObject {
+                        op,
+                        inner: true,
+                        count: op_count,
+                    });
                     return Action::Continue;
                 }
                 if key.code == KeyCode::Char('a') {
-                    self.pending = Some(Pending::TextObject { op, inner: false });
+                    self.pending = Some(Pending::TextObject {
+                        op,
+                        inner: false,
+                        count: op_count,
+                    });
                     return Action::Continue;
                 }
 
-                // Try as a motion.
-                if let Some(range) = self.operator_motion_range(key.code, op) {
+                // Try as a motion. The motion's own count multiplies with
+                // the operator count, except for g/G where it's a line number.
+                let raw_motion_count = self.take_raw_count();
+                let effective = op_count * raw_motion_count.unwrap_or(1);
+                if let Some(range) =
+                    self.operator_motion_range(key.code, op, effective, raw_motion_count)
+                {
                     return self.apply_operator(op, range, false);
                 }
 
                 // Unrecognized key — cancel the operator silently.
                 Action::Continue
             }
-            Pending::TextObject { op, inner } => {
+            Pending::TextObject { op, inner, count: _op_count } => {
                 // Escape cancels.
                 if key.code == KeyCode::Escape {
+                    self.count = None;
                     return Action::Continue;
                 }
 
@@ -317,9 +434,19 @@ impl Editor {
     }
 
     /// Process a single normal-mode key (no pending operator).
-    fn handle_normal_key(&mut self, key: &KeyEvent, pe: bool) -> Action {
+    ///
+    /// `raw_count` is the accumulated numeric prefix — `None` if no digits
+    /// were pressed, `Some(n)` otherwise.
+    fn handle_normal_key(
+        &mut self,
+        key: &KeyEvent,
+        pe: bool,
+        raw_count: Option<usize>,
+    ) -> Action {
+        let count = raw_count.unwrap_or(1);
+
         // Try motion keys first (shared with visual mode).
-        if self.apply_motion(key.code, pe) {
+        if self.apply_motion(key.code, pe, raw_count) {
             return Action::Continue;
         }
 
@@ -341,6 +468,8 @@ impl Editor {
             }
 
             // -- Mode transitions (all begin a history transaction) --
+            // (Count for i/a/A/I/o/O would repeat the insert on exit — complex,
+            // deferred to dot-repeat session.)
             KeyCode::Char('i') => {
                 self.history.begin(self.cursor.position());
                 self.mode = Mode::Insert;
@@ -363,30 +492,38 @@ impl Editor {
             KeyCode::Char('o') => self.open_line_below(),
             KeyCode::Char('O') => self.open_line_above(),
 
-            // -- Operators (enter pending mode) --
+            // -- Operators (enter pending mode with count) --
             KeyCode::Char('d') => {
-                self.pending = Some(Pending::Operator('d'));
+                self.pending = Some(Pending::Operator { op: 'd', count });
             }
             KeyCode::Char('c') => {
-                self.pending = Some(Pending::Operator('c'));
+                self.pending = Some(Pending::Operator { op: 'c', count });
             }
             KeyCode::Char('y') => {
-                self.pending = Some(Pending::Operator('y'));
+                self.pending = Some(Pending::Operator { op: 'y', count });
             }
-            KeyCode::Char('x') => self.delete_char_at_cursor(),
+            KeyCode::Char('x') => self.delete_chars_at_cursor(count),
 
             // -- Yank line shortcut --
             KeyCode::Char('Y') => {
-                self.operator_line('y');
+                self.operator_line('y', count);
             }
 
             // -- Paste --
-            KeyCode::Char('p') => self.paste_after(),
-            KeyCode::Char('P') => self.paste_before(),
+            KeyCode::Char('p') => self.paste_after(count),
+            KeyCode::Char('P') => self.paste_before(count),
 
-            // -- Undo/redo --
+            // -- Undo --
             KeyCode::Char('u') => {
-                if let Some(pos) = self.history.undo(&mut self.buffer) {
+                let mut last_pos = None;
+                for _ in 0..count {
+                    if let Some(pos) = self.history.undo(&mut self.buffer) {
+                        last_pos = Some(pos);
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(pos) = last_pos {
                     self.cursor.set_position(pos, &self.buffer, pe);
                 }
             }
@@ -394,8 +531,16 @@ impl Editor {
             // -- Search --
             KeyCode::Char('/') => self.start_search(SearchDirection::Forward),
             KeyCode::Char('?') => self.start_search(SearchDirection::Backward),
-            KeyCode::Char('n') => self.search_next(),
-            KeyCode::Char('N') => self.search_prev(),
+            KeyCode::Char('n') => {
+                for _ in 0..count {
+                    self.search_next();
+                }
+            }
+            KeyCode::Char('N') => {
+                for _ in 0..count {
+                    self.search_prev();
+                }
+            }
             KeyCode::Char('*') => {
                 self.search_word_under_cursor(SearchDirection::Forward);
             }
@@ -416,7 +561,18 @@ impl Editor {
     /// Uses a temporary cursor clone to compute where the motion would go,
     /// then builds a half-open range. Handles exclusive/inclusive motion types
     /// and linewise motions.
-    fn operator_motion_range(&self, code: KeyCode, op: char) -> Option<Range> {
+    ///
+    /// `effective` is the pre-multiplied count (`op_count * motion_count`) for
+    /// most motions. `raw_motion_count` preserves whether the user typed a
+    /// motion count, needed by `G`/`g` where the count is a line number.
+    #[allow(clippy::too_many_lines)]
+    fn operator_motion_range(
+        &self,
+        code: KeyCode,
+        op: char,
+        effective: usize,
+        raw_motion_count: Option<usize>,
+    ) -> Option<Range> {
         let start = self.cursor.position();
         let mut c = self.cursor.clone();
 
@@ -424,11 +580,11 @@ impl Editor {
         let inclusive = match code {
             // Exclusive motions — range end IS the target position.
             KeyCode::Char('h') | KeyCode::Left => {
-                c.move_left(1, &self.buffer, false);
+                c.move_left(effective, &self.buffer, false);
                 false
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                c.move_right(1, &self.buffer, false);
+                c.move_right(effective, &self.buffer, false);
                 false
             }
             KeyCode::Char('0') | KeyCode::Home => {
@@ -440,40 +596,40 @@ impl Editor {
                 false
             }
             KeyCode::Char('b') => {
-                c.word_backward(1, &self.buffer, false);
+                c.word_backward(effective, &self.buffer, false);
                 false
             }
             KeyCode::Char('B') => {
-                c.big_word_backward(1, &self.buffer, false);
+                c.big_word_backward(effective, &self.buffer, false);
                 false
             }
 
             // Special case: cw/cW act like ce/cE (Vim compatibility).
             KeyCode::Char('w') if op == 'c' => {
-                c.word_end_forward(1, &self.buffer, false);
+                c.word_end_forward(effective, &self.buffer, false);
                 true
             }
             KeyCode::Char('W') if op == 'c' => {
-                c.big_word_end_forward(1, &self.buffer, false);
+                c.big_word_end_forward(effective, &self.buffer, false);
                 true
             }
 
             KeyCode::Char('w') => {
-                c.word_forward(1, &self.buffer, false);
+                c.word_forward(effective, &self.buffer, false);
                 false
             }
             KeyCode::Char('W') => {
-                c.big_word_forward(1, &self.buffer, false);
+                c.big_word_forward(effective, &self.buffer, false);
                 false
             }
 
             // Inclusive motions — range extends to include the target char.
             KeyCode::Char('e') => {
-                c.word_end_forward(1, &self.buffer, false);
+                c.word_end_forward(effective, &self.buffer, false);
                 true
             }
             KeyCode::Char('E') => {
-                c.big_word_end_forward(1, &self.buffer, false);
+                c.big_word_end_forward(effective, &self.buffer, false);
                 true
             }
             KeyCode::Char('$') | KeyCode::End => {
@@ -483,19 +639,27 @@ impl Editor {
 
             // Linewise motions — expand to full lines.
             KeyCode::Char('j') | KeyCode::Down => {
-                c.move_down(1, &self.buffer, false);
+                c.move_down(effective, &self.buffer, false);
                 return self.linewise_range(start, c.position());
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                c.move_up(1, &self.buffer, false);
+                c.move_up(effective, &self.buffer, false);
                 return self.linewise_range(start, c.position());
             }
             KeyCode::Char('G') => {
-                c.move_to_last_line(&self.buffer, false);
+                if let Some(n) = raw_motion_count {
+                    c.goto_line(n.saturating_sub(1), &self.buffer, false);
+                } else {
+                    c.move_to_last_line(&self.buffer, false);
+                }
                 return self.linewise_range(start, c.position());
             }
             KeyCode::Char('g') => {
-                c.move_to_first_line(&self.buffer, false);
+                if let Some(n) = raw_motion_count {
+                    c.goto_line(n.saturating_sub(1), &self.buffer, false);
+                } else {
+                    c.move_to_first_line(&self.buffer, false);
+                }
                 return self.linewise_range(start, c.position());
             }
 
@@ -647,8 +811,12 @@ impl Editor {
         Action::Continue
     }
 
-    /// Apply a line-wise operator (dd, yy, cc).
-    fn operator_line(&mut self, op: char) -> Action {
+    /// Apply a line-wise operator (dd, yy, cc) to `count` lines.
+    ///
+    /// `3dd` deletes 3 lines starting from the cursor's line. If there are
+    /// fewer than `count` lines remaining, all lines from the cursor to the
+    /// end of the buffer are affected.
+    fn operator_line(&mut self, op: char, count: usize) -> Action {
         if self.buffer.is_empty() {
             return Action::Continue;
         }
@@ -656,22 +824,29 @@ impl Editor {
         let line = self.cursor.line();
         let line_count = self.buffer.line_count();
 
-        // Compute the line range (same logic as delete_current_line).
-        let range = if line_count == 1 {
-            let len = self.buffer.line_len(0).unwrap_or(0);
-            if len == 0 {
-                return Action::Continue;
-            }
-            Range::new(Position::ZERO, Position::new(0, len))
-        } else if line + 1 < line_count {
-            Range::new(Position::new(line, 0), Position::new(line + 1, 0))
-        } else {
+        // The exclusive end line (first line NOT included).
+        let end_line = (line + count).min(line_count);
+
+        let range = if end_line < line_count {
+            // Normal case: lines [line, end_line) with trailing newlines.
+            Range::new(Position::new(line, 0), Position::new(end_line, 0))
+        } else if line > 0 {
+            // Deleting through end of buffer: eat the preceding newline.
             let prev_len = self.buffer.line_content_len(line - 1).unwrap_or(0);
-            let this_len = self.buffer.line_len(line).unwrap_or(0);
+            let last = line_count - 1;
+            let last_len = self.buffer.line_len(last).unwrap_or(0);
             Range::new(
                 Position::new(line - 1, prev_len),
-                Position::new(line, this_len),
+                Position::new(last, last_len),
             )
+        } else {
+            // Deleting entire buffer.
+            let last = line_count - 1;
+            let last_len = self.buffer.line_len(last).unwrap_or(0);
+            if last_len == 0 {
+                return Action::Continue;
+            }
+            Range::new(Position::ZERO, Position::new(last, last_len))
         };
 
         self.apply_operator(op, range, true)
@@ -932,8 +1107,9 @@ impl Editor {
             return Action::Continue;
         };
 
-        // Ctrl combinations.
+        // Ctrl combinations cancel any accumulated count.
         if key.modifiers.contains(Modifiers::CTRL) {
+            self.count = None;
             match key.code {
                 KeyCode::Char('c') => return Action::Quit,
                 KeyCode::Char('v') => {
@@ -950,9 +1126,24 @@ impl Editor {
             }
         }
 
+        // Digit accumulation (same logic as normal mode).
+        match key.code {
+            KeyCode::Char(d @ '1'..='9') => {
+                self.push_count_digit(d as u8 - b'0');
+                return Action::Continue;
+            }
+            KeyCode::Char('0') if self.count.is_some() => {
+                self.push_count_digit(0);
+                return Action::Continue;
+            }
+            _ => {}
+        }
+
+        let raw_count = self.take_raw_count();
+
         // Try motion keys (shared with normal mode). Motions move the
         // cursor but leave the anchor in place, extending the selection.
-        if self.apply_motion(key.code, pe) {
+        if self.apply_motion(key.code, pe, raw_count) {
             return Action::Continue;
         }
 
@@ -1443,13 +1634,16 @@ impl Editor {
 
     // ── Paste commands ──────────────────────────────────────────────────
 
-    /// Paste after the cursor (`p` in normal mode).
-    fn paste_after(&mut self) {
-        if self.register.is_empty() {
+    /// Paste after the cursor (`p` / `3p` in normal mode).
+    ///
+    /// With count, the register content is pasted `count` times.
+    fn paste_after(&mut self, count: usize) {
+        if self.register.is_empty() || count == 0 {
             return;
         }
 
-        let text = self.register.content().to_string();
+        let single = self.register.content().to_string();
+        let text = single.repeat(count);
         let kind = self.register.kind();
 
         let pos = match kind {
@@ -1507,13 +1701,16 @@ impl Editor {
         self.history.commit(self.cursor.position());
     }
 
-    /// Paste before the cursor (`P` in normal mode).
-    fn paste_before(&mut self) {
-        if self.register.is_empty() {
+    /// Paste before the cursor (`P` / `3P` in normal mode).
+    ///
+    /// With count, the register content is pasted `count` times.
+    fn paste_before(&mut self, count: usize) {
+        if self.register.is_empty() || count == 0 {
             return;
         }
 
-        let text = self.register.content().to_string();
+        let single = self.register.content().to_string();
+        let text = single.repeat(count);
         let kind = self.register.kind();
 
         let pos = match kind {
@@ -1565,11 +1762,11 @@ impl Editor {
 
     // ── Edit commands ────────────────────────────────────────────────────
 
-    /// Delete the character under the cursor (`x` in Vim).
+    /// Delete `count` characters at the cursor (`x` / `3x` in Vim).
     ///
-    /// Stores the deleted character in the unnamed register (Vim behavior:
-    /// every delete is also a cut).
-    fn delete_char_at_cursor(&mut self) {
+    /// Stores the deleted text in the unnamed register (Vim behavior:
+    /// every delete is also a cut). Does not cross line boundaries.
+    fn delete_chars_at_cursor(&mut self, count: usize) {
         let pe = self.mode.cursor_past_end();
         let pos = self.cursor.position();
         let line_len = self.buffer.line_content_len(pos.line).unwrap_or(0);
@@ -1578,14 +1775,20 @@ impl Editor {
             return;
         }
 
-        let ch = self.buffer.char_at(pos).unwrap();
-        let text = ch.to_string();
-        let to = Position::new(pos.line, pos.col + 1);
+        let end_col = (pos.col + count).min(line_len);
+        let to = Position::new(pos.line, end_col);
+        let range = Range::new(pos, to);
+
+        let text = self
+            .buffer
+            .slice(range)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
 
         self.register.yank(text.clone(), RegisterKind::Char);
         self.history.begin(pos);
         self.history.record_delete(pos, &text);
-        self.buffer.delete(Range::new(pos, to));
+        self.buffer.delete(range);
         self.cursor.clamp(&self.buffer, pe);
         self.history.commit(self.cursor.position());
     }
