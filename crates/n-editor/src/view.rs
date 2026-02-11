@@ -624,7 +624,7 @@ impl View {
 /// Render a right-aligned line number in the gutter.
 ///
 /// When `is_cursor_line` is true, the number is rendered at normal brightness
-/// (CursorLineNr highlight group in Vim). Other lines are DIM.
+/// (`CursorLineNr` highlight group in Vim). Other lines are DIM.
 fn render_line_number(
     frame: &mut FrameBuffer,
     x: u16,
@@ -922,6 +922,163 @@ pub fn highlight_matches(
                     );
                 }
             }
+        }
+    }
+}
+
+/// Highlight the entire cursor line with an underline.
+///
+/// Call this **after** [`View::render`] to add a subtle visual indicator for
+/// the line the cursor is on (`:set cursorline`). Applies `Attr::UNDERLINE`
+/// to every cell on the cursor's screen row, including empty space past the
+/// end of text and the gutter.
+///
+/// This is the Vim default `CursorLine` highlight (`term=underline`). When a
+/// theme engine is available, this should be overridden with a background color.
+#[allow(clippy::too_many_arguments)]
+pub fn highlight_cursorline(
+    view: &View,
+    frame: &mut FrameBuffer,
+    cursor_line: usize,
+    area_x: u16,
+    area_y: u16,
+    area_width: u16,
+    area_height: u16,
+) {
+    if area_height == 0 || area_width == 0 {
+        return;
+    }
+
+    let text_height = area_height.saturating_sub(1); // exclude status line
+
+    // The cursor line must be visible.
+    if cursor_line < view.top_line {
+        return;
+    }
+    let row = cursor_line - view.top_line;
+    if row >= text_height as usize {
+        return;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let screen_y = area_y + row as u16;
+
+    // Underline every cell on this row (gutter + text + empty space).
+    for col in 0..area_width {
+        let sx = area_x + col;
+        if let Some(cell) = frame.get(sx, screen_y) {
+            let mut c = *cell;
+            if c.underline == UnderlineStyle::None {
+                c.underline = UnderlineStyle::Straight;
+            }
+            frame.set(sx, screen_y, c);
+        }
+    }
+}
+
+/// Render a completion popup menu below the cursor.
+///
+/// Shows a list of candidates with the current selection highlighted. The popup
+/// appears below `cursor_y` at column `cursor_x`, clamped to fit within the
+/// screen. Shows at most `MAX_POPUP_HEIGHT` items, scrolling if there are more.
+///
+/// The `selected` index highlights one candidate with inverse video. The
+/// `prefix` is shown as the last entry (cycling back to what the user typed).
+pub fn render_completion_popup(
+    frame: &mut FrameBuffer,
+    candidates: &[String],
+    selected: usize,
+    cursor_x: u16,
+    cursor_y: u16,
+    frame_width: u16,
+    frame_height: u16,
+) {
+    const MAX_POPUP_HEIGHT: u16 = 10;
+
+    if candidates.is_empty() || frame_width == 0 || frame_height == 0 {
+        return;
+    }
+
+    // Compute popup dimensions.
+    #[allow(clippy::cast_possible_truncation)]
+    let item_count = candidates.len().min(MAX_POPUP_HEIGHT as usize) as u16;
+    let popup_height = item_count;
+    #[allow(clippy::cast_possible_truncation)]
+    let max_word_len = candidates
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(frame_width as usize) as u16;
+    let popup_width = (max_word_len + 2).min(frame_width.saturating_sub(2)).max(4);
+
+    // Position: prefer below cursor, shift up if near bottom.
+    let popup_y = if cursor_y + 1 + popup_height <= frame_height {
+        cursor_y + 1
+    } else {
+        cursor_y.saturating_sub(popup_height)
+    };
+
+    // Horizontal: align left edge with cursor, clamp to frame.
+    let popup_x = cursor_x.min(frame_width.saturating_sub(popup_width));
+
+    // Scroll offset: keep selected item visible.
+    #[allow(clippy::cast_possible_truncation)]
+    let scroll: u16 = if selected >= popup_height as usize {
+        (selected as u16).saturating_sub(popup_height) + 1
+    } else {
+        0
+    };
+
+    // Render each visible item.
+    for row in 0..popup_height {
+        let idx = (scroll + row) as usize;
+        if idx >= candidates.len() {
+            break;
+        }
+
+        let sy = popup_y + row;
+        let is_selected = idx == selected;
+
+        let (fg, bg, attrs) = if is_selected {
+            (
+                CellColor::Ansi256(0),   // black text
+                CellColor::Ansi256(4),   // blue background
+                Attr::BOLD,
+            )
+        } else {
+            (
+                CellColor::Default,
+                CellColor::Ansi256(237), // dark gray background
+                Attr::empty(),
+            )
+        };
+
+        // Leading space.
+        if popup_x < frame_width {
+            frame.set(popup_x, sy, Cell::styled(' ', fg, bg, attrs, UnderlineStyle::None));
+        }
+
+        // Candidate text.
+        let mut col: u16 = 1;
+        for ch in candidates[idx].chars() {
+            if col >= popup_width - 1 {
+                break;
+            }
+            let sx = popup_x + col;
+            if sx < frame_width {
+                frame.set(sx, sy, Cell::styled(ch, fg, bg, attrs, UnderlineStyle::None));
+            }
+            col += 1;
+        }
+
+        // Fill remaining width with background.
+        while col < popup_width {
+            let sx = popup_x + col;
+            if sx < frame_width {
+                frame.set(sx, sy, Cell::styled(' ', fg, bg, attrs, UnderlineStyle::None));
+            }
+            col += 1;
         }
     }
 }
@@ -2653,5 +2810,167 @@ mod tests {
 
         // First cell should be 'h' (no gutter padding).
         assert_eq!(frame.get(0, 0).unwrap().character(), Some('h'));
+    }
+
+    // ── Cursorline tests ──────────────────────────────────────────────
+
+    #[test]
+    fn cursorline_underlines_cursor_row() {
+        let buf = Buffer::from_text("aaa\nbbb\nccc");
+        let mut cursor = Cursor::new();
+        cursor.move_down(1, &buf, false); // cursor on line 1
+        let mut v = View::new();
+
+        let mut frame = FrameBuffer::new(10, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 4, true);
+        highlight_cursorline(&v, &mut frame, 1, 0, 0, 10, 4);
+
+        // Row 1 (cursor line) should be underlined.
+        assert!(frame.get(0, 1).unwrap().underline.is_underlined(),
+            "cursor row gutter should be underlined");
+        assert!(frame.get(5, 1).unwrap().underline.is_underlined(),
+            "cursor row text should be underlined");
+        // Row 0 (not cursor) should NOT be underlined.
+        assert!(!frame.get(0, 0).unwrap().underline.is_underlined(),
+            "non-cursor row should not be underlined");
+        assert!(!frame.get(5, 0).unwrap().underline.is_underlined(),
+            "non-cursor row text should not be underlined");
+    }
+
+    #[test]
+    fn cursorline_covers_full_width() {
+        // Cursorline should extend past the end of text to fill the row.
+        let buf = Buffer::from_text("hi");
+        let cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_line_numbers(false);
+
+        let mut frame = FrameBuffer::new(20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 2, true);
+        highlight_cursorline(&v, &mut frame, 0, 0, 0, 20, 2);
+
+        // Cell past the text (col 10) should still be underlined.
+        assert!(frame.get(10, 0).unwrap().underline.is_underlined(),
+            "empty cell past text should be underlined on cursor line");
+    }
+
+    #[test]
+    fn cursorline_noop_when_offscreen() {
+        // If the cursor line is not visible, nothing should be underlined.
+        let buf = Buffer::from_text("a\nb\nc\nd\ne");
+        let cursor = Cursor::new(); // line 0
+        let mut v = View::new();
+        v.set_line_numbers(false);
+
+        let mut frame = FrameBuffer::new(10, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true);
+
+        // Ask to highlight cursor_line=99 which doesn't exist on screen.
+        highlight_cursorline(&v, &mut frame, 99, 0, 0, 10, 2);
+
+        // No row should be underlined since cursor line (99) is past visible area.
+        assert!(!frame.get(0, 0).unwrap().underline.is_underlined());
+        assert!(!frame.get(0, 1).unwrap().underline.is_underlined());
+    }
+
+    #[test]
+    fn cursorline_preserves_existing_underline() {
+        // If a cell already has underline (e.g., from search highlight), it
+        // should keep its existing style, not be overwritten.
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_line_numbers(false);
+
+        let mut frame = FrameBuffer::new(10, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true);
+
+        // Manually set a curly underline on one cell.
+        let mut c = *frame.get(0, 0).unwrap();
+        c.underline = UnderlineStyle::Curly;
+        frame.set(0, 0, c);
+
+        highlight_cursorline(&v, &mut frame, 0, 0, 0, 10, 2);
+
+        // Curly underline should be preserved, not overwritten to Straight.
+        assert_eq!(frame.get(0, 0).unwrap().underline, UnderlineStyle::Curly);
+        // Other cells should get Straight underline.
+        assert_eq!(frame.get(1, 0).unwrap().underline, UnderlineStyle::Straight);
+    }
+
+    #[test]
+    fn cursorline_preserves_cell_content() {
+        // Underline should not change characters, colors, or attributes.
+        let buf = Buffer::from_text("abc");
+        let cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_line_numbers(false);
+
+        let mut frame = FrameBuffer::new(10, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true);
+
+        let before = *frame.get(0, 0).unwrap();
+        highlight_cursorline(&v, &mut frame, 0, 0, 0, 10, 2);
+        let after = *frame.get(0, 0).unwrap();
+
+        assert_eq!(before.character(), after.character());
+        assert_eq!(before.fg, after.fg);
+        assert_eq!(before.bg, after.bg);
+        assert_eq!(before.attrs, after.attrs);
+    }
+
+    // ── Completion popup tests ────────────────────────────────────────
+
+    #[test]
+    fn completion_popup_renders_candidates() {
+        let mut frame = FrameBuffer::new(40, 20);
+        let candidates = vec!["hello".to_string(), "help".to_string(), "heap".to_string()];
+        render_completion_popup(&mut frame, &candidates, 0, 5, 3, 40, 20);
+
+        // Popup should be at row 4 (below cursor_y=3), starting at col 5.
+        // Selected item (0 = "hello") should have BOLD.
+        let cell = frame.get(6, 4).unwrap(); // ' h' → col 6 is 'h' of " hello"
+        assert!(cell.attrs.contains(Attr::BOLD), "selected item should be BOLD");
+
+        // Non-selected item ("help" at row 5) should not be BOLD.
+        let cell2 = frame.get(6, 5).unwrap();
+        assert!(!cell2.attrs.contains(Attr::BOLD), "non-selected should not be BOLD");
+    }
+
+    #[test]
+    fn completion_popup_empty_noop() {
+        let mut frame = FrameBuffer::new(40, 20);
+        let empty: Vec<String> = vec![];
+        render_completion_popup(&mut frame, &empty, 0, 5, 3, 40, 20);
+        // Should not crash or modify the frame.
+        assert!(frame.get(5, 4).unwrap().ch == b' ' as u32);
+    }
+
+    #[test]
+    fn completion_popup_near_bottom_shifts_up() {
+        // Cursor at row 18 (near bottom of 20-row frame) with 5 candidates.
+        let mut frame = FrameBuffer::new(40, 20);
+        let candidates: Vec<String> = (0..5).map(|i| format!("word{i}")).collect();
+        render_completion_popup(&mut frame, &candidates, 0, 5, 18, 40, 20);
+
+        // Popup should shift above cursor since row 19 is the last.
+        // It should NOT render below row 19.
+        let cell = frame.get(6, 13).unwrap(); // Above cursor
+        assert_ne!(cell.bg, CellColor::Default, "popup should render above cursor near bottom");
+    }
+
+    #[test]
+    fn completion_popup_selection_highlight() {
+        let mut frame = FrameBuffer::new(40, 20);
+        let candidates = vec!["aaa".to_string(), "bbb".to_string()];
+        render_completion_popup(&mut frame, &candidates, 1, 5, 3, 40, 20);
+
+        // Selection index 1 ("bbb") should be at row 5 and be BOLD.
+        let cell = frame.get(6, 5).unwrap();
+        assert!(cell.attrs.contains(Attr::BOLD), "selected item (idx=1) should be BOLD");
+
+        // Index 0 ("aaa") at row 4 should NOT be BOLD.
+        let cell0 = frame.get(6, 4).unwrap();
+        assert!(!cell0.attrs.contains(Attr::BOLD), "non-selected (idx=0) should not be BOLD");
     }
 }
