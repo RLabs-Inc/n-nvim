@@ -1,0 +1,14 @@
+[package]
+name = "n-editor"
+description = "Editor core for n-nvim — text buffers, modes, commands"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ropey = "1"
