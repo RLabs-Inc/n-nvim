@@ -11,7 +11,8 @@
 //! - **[`search`]** — Incremental search (`/`, `?`, `n`, `N`) with match highlighting
 //! - **[`view`]** — View layer that bridges buffers to n-term's framebuffer
 //! - **[`history`]** — Undo/redo: transaction-based, cursor position restore
-//! - **[`command`]** — Command-line parsing (`:w`, `:q`, `:e`, `:s`, `:bn`, `:bd`, `:ls`)
+//! - **[`command`]** — Command-line parsing (`:w`, `:q`, `:e`, `:s`, `:bn`, `:bd`, `:ls`, `:set`)
+//! - **[`options`]** — `:set` option system: parsing, names, abbreviations
 //! - **[`register`]** — Register file: unnamed + 26 named registers (a-z) with append
 //! - **[`jumplist`]** — Jump list (`Ctrl+O`/`Ctrl+I`) and change list (`g;`/`g,`)
 //! - **[`split`]** — Split tree layout for window panes (`:sp`, `:vsp`, `Ctrl+W`)
@@ -22,6 +23,7 @@ pub mod cursor;
 pub mod history;
 pub mod jumplist;
 pub mod mode;
+pub mod options;
 pub mod position;
 pub mod register;
 pub mod search;

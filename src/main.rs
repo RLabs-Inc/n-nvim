@@ -33,6 +33,7 @@ use n_editor::cursor::Cursor;
 use n_editor::history::History;
 use n_editor::jumplist::{ChangeList, JumpList};
 use n_editor::mode::{Mode, VisualKind};
+use n_editor::options::{self, SetDirective};
 use n_editor::position::{Position, Range};
 use n_editor::register::{RegisterFile, RegisterKind};
 use n_editor::search::{self, SearchDirection, SearchState};
@@ -445,6 +446,32 @@ struct Editor {
     /// Active block-insert replay state. When `Some`, the next Escape from
     /// insert mode will replay the typed text on the stored lines.
     block_insert: Option<BlockInsert>,
+
+    // ── Global options (apply across all buffers/windows) ─────────────
+
+    /// Indent width for `>>`/`<<` and auto-indent (`:set shiftwidth`).
+    shiftwidth: usize,
+
+    /// Use spaces instead of tabs when indenting (`:set expandtab`).
+    expandtab: bool,
+
+    /// Case-insensitive search (`:set ignorecase`).
+    ignorecase: bool,
+
+    /// Override `ignorecase` when pattern contains uppercase (`:set smartcase`).
+    smartcase: bool,
+
+    /// Highlight all search matches (`:set hlsearch`).
+    hlsearch: bool,
+
+    /// Incremental search — jump to matches as you type (`:set incsearch`).
+    incsearch: bool,
+
+    /// Search wraps around end of file (`:set wrapscan`).
+    wrapscan: bool,
+
+    /// Highlight the screen line of the cursor (`:set cursorline`).
+    cursorline: bool,
 }
 
 impl Editor {
@@ -494,6 +521,14 @@ impl Editor {
             jump_list: JumpList::new(),
             change_list: ChangeList::new(),
             block_insert: None,
+            shiftwidth: 4,
+            expandtab: true,
+            ignorecase: false,
+            smartcase: false,
+            hlsearch: true,
+            incsearch: true,
+            wrapscan: true,
+            cursorline: false,
         }
     }
 
@@ -548,6 +583,14 @@ impl Editor {
             jump_list: JumpList::new(),
             change_list: ChangeList::new(),
             block_insert: None,
+            shiftwidth: 4,
+            expandtab: true,
+            ignorecase: false,
+            smartcase: false,
+            hlsearch: true,
+            incsearch: true,
+            wrapscan: true,
+            cursorline: false,
         }
     }
 
@@ -3003,6 +3046,7 @@ impl Editor {
             Command::VSplit => self.win_split_vertical(),
             Command::WinClose => self.win_close(),
             Command::WinOnly => self.win_only(),
+            Command::Set(directives) => self.cmd_set(&directives),
             Command::Unknown(input) => {
                 if input.is_empty() {
                     CommandResult::Ok(None)
@@ -3120,6 +3164,205 @@ impl Editor {
             return CommandResult::Err("E33: No previous substitute regular expression".to_string());
         };
         self.execute_substitute(range, &pattern, &replacement, flags)
+    }
+
+    /// `:set` — apply one or more option directives.
+    ///
+    /// Each directive can turn on/off a boolean, assign a numeric value,
+    /// query the current value, or show all/changed options.
+    fn cmd_set(&mut self, directives: &[SetDirective]) -> CommandResult {
+        let mut messages: Vec<String> = Vec::new();
+
+        for directive in directives {
+            match self.apply_set_directive(directive) {
+                Ok(Some(msg)) => messages.push(msg),
+                Ok(None) => {}
+                Err(msg) => return CommandResult::Err(msg),
+            }
+        }
+
+        if messages.is_empty() {
+            CommandResult::Ok(None)
+        } else {
+            CommandResult::Ok(Some(messages.join("  ")))
+        }
+    }
+
+    /// Apply a single `:set` directive, returning an optional message or error.
+    fn apply_set_directive(&mut self, directive: &SetDirective) -> Result<Option<String>, String> {
+        match directive {
+            SetDirective::On(name) => self.set_option_bool(name, true),
+            SetDirective::Off(name) => self.set_option_bool(name, false),
+            SetDirective::Toggle(name) => {
+                let val = self.get_option_bool(name)?;
+                self.set_option_bool(name, !val)
+            }
+            SetDirective::Query(name) => self.query_option(name),
+            SetDirective::Assign(name, value) => self.set_option_value(name, value),
+            SetDirective::ShowChanged => Ok(Some(self.show_changed_options())),
+            SetDirective::ShowAll => Ok(Some(self.show_all_options())),
+        }
+    }
+
+    /// Get a boolean option by name (full or abbreviated).
+    fn get_option_bool(&self, name: &str) -> Result<bool, String> {
+        match name {
+            "number" | "nu" => Ok(self.view.line_numbers()),
+            "relativenumber" | "rnu" => Ok(self.view.relativenumber()),
+            "expandtab" | "et" => Ok(self.expandtab),
+            "ignorecase" | "ic" => Ok(self.ignorecase),
+            "smartcase" | "scs" => Ok(self.smartcase),
+            "hlsearch" | "hls" => Ok(self.hlsearch),
+            "incsearch" | "is" => Ok(self.incsearch),
+            "wrapscan" | "ws" => Ok(self.wrapscan),
+            "cursorline" | "cul" => Ok(self.cursorline),
+            _ if options::is_numeric_option(name) => {
+                Err(format!("E521: Number required after =: {name}"))
+            }
+            _ => Err(format!("E518: Unknown option: {name}")),
+        }
+    }
+
+    /// Set a boolean option by name.
+    fn set_option_bool(&mut self, name: &str, value: bool) -> Result<Option<String>, String> {
+        match name {
+            "number" | "nu" => self.view.set_line_numbers(value),
+            "relativenumber" | "rnu" => self.view.set_relativenumber(value),
+            "expandtab" | "et" => self.expandtab = value,
+            "ignorecase" | "ic" => self.ignorecase = value,
+            "smartcase" | "scs" => self.smartcase = value,
+            "hlsearch" | "hls" => self.hlsearch = value,
+            "incsearch" | "is" => self.incsearch = value,
+            "wrapscan" | "ws" => self.wrapscan = value,
+            "cursorline" | "cul" => self.cursorline = value,
+            _ if options::is_numeric_option(name) => {
+                return Err(format!("E521: Number required after =: {name}"));
+            }
+            _ => return Err(format!("E518: Unknown option: {name}")),
+        }
+        Ok(None)
+    }
+
+    /// Assign a value to a numeric option.
+    fn set_option_value(&mut self, name: &str, value: &str) -> Result<Option<String>, String> {
+        match name {
+            "scrolloff" | "so" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("E521: Number required after =: {name}"))?;
+                self.view.set_scrolloff(n);
+            }
+            "tabstop" | "ts" => {
+                let n: u8 = value
+                    .parse()
+                    .map_err(|_| format!("E521: Number required after =: {name}"))?;
+                if n == 0 {
+                    return Err(format!("E487: Argument must be positive: {name}=0"));
+                }
+                self.view.set_tab_width(n);
+            }
+            "shiftwidth" | "sw" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("E521: Number required after =: {name}"))?;
+                self.shiftwidth = n;
+            }
+            // Boolean options can also be set with =0 / =1.
+            _ if options::is_bool_option(name) => match value {
+                "0" | "false" => return self.set_option_bool(name, false),
+                "1" | "true" => return self.set_option_bool(name, true),
+                _ => return Err(format!("E474: Invalid argument: {name}={value}")),
+            },
+            _ => return Err(format!("E518: Unknown option: {name}")),
+        }
+        Ok(None)
+    }
+
+    /// Query the current value of an option.
+    fn query_option(&self, name: &str) -> Result<Option<String>, String> {
+        match name {
+            "number" | "nu" => Ok(Some(options::format_bool("number", self.view.line_numbers()))),
+            "relativenumber" | "rnu" => {
+                Ok(Some(options::format_bool("relativenumber", self.view.relativenumber())))
+            }
+            "scrolloff" | "so" => Ok(Some(format!("scrolloff={}", self.view.scrolloff()))),
+            "tabstop" | "ts" => Ok(Some(format!("tabstop={}", self.view.tab_width()))),
+            "shiftwidth" | "sw" => Ok(Some(format!("shiftwidth={}", self.shiftwidth))),
+            "expandtab" | "et" => Ok(Some(options::format_bool("expandtab", self.expandtab))),
+            "ignorecase" | "ic" => Ok(Some(options::format_bool("ignorecase", self.ignorecase))),
+            "smartcase" | "scs" => Ok(Some(options::format_bool("smartcase", self.smartcase))),
+            "hlsearch" | "hls" => Ok(Some(options::format_bool("hlsearch", self.hlsearch))),
+            "incsearch" | "is" => Ok(Some(options::format_bool("incsearch", self.incsearch))),
+            "wrapscan" | "ws" => Ok(Some(options::format_bool("wrapscan", self.wrapscan))),
+            "cursorline" | "cul" => Ok(Some(options::format_bool("cursorline", self.cursorline))),
+            _ => Err(format!("E518: Unknown option: {name}")),
+        }
+    }
+
+    /// Show all options whose values differ from defaults.
+    fn show_changed_options(&self) -> String {
+        let mut parts = Vec::new();
+        // Boolean options with non-default values.
+        if !self.view.line_numbers() {
+            parts.push("nonumber".to_string());
+        }
+        if self.view.relativenumber() {
+            parts.push("relativenumber".to_string());
+        }
+        if self.view.scrolloff() != 0 {
+            parts.push(format!("scrolloff={}", self.view.scrolloff()));
+        }
+        if self.view.tab_width() != 4 {
+            parts.push(format!("tabstop={}", self.view.tab_width()));
+        }
+        if self.shiftwidth != 4 {
+            parts.push(format!("shiftwidth={}", self.shiftwidth));
+        }
+        if !self.expandtab {
+            parts.push("noexpandtab".to_string());
+        }
+        if self.ignorecase {
+            parts.push("ignorecase".to_string());
+        }
+        if self.smartcase {
+            parts.push("smartcase".to_string());
+        }
+        if !self.hlsearch {
+            parts.push("nohlsearch".to_string());
+        }
+        if !self.incsearch {
+            parts.push("noincsearch".to_string());
+        }
+        if !self.wrapscan {
+            parts.push("nowrapscan".to_string());
+        }
+        if self.cursorline {
+            parts.push("cursorline".to_string());
+        }
+        if parts.is_empty() {
+            "No changed options".to_string()
+        } else {
+            parts.join("  ")
+        }
+    }
+
+    /// Show all options and their current values.
+    fn show_all_options(&self) -> String {
+        [
+            options::format_bool("number", self.view.line_numbers()),
+            options::format_bool("relativenumber", self.view.relativenumber()),
+            format!("scrolloff={}", self.view.scrolloff()),
+            format!("tabstop={}", self.view.tab_width()),
+            format!("shiftwidth={}", self.shiftwidth),
+            options::format_bool("expandtab", self.expandtab),
+            options::format_bool("ignorecase", self.ignorecase),
+            options::format_bool("smartcase", self.smartcase),
+            options::format_bool("hlsearch", self.hlsearch),
+            options::format_bool("incsearch", self.incsearch),
+            options::format_bool("wrapscan", self.wrapscan),
+            options::format_bool("cursorline", self.cursorline),
+        ]
+        .join("  ")
     }
 
     /// Core substitution engine shared by `:s/pat/rep/flags` and `:s` repeat.
@@ -4758,9 +5001,6 @@ impl Editor {
 
     // ── Indent / outdent ────────────────────────────────────────────────
 
-    /// Width of one indentation level (in spaces).
-    const INDENT_WIDTH: usize = 4;
-
     /// Dispatch an operator: routes `>` / `<` to indent/outdent, others to
     /// the standard `apply_operator` path.
     fn execute_operator(&mut self, op: char, range: Range, linewise: bool) -> Action {
@@ -4823,7 +5063,7 @@ impl Editor {
     /// Empty lines are skipped (Vim behavior). The cursor is placed at the
     /// first non-blank of the first affected line.
     fn indent_lines(&mut self, first: usize, last: usize) {
-        let indent: String = std::iter::repeat_n(' ', Self::INDENT_WIDTH).collect();
+        let indent: String = std::iter::repeat_n(' ', self.shiftwidth).collect();
 
         self.history.begin(self.cursor.position());
 
@@ -4866,7 +5106,7 @@ impl Editor {
                 if ch == '\t' && remove == 0 {
                     remove = 1;
                     break;
-                } else if ch == ' ' && remove < Self::INDENT_WIDTH {
+                } else if ch == ' ' && remove < self.shiftwidth {
                     remove += 1;
                 } else {
                     break;
@@ -10133,5 +10373,288 @@ mod tests {
         feed(&mut e, &[press('A'), esc()]);
         // Buffer unchanged (except possible padding on first line).
         assert_eq!(e.buffer.contents(), "hello\nworld\nfoooo");
+    }
+
+    // ── :set command ────────────────────────────────────────────────────
+
+    /// Type a command string via `:` + chars + Enter.
+    fn run_cmd(editor: &mut Editor, cmd: &str) {
+        feed(editor, &[press(':')]);
+        for ch in cmd.chars() {
+            feed(editor, &[press(ch)]);
+        }
+        feed(editor, &[enter()]);
+    }
+
+    #[test]
+    fn set_number_on_off() {
+        let mut e = editor_with("hello");
+        assert!(e.view.line_numbers());
+        run_cmd(&mut e, "set nonumber");
+        assert!(!e.view.line_numbers());
+        run_cmd(&mut e, "set number");
+        assert!(e.view.line_numbers());
+    }
+
+    #[test]
+    fn set_number_abbreviation() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set nonu");
+        assert!(!e.view.line_numbers());
+        run_cmd(&mut e, "set nu");
+        assert!(e.view.line_numbers());
+    }
+
+    #[test]
+    fn set_relativenumber() {
+        let mut e = editor_with("hello");
+        assert!(!e.view.relativenumber());
+        run_cmd(&mut e, "set relativenumber");
+        assert!(e.view.relativenumber());
+        run_cmd(&mut e, "set nornu");
+        assert!(!e.view.relativenumber());
+    }
+
+    #[test]
+    fn set_toggle_with_bang() {
+        let mut e = editor_with("hello");
+        assert!(e.view.line_numbers());
+        run_cmd(&mut e, "set number!");
+        assert!(!e.view.line_numbers());
+        run_cmd(&mut e, "set number!");
+        assert!(e.view.line_numbers());
+    }
+
+    #[test]
+    fn set_scrolloff() {
+        let mut e = editor_with("hello");
+        assert_eq!(e.view.scrolloff(), 0);
+        run_cmd(&mut e, "set scrolloff=5");
+        assert_eq!(e.view.scrolloff(), 5);
+    }
+
+    #[test]
+    fn set_scrolloff_abbreviation() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set so=10");
+        assert_eq!(e.view.scrolloff(), 10);
+    }
+
+    #[test]
+    fn set_tabstop() {
+        let mut e = editor_with("hello");
+        assert_eq!(e.view.tab_width(), 4);
+        run_cmd(&mut e, "set tabstop=8");
+        assert_eq!(e.view.tab_width(), 8);
+    }
+
+    #[test]
+    fn set_tabstop_abbreviation() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set ts=2");
+        assert_eq!(e.view.tab_width(), 2);
+    }
+
+    #[test]
+    fn set_tabstop_zero_rejected() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set ts=0");
+        // Should show error, value unchanged.
+        assert_eq!(e.view.tab_width(), 4);
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E487")));
+    }
+
+    #[test]
+    fn set_shiftwidth() {
+        let mut e = editor_with("hello");
+        assert_eq!(e.shiftwidth, 4);
+        run_cmd(&mut e, "set sw=2");
+        assert_eq!(e.shiftwidth, 2);
+    }
+
+    #[test]
+    fn set_shiftwidth_affects_indent() {
+        let mut e = editor_with("hello\nworld");
+        run_cmd(&mut e, "set sw=2");
+        // >> should indent by 2 spaces now.
+        feed(&mut e, &[press('>'), press('>')]);
+        assert_eq!(e.buffer.line(0).unwrap().to_string(), "  hello\n");
+    }
+
+    #[test]
+    fn set_ignorecase() {
+        let mut e = editor_with("hello");
+        assert!(!e.ignorecase);
+        run_cmd(&mut e, "set ignorecase");
+        assert!(e.ignorecase);
+        run_cmd(&mut e, "set noic");
+        assert!(!e.ignorecase);
+    }
+
+    #[test]
+    fn set_query_shows_value() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set scrolloff?");
+        assert_eq!(e.message.as_deref(), Some("scrolloff=0"));
+
+        run_cmd(&mut e, "set number?");
+        assert_eq!(e.message.as_deref(), Some("number"));
+    }
+
+    #[test]
+    fn set_query_after_change() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set scrolloff=7");
+        run_cmd(&mut e, "set so?");
+        assert_eq!(e.message.as_deref(), Some("scrolloff=7"));
+    }
+
+    #[test]
+    fn set_bare_numeric_is_query() {
+        // `:set scrolloff` should query, not enable.
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set scrolloff");
+        assert_eq!(e.message.as_deref(), Some("scrolloff=0"));
+    }
+
+    #[test]
+    fn set_show_changed_default() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set");
+        assert_eq!(e.message.as_deref(), Some("No changed options"));
+    }
+
+    #[test]
+    fn set_show_changed_after_modification() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set scrolloff=5");
+        run_cmd(&mut e, "set");
+        let msg = e.message.as_deref().unwrap_or("");
+        assert!(msg.contains("scrolloff=5"), "msg = '{msg}'");
+    }
+
+    #[test]
+    fn set_show_all() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set all");
+        let msg = e.message.as_deref().unwrap_or("");
+        assert!(msg.contains("number"), "msg = '{msg}'");
+        assert!(msg.contains("scrolloff="), "msg = '{msg}'");
+        assert!(msg.contains("tabstop="), "msg = '{msg}'");
+    }
+
+    #[test]
+    fn set_unknown_option_error() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set foobar");
+        assert!(e.message.as_ref().is_some_and(|m| m.contains("E518")));
+        assert!(e.message_is_error);
+    }
+
+    #[test]
+    fn set_multiple_options() {
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set nonumber scrolloff=3 relativenumber");
+        assert!(!e.view.line_numbers());
+        assert_eq!(e.view.scrolloff(), 3);
+        assert!(e.view.relativenumber());
+    }
+
+    #[test]
+    fn set_se_abbreviation() {
+        // `:se` should work like `:set`.
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "se nonumber");
+        assert!(!e.view.line_numbers());
+    }
+
+    #[test]
+    fn set_boolean_with_equals() {
+        // `:set number=0` and `:set number=1` should work.
+        let mut e = editor_with("hello");
+        run_cmd(&mut e, "set number=0");
+        assert!(!e.view.line_numbers());
+        run_cmd(&mut e, "set number=1");
+        assert!(e.view.line_numbers());
+    }
+
+    // ── Scrolloff integration ───────────────────────────────────────────
+
+    #[test]
+    fn scrolloff_affects_scrolling() {
+        // With scrolloff=3 and a tall enough file, cursor shouldn't reach
+        // the bottom of the viewport without scrolling.
+        let text: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        let mut e = editor_with(&text);
+        run_cmd(&mut e, "set scrolloff=3");
+
+        // Move down many times — the view should scroll to maintain margin.
+        for _ in 0..15 {
+            feed(&mut e, &[press('j')]);
+        }
+
+        // Cursor at line 15, with scrolloff=3, top_line should maintain margin.
+        let top = e.view.top_line();
+        let bottom_visible = top + e.last_text_height;
+        // Cursor should be at least 3 lines from the bottom.
+        assert!(
+            e.cursor.line() + 3 <= bottom_visible,
+            "cursor={}, top={top}, bottom={bottom_visible}",
+            e.cursor.line()
+        );
+    }
+
+    // ── Relative line numbers ───────────────────────────────────────────
+
+    /// Extract a row of the framebuffer as a string (skipping continuation cells).
+    fn row_chars(frame: &FrameBuffer, y: u16) -> String {
+        let row = frame.row(y).unwrap();
+        row.iter()
+            .filter(|c| !c.is_continuation())
+            .map(|c| c.character().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn relativenumber_render() {
+        let text = "aaa\nbbb\nccc\nddd\neee";
+        let mut e = editor_with(text);
+        run_cmd(&mut e, "set relativenumber");
+        // Move cursor to line 2 (0-indexed).
+        feed(&mut e, &[press('j'), press('j')]);
+
+        // Render and check gutter values.
+        let mut frame = FrameBuffer::new(30, 8);
+        e.paint(&mut frame);
+
+        let row0 = row_chars(&frame, 0);
+        let row2 = row_chars(&frame, 2);
+        let row4 = row_chars(&frame, 4);
+
+        // Row 0 should show distance 2 from cursor (which is at line 2).
+        assert!(row0.starts_with("2"), "row0 gutter = '{row0}'");
+        // Row 2 (cursor) should show absolute 3 (hybrid mode: number is on).
+        assert!(row2.starts_with("3"), "row2 gutter = '{row2}'");
+        // Row 4 should show distance 2.
+        assert!(row4.starts_with("2"), "row4 gutter = '{row4}'");
+    }
+
+    #[test]
+    fn relativenumber_only_no_number() {
+        let text = "aaa\nbbb\nccc";
+        let mut e = editor_with(text);
+        run_cmd(&mut e, "set nonumber relativenumber");
+        feed(&mut e, &[press('j')]); // cursor on line 1
+
+        let mut frame = FrameBuffer::new(30, 6);
+        e.paint(&mut frame);
+
+        let row0 = row_chars(&frame, 0); // distance 1
+        let row1 = row_chars(&frame, 1); // cursor = 0
+        let row2 = row_chars(&frame, 2); // distance 1
+
+        assert!(row0.starts_with("1"), "row0 = '{row0}'");
+        assert!(row1.starts_with("0"), "row1 = '{row1}'");
+        assert!(row2.starts_with("1"), "row2 = '{row2}'");
     }
 }

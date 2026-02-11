@@ -236,6 +236,19 @@ pub struct View {
     /// Whether to show the line number gutter.
     line_numbers: bool,
 
+    /// Show relative line numbers (distance from cursor line).
+    ///
+    /// When both `line_numbers` and `relativenumber` are true (hybrid mode),
+    /// the cursor line shows the absolute number while other lines show their
+    /// distance from the cursor.
+    relativenumber: bool,
+
+    /// Minimum lines to keep above and below the cursor when scrolling.
+    ///
+    /// Setting this to a large value (e.g., 999) keeps the cursor centered.
+    /// Clamped to half the viewport height to avoid impossible constraints.
+    scrolloff: usize,
+
     /// Tab stop width (display columns per tab stop).
     tab_width: u8,
 }
@@ -254,6 +267,8 @@ impl View {
             top_line: 0,
             left_col: 0,
             line_numbers: true,
+            relativenumber: false,
+            scrolloff: 0,
             tab_width: 4,
         }
     }
@@ -281,6 +296,20 @@ impl View {
         self.line_numbers
     }
 
+    /// Whether relative line numbers are shown.
+    #[inline]
+    #[must_use]
+    pub const fn relativenumber(&self) -> bool {
+        self.relativenumber
+    }
+
+    /// Minimum lines to keep above/below cursor.
+    #[inline]
+    #[must_use]
+    pub const fn scrolloff(&self) -> usize {
+        self.scrolloff
+    }
+
     /// Current tab width.
     #[inline]
     #[must_use]
@@ -293,6 +322,16 @@ impl View {
     /// Enable or disable line numbers.
     pub const fn set_line_numbers(&mut self, show: bool) {
         self.line_numbers = show;
+    }
+
+    /// Enable or disable relative line numbers.
+    pub const fn set_relativenumber(&mut self, show: bool) {
+        self.relativenumber = show;
+    }
+
+    /// Set the minimum lines to keep above/below cursor when scrolling.
+    pub const fn set_scrolloff(&mut self, lines: usize) {
+        self.scrolloff = lines;
     }
 
     /// Set the tab stop width (minimum 1).
@@ -323,7 +362,8 @@ impl View {
         area_width: u16,
         area_height: u16,
     ) {
-        let gw = gutter_width(buf.line_count(), self.line_numbers);
+        let show_gutter = self.line_numbers || self.relativenumber;
+        let gw = gutter_width(buf.line_count(), show_gutter);
         let text_width = area_width.saturating_sub(gw) as usize;
         let text_height = area_height.saturating_sub(1) as usize; // -1 for status
 
@@ -333,12 +373,16 @@ impl View {
 
         let cursor_line = cursor.line();
 
-        // Vertical: cursor must be within [top_line, top_line + text_height)
-        if cursor_line < self.top_line {
-            self.top_line = cursor_line;
+        // Clamp scrolloff to half the viewport (avoids impossible constraints
+        // when the viewport is very small or scrolloff is very large).
+        let so = self.scrolloff.min(text_height.saturating_sub(1) / 2);
+
+        // Vertical: cursor must stay at least `so` lines from top and bottom.
+        if cursor_line < self.top_line + so {
+            self.top_line = cursor_line.saturating_sub(so);
         }
-        if cursor_line >= self.top_line + text_height {
-            self.top_line = cursor_line - text_height + 1;
+        if cursor_line + so >= self.top_line + text_height {
+            self.top_line = cursor_line + so + 1 - text_height;
         }
 
         // Horizontal: cursor display column must be within [left_col, left_col + text_width)
@@ -393,10 +437,12 @@ impl View {
         self.ensure_cursor_visible(cursor, buf, area_width, area_height);
 
         let line_count = buf.line_count();
-        let gw = gutter_width(line_count, self.line_numbers);
+        let show_gutter = self.line_numbers || self.relativenumber;
+        let gw = gutter_width(line_count, show_gutter);
         let text_width = area_width.saturating_sub(gw);
         let text_height = area_height.saturating_sub(1); // status line
         let text_x = area_x + gw;
+        let cursor_line = cursor.line();
 
         let mut cursor_screen: Option<(u16, u16)> = None;
 
@@ -407,9 +453,20 @@ impl View {
             let buf_line = self.top_line + row as usize;
 
             if buf_line < line_count {
-                // Gutter: line number
-                if self.line_numbers && gw > 0 {
-                    render_line_number(frame, area_x, screen_y, gw, buf_line + 1);
+                // Gutter: line number (absolute, relative, or hybrid)
+                if show_gutter && gw > 0 {
+                    let is_cursor_line = buf_line == cursor_line;
+                    let num = if self.relativenumber {
+                        if is_cursor_line && self.line_numbers {
+                            // Hybrid mode: cursor line shows absolute number.
+                            buf_line + 1
+                        } else {
+                            buf_line.abs_diff(cursor_line)
+                        }
+                    } else {
+                        buf_line + 1
+                    };
+                    render_line_number(frame, area_x, screen_y, gw, num, is_cursor_line);
                 }
 
                 // Text content (with optional selection highlighting)
@@ -417,8 +474,8 @@ impl View {
                 self.render_text_line(frame, buf, buf_line, text_x, screen_y, text_width, line_sel);
 
                 // Cursor screen position
-                if buf_line == cursor.line() {
-                    let display_col = buf.line(cursor.line()).map_or(0, |line| {
+                if buf_line == cursor_line {
+                    let display_col = buf.line(cursor_line).map_or(0, |line| {
                         char_col_to_display_col(line.chars(), cursor.col(), self.tab_width)
                     });
 
@@ -565,32 +622,43 @@ impl View {
 // ---------------------------------------------------------------------------
 
 /// Render a right-aligned line number in the gutter.
+///
+/// When `is_cursor_line` is true, the number is rendered at normal brightness
+/// (CursorLineNr highlight group in Vim). Other lines are DIM.
 fn render_line_number(
     frame: &mut FrameBuffer,
     x: u16,
     y: u16,
     gutter_w: u16,
-    line_num: usize, // 1-indexed
+    line_num: usize,
+    is_cursor_line: bool,
 ) {
     let num_str = line_num.to_string();
     let digit_space = gutter_w.saturating_sub(1) as usize; // reserve 1 for separator
     let padding = digit_space.saturating_sub(num_str.len());
 
-    let dim_cell = |ch: char| {
-        Cell::styled(ch, CellColor::Default, CellColor::Default, Attr::DIM, UnderlineStyle::None)
+    // Cursor line number stands out; other lines are subdued.
+    let style = if is_cursor_line {
+        Attr::empty()
+    } else {
+        Attr::DIM
+    };
+
+    let styled_cell = |ch: char| {
+        Cell::styled(ch, CellColor::Default, CellColor::Default, style, UnderlineStyle::None)
     };
 
     let mut col = x;
 
     // Leading spaces
     for _ in 0..padding {
-        frame.set(col, y, dim_cell(' '));
+        frame.set(col, y, styled_cell(' '));
         col += 1;
     }
 
     // Digits
     for ch in num_str.chars() {
-        frame.set(col, y, dim_cell(ch));
+        frame.set(col, y, styled_cell(ch));
         col += 1;
     }
 
@@ -775,7 +843,7 @@ pub fn highlight_matches(
         return;
     }
 
-    let gw = gutter_width(buf.line_count(), view.line_numbers);
+    let gw = gutter_width(buf.line_count(), view.line_numbers || view.relativenumber);
     let text_x = area_x + gw;
     let text_width = area_width.saturating_sub(gw);
     let text_height = area_height.saturating_sub(1); // status line
@@ -1402,15 +1470,16 @@ mod tests {
 
     #[test]
     fn render_line_numbers_are_dim() {
-        let buf = Buffer::from_text("hello");
-        let cursor = Cursor::new();
-        let mut frame = FrameBuffer::new(20, 3);
+        let buf = Buffer::from_text("hello\nworld");
+        let cursor = Cursor::new(); // cursor on line 0
+        let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
         v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
 
-        // Line number "1" at column 0 should be DIM.
-        assert!(is_dim(&frame, 0, 0));
+        // Cursor line (0) is bright, non-cursor line (1) is DIM.
+        assert!(!is_dim(&frame, 0, 0), "cursor line number should be bright");
+        assert!(is_dim(&frame, 0, 1), "non-cursor line number should be DIM");
     }
 
     #[test]
@@ -2394,5 +2463,195 @@ mod tests {
         for col in 3..10 {
             assert_eq!(row[col].character(), Some(' '), "col {col} not cleared");
         }
+    }
+
+    // ── scrolloff ────────────────────────────────────────────────────────
+
+    #[test]
+    fn scrolloff_zero_is_default_behavior() {
+        // With scrolloff=0, cursor can go to the very edge of the viewport.
+        let buf = Buffer::from_text("a\nb\nc\nd\ne\nf\ng\nh\ni\nj");
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_scrolloff(0);
+
+        // Move to last visible line (text_height = 10-1=9 for a 10-high area).
+        for _ in 0..8 {
+            cursor.move_down(1, &buf, false);
+        }
+        v.ensure_cursor_visible(&cursor, &buf, 20, 10);
+        assert_eq!(v.top_line(), 0); // cursor at line 8, viewport [0,9)
+    }
+
+    #[test]
+    fn scrolloff_keeps_margin_at_bottom() {
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let buf = Buffer::from_text(&text);
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_scrolloff(3);
+
+        // text_height = 10-1 = 9, so=3. Viewport shows 9 lines.
+        // Cursor at line 6: must leave 3 lines below.
+        // Line 6 at position 6 from top, 2 from bottom (9-1-6=2 < 3).
+        for _ in 0..6 {
+            cursor.move_down(1, &buf, false);
+        }
+        v.ensure_cursor_visible(&cursor, &buf, 20, 10);
+        // cursor=6, so=3 → 6+3=9 >= 0+9 → top = 6+3+1-9 = 1
+        assert_eq!(v.top_line(), 1);
+    }
+
+    #[test]
+    fn scrolloff_keeps_margin_at_top() {
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let buf = Buffer::from_text(&text);
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_scrolloff(3);
+        v.set_top_line(10);
+
+        // Cursor at line 11 (within margin from top of viewport).
+        for _ in 0..11 {
+            cursor.move_down(1, &buf, false);
+        }
+        v.ensure_cursor_visible(&cursor, &buf, 20, 10);
+        // cursor=11, top=10, so=3. 11 < 10+3=13 → top = 11-3 = 8
+        assert_eq!(v.top_line(), 8);
+    }
+
+    #[test]
+    fn scrolloff_clamped_to_half_viewport() {
+        // scrolloff=999 should be clamped to half viewport.
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let buf = Buffer::from_text(&text);
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_scrolloff(999);
+
+        // text_height=9, so = min(999, (9-1)/2) = 4
+        // This effectively centers the cursor.
+        for _ in 0..10 {
+            cursor.move_down(1, &buf, false);
+        }
+        v.ensure_cursor_visible(&cursor, &buf, 20, 10);
+        // cursor=10, so=4 → 10+4=14 >= top+9 → top = 10+4+1-9 = 6
+        assert_eq!(v.top_line(), 6);
+    }
+
+    #[test]
+    fn scrolloff_at_file_start() {
+        // scrolloff=5 at file start — can't maintain full margin, cursor
+        // stays as close as possible.
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let buf = Buffer::from_text(&text);
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_scrolloff(5);
+
+        // Cursor at line 2 — can't have 5 lines above, top stays 0.
+        for _ in 0..2 {
+            cursor.move_down(1, &buf, false);
+        }
+        v.ensure_cursor_visible(&cursor, &buf, 20, 20);
+        assert_eq!(v.top_line(), 0);
+    }
+
+    // ── relative line numbers ────────────────────────────────────────────
+
+    #[test]
+    fn relativenumber_only() {
+        // relativenumber without number shows distances (cursor shows 0).
+        let buf = Buffer::from_text("aaa\nbbb\nccc\nddd\neee");
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_line_numbers(false);
+        v.set_relativenumber(true);
+
+        // Cursor on line 2 (0-indexed).
+        cursor.move_down(1, &buf, false);
+        cursor.move_down(1, &buf, false);
+
+        let mut frame = FrameBuffer::new(20, 7); // 5 text + 1 status + 1 cmd
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 6, true);
+
+        let gw = gutter_width(5, true) as usize;
+        // Line 0 = distance 2 from cursor
+        let row0 = row_chars(&frame, 0);
+        assert!(row0.starts_with(&format!("{:>w$}", 2, w = gw - 1)),
+            "row0 = '{row0}'");
+        // Line 2 = cursor line = distance 0
+        let row2 = row_chars(&frame, 2);
+        assert!(row2.starts_with(&format!("{:>w$}", 0, w = gw - 1)),
+            "row2 = '{row2}'");
+        // Line 4 = distance 2
+        let row4 = row_chars(&frame, 4);
+        assert!(row4.starts_with(&format!("{:>w$}", 2, w = gw - 1)),
+            "row4 = '{row4}'");
+    }
+
+    #[test]
+    fn hybrid_mode_cursor_shows_absolute() {
+        // number + relativenumber = hybrid: cursor line shows absolute.
+        let buf = Buffer::from_text("aaa\nbbb\nccc\nddd\neee");
+        let mut cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_line_numbers(true);
+        v.set_relativenumber(true);
+
+        // Cursor on line 2 (0-indexed), which is line 3 (1-indexed).
+        cursor.move_down(1, &buf, false);
+        cursor.move_down(1, &buf, false);
+
+        let mut frame = FrameBuffer::new(20, 7);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 6, true);
+
+        let gw = gutter_width(5, true) as usize;
+        // Line 0 = distance 2 (relative)
+        let row0 = row_chars(&frame, 0);
+        assert!(row0.starts_with(&format!("{:>w$}", 2, w = gw - 1)),
+            "row0 = '{row0}'");
+        // Line 2 = cursor = absolute 3
+        let row2 = row_chars(&frame, 2);
+        assert!(row2.starts_with(&format!("{:>w$}", 3, w = gw - 1)),
+            "row2 = '{row2}'");
+        // Line 3 = distance 1
+        let row3 = row_chars(&frame, 3);
+        assert!(row3.starts_with(&format!("{:>w$}", 1, w = gw - 1)),
+            "row3 = '{row3}'");
+    }
+
+    #[test]
+    fn cursor_line_number_is_bright() {
+        // Cursor line number should NOT be DIM.
+        let buf = Buffer::from_text("aaa\nbbb\nccc");
+        let mut cursor = Cursor::new();
+        cursor.move_down(1, &buf, false); // cursor on line 1
+        let mut v = View::new();
+        v.set_relativenumber(true);
+
+        let mut frame = FrameBuffer::new(20, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+
+        // Line 1 (cursor) — gutter should NOT be DIM.
+        assert!(!is_dim(&frame, 0, 1), "cursor line number should not be DIM");
+        // Line 0 (not cursor) — gutter should be DIM.
+        assert!(is_dim(&frame, 0, 0), "non-cursor line number should be DIM");
+    }
+
+    #[test]
+    fn no_gutter_when_both_off() {
+        // Neither number nor relativenumber → no gutter.
+        let buf = Buffer::from_text("hello");
+        let cursor = Cursor::new();
+        let mut v = View::new();
+        v.set_line_numbers(false);
+        v.set_relativenumber(false);
+
+        let mut frame = FrameBuffer::new(20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 2, true);
+
+        // First cell should be 'h' (no gutter padding).
+        assert_eq!(frame.get(0, 0).unwrap().character(), Some('h'));
     }
 }

@@ -46,6 +46,8 @@
 
 use std::path::PathBuf;
 
+use crate::options::{self, SetDirective};
+
 // ---------------------------------------------------------------------------
 // Command-line range
 // ---------------------------------------------------------------------------
@@ -157,6 +159,9 @@ pub enum Command {
 
     /// `:only` — close all windows except the current one.
     WinOnly,
+
+    /// `:set [option[=value] ...]` — get or set editor options.
+    Set(Vec<SetDirective>),
 
     /// Unknown command — contains the full input for error reporting.
     Unknown(String),
@@ -370,6 +375,7 @@ fn parse_command(input: &str) -> Command {
         "vsp" | "vsplit" => Command::VSplit,
         "close" | "clo" => Command::WinClose,
         "only" | "on" => Command::WinOnly,
+        "set" | "se" => Command::Set(options::parse_set(arg)),
         _ => Command::Unknown(trimmed.to_string()),
     }
 }
@@ -1223,5 +1229,55 @@ mod tests {
     fn parse_win_only() {
         assert_eq!(parse_command("only"), Command::WinOnly);
         assert_eq!(parse_command("on"), Command::WinOnly);
+    }
+
+    // ── :set command ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_set_boolean() {
+        assert_eq!(
+            parse_command("set number"),
+            Command::Set(vec![SetDirective::On("number".into())])
+        );
+        assert_eq!(
+            parse_command("se rnu"),
+            Command::Set(vec![SetDirective::On("rnu".into())])
+        );
+    }
+
+    #[test]
+    fn parse_set_no_args() {
+        assert_eq!(
+            parse_command("set"),
+            Command::Set(vec![SetDirective::ShowChanged])
+        );
+    }
+
+    #[test]
+    fn parse_set_assign() {
+        assert_eq!(
+            parse_command("set scrolloff=5"),
+            Command::Set(vec![SetDirective::Assign("scrolloff".into(), "5".into())])
+        );
+    }
+
+    #[test]
+    fn parse_set_multiple() {
+        let result = parse_command("set number scrolloff=5");
+        match result {
+            Command::Set(dirs) => {
+                assert_eq!(dirs.len(), 2);
+                assert_eq!(dirs[0], SetDirective::On("number".into()));
+                assert_eq!(dirs[1], SetDirective::Assign("scrolloff".into(), "5".into()));
+            }
+            other => panic!("Expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_set_not_confused_with_s() {
+        // `:set` should not be confused with `:s` (substitute).
+        assert!(matches!(parse_command("set number"), Command::Set(_)));
+        assert!(matches!(parse_command("se number"), Command::Set(_)));
     }
 }
