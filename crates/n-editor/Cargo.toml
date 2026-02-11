@@ -11,4 +11,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+n-term = { path = "../n-term" }
 ropey = "1"
+unicode-width = "0.2"
