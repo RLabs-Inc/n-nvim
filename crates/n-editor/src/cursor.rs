@@ -30,6 +30,7 @@
 
 use crate::buffer::Buffer;
 use crate::position::{Position, Range};
+use crate::word;
 
 /// A cursor in a text buffer.
 ///
@@ -245,6 +246,74 @@ impl Cursor {
         self.pos.line = last_line;
         let max_col = max_col_for_line(buf, last_line, past_end);
         self.pos.col = self.sticky_col.min(max_col);
+    }
+
+    // -- Word motions -------------------------------------------------------
+
+    /// Move forward to the start of the next word. This is `w` in Vim.
+    /// Resets sticky column.
+    pub fn word_forward(&mut self, count: usize, buf: &Buffer, past_end: bool) {
+        for _ in 0..count {
+            self.pos = word::word_forward(buf, self.pos);
+        }
+        let max_col = max_col_for_line(buf, self.pos.line, past_end);
+        self.pos.col = self.pos.col.min(max_col);
+        self.sticky_col = self.pos.col;
+    }
+
+    /// Move backward to the start of the previous word. This is `b` in Vim.
+    /// Resets sticky column.
+    pub fn word_backward(&mut self, count: usize, buf: &Buffer, past_end: bool) {
+        for _ in 0..count {
+            self.pos = word::word_backward(buf, self.pos);
+        }
+        let max_col = max_col_for_line(buf, self.pos.line, past_end);
+        self.pos.col = self.pos.col.min(max_col);
+        self.sticky_col = self.pos.col;
+    }
+
+    /// Move forward to the end of the current or next word. This is `e` in Vim.
+    /// Resets sticky column.
+    pub fn word_end_forward(&mut self, count: usize, buf: &Buffer, past_end: bool) {
+        for _ in 0..count {
+            self.pos = word::word_end_forward(buf, self.pos);
+        }
+        let max_col = max_col_for_line(buf, self.pos.line, past_end);
+        self.pos.col = self.pos.col.min(max_col);
+        self.sticky_col = self.pos.col;
+    }
+
+    /// Move forward to the start of the next WORD. This is `W` in Vim.
+    /// Resets sticky column.
+    pub fn big_word_forward(&mut self, count: usize, buf: &Buffer, past_end: bool) {
+        for _ in 0..count {
+            self.pos = word::big_word_forward(buf, self.pos);
+        }
+        let max_col = max_col_for_line(buf, self.pos.line, past_end);
+        self.pos.col = self.pos.col.min(max_col);
+        self.sticky_col = self.pos.col;
+    }
+
+    /// Move backward to the start of the previous WORD. This is `B` in Vim.
+    /// Resets sticky column.
+    pub fn big_word_backward(&mut self, count: usize, buf: &Buffer, past_end: bool) {
+        for _ in 0..count {
+            self.pos = word::big_word_backward(buf, self.pos);
+        }
+        let max_col = max_col_for_line(buf, self.pos.line, past_end);
+        self.pos.col = self.pos.col.min(max_col);
+        self.sticky_col = self.pos.col;
+    }
+
+    /// Move forward to the end of the current or next WORD. This is `E` in Vim.
+    /// Resets sticky column.
+    pub fn big_word_end_forward(&mut self, count: usize, buf: &Buffer, past_end: bool) {
+        for _ in 0..count {
+            self.pos = word::big_word_end_forward(buf, self.pos);
+        }
+        let max_col = max_col_for_line(buf, self.pos.line, past_end);
+        self.pos.col = self.pos.col.min(max_col);
+        self.sticky_col = self.pos.col;
     }
 
     // -- Clamping -----------------------------------------------------------
@@ -857,6 +926,113 @@ mod tests {
 
         c.move_to_line_end(&buf, true);
         assert_eq!(c.position(), Position::ZERO);
+    }
+
+    // -- Word motions -------------------------------------------------------
+
+    #[test]
+    fn word_forward_basic() {
+        let buf = Buffer::from_text("hello world foo");
+        let mut c = Cursor::new();
+
+        c.word_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 6));
+        assert_eq!(c.sticky_col(), 6);
+    }
+
+    #[test]
+    fn word_forward_with_count() {
+        let buf = Buffer::from_text("one two three four");
+        let mut c = Cursor::new();
+
+        c.word_forward(3, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 14));
+    }
+
+    #[test]
+    fn word_backward_basic() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::at(Position::new(0, 6));
+
+        c.word_backward(1, &buf, false);
+        assert_eq!(c.position(), Position::ZERO);
+        assert_eq!(c.sticky_col(), 0);
+    }
+
+    #[test]
+    fn word_backward_with_count() {
+        let buf = Buffer::from_text("one two three four");
+        let mut c = Cursor::at(Position::new(0, 14));
+
+        c.word_backward(2, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 4));
+    }
+
+    #[test]
+    fn word_end_forward_basic() {
+        let buf = Buffer::from_text("hello world");
+        let mut c = Cursor::new();
+
+        c.word_end_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 4));
+        assert_eq!(c.sticky_col(), 4);
+    }
+
+    #[test]
+    fn word_end_forward_with_count() {
+        let buf = Buffer::from_text("one two three");
+        let mut c = Cursor::new();
+
+        c.word_end_forward(2, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 6));
+    }
+
+    #[test]
+    fn big_word_forward_basic() {
+        let buf = Buffer::from_text("hello.world next");
+        let mut c = Cursor::new();
+
+        c.big_word_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 12));
+    }
+
+    #[test]
+    fn big_word_backward_basic() {
+        let buf = Buffer::from_text("hello.world next");
+        let mut c = Cursor::at(Position::new(0, 12));
+
+        c.big_word_backward(1, &buf, false);
+        assert_eq!(c.position(), Position::ZERO);
+    }
+
+    #[test]
+    fn big_word_end_forward_basic() {
+        let buf = Buffer::from_text("hello.world next");
+        let mut c = Cursor::new();
+
+        c.big_word_end_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(0, 10));
+    }
+
+    #[test]
+    fn word_motion_resets_sticky_col() {
+        let buf = Buffer::from_text("short\nverylongline\nhi");
+        let mut c = Cursor::at(Position::new(1, 11)); // in "verylongline"
+        assert_eq!(c.sticky_col(), 11);
+
+        c.word_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(2, 0));
+        assert_eq!(c.sticky_col(), 0); // reset by word motion
+    }
+
+    #[test]
+    fn word_forward_clamps_past_end() {
+        // On an empty line in normal mode, cursor must be at col 0.
+        let buf = Buffer::from_text("hello\n\nworld");
+        let mut c = Cursor::new();
+
+        c.word_forward(1, &buf, false);
+        assert_eq!(c.position(), Position::new(1, 0));
     }
 
     // -- Single-char buffer -------------------------------------------------

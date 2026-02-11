@@ -6,11 +6,13 @@
 //! - **[`buffer`]** — `Buffer` wrapping a rope with editing, file I/O, and metadata
 //! - **[`mode`]** — Vim-style modal editing (`Normal`, `Insert`, `Visual`, etc.)
 //! - **[`cursor`]** — Cursor with movement, sticky column, and selection
+//! - **[`word`]** — Word/WORD boundary detection for `w`/`b`/`e`/`W`/`B`/`E` motions
 //!
-//! Future modules will add word motions, split tree layout, floating windows,
-//! commands, and the view layer that bridges buffers to n-term's rendering.
+//! Future modules will add split tree layout, floating windows, commands, and
+//! the view layer that bridges buffers to n-term's rendering.
 
 pub mod buffer;
 pub mod cursor;
 pub mod mode;
 pub mod position;
+pub mod word;
