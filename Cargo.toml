@@ -16,3 +16,21 @@ unsafe_code = "warn"
 all = "warn"
 pedantic = "warn"
 nursery = "warn"
+
+# ── Binary crate (the editor itself) ─────────────────────────
+
+[package]
+name = "n-nvim"
+description = "A terminal text editor that reimagines Neovim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+n-term = { path = "crates/n-term" }
+n-editor = { path = "crates/n-editor" }

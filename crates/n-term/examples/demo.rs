@@ -181,7 +181,7 @@ impl App for Demo {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn paint(&self, buf: &mut FrameBuffer) {
+    fn paint(&mut self, buf: &mut FrameBuffer) {
         let w = buf.width();
         let h = buf.height();
 

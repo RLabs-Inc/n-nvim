@@ -40,11 +40,12 @@
 // bytes as literal events. With an 8.3ms timeout, the user experiences
 // at most 8.3ms lag on Escape — imperceptible.
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
+use crate::ansi;
 use crate::buffer::FrameBuffer;
 use crate::diff::DiffRenderer;
 use crate::input::{Event, Parser};
@@ -102,6 +103,7 @@ pub enum Action {
 /// 2. [`on_resize`](App::on_resize) — when the terminal size changes
 /// 3. [`on_tick`](App::on_tick) — every loop iteration (for animations)
 /// 4. [`paint`](App::paint) — when the frame is dirty and needs redrawing
+/// 5. [`cursor`](App::cursor) — after paint, to position the hardware cursor
 ///
 /// Only [`paint`](App::paint) is required. Everything else has default
 /// no-op implementations.
@@ -133,7 +135,22 @@ pub trait App {
     /// Called only when the frame is dirty (input arrived, resize
     /// happened, or `on_tick` returned `true`). The buffer has been
     /// cleared before this call — paint everything you want visible.
-    fn paint(&self, buf: &mut FrameBuffer);
+    ///
+    /// Takes `&mut self` so the application can update render state
+    /// (e.g., store the computed cursor screen position for [`cursor`]).
+    fn paint(&mut self, buf: &mut FrameBuffer);
+
+    /// The terminal cursor position and shape after painting.
+    ///
+    /// Return `Some((x, y, shape))` to show the hardware cursor at the
+    /// given screen position with the given shape, or `None` to keep the
+    /// cursor hidden. Called after every [`paint`] to update the cursor.
+    ///
+    /// The event loop handles cursor show/hide and shape changes — the
+    /// application just reports where the cursor should be.
+    fn cursor(&self) -> Option<(u16, u16, crate::ansi::CursorShape)> {
+        None
+    }
 }
 
 // ─── Frame Loop Config ───────────────────────────────────────────────────────
@@ -185,7 +202,7 @@ impl Default for LoopConfig {
 ///         Action::Continue
 ///     }
 ///
-///     fn paint(&self, buf: &mut FrameBuffer) {
+///     fn paint(&mut self, buf: &mut FrameBuffer) {
 ///         // Paint your UI here...
 ///     }
 /// }
@@ -320,6 +337,19 @@ impl EventLoop {
                 app.paint(&mut frame);
                 self.renderer.render(&frame);
                 self.renderer.flush()?;
+
+                // Position the hardware cursor after frame output.
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                if let Some((x, y, shape)) = app.cursor() {
+                    ansi::cursor_to(&mut lock, x, y)?;
+                    ansi::set_cursor_shape(&mut lock, shape)?;
+                    ansi::cursor_show(&mut lock)?;
+                } else {
+                    ansi::cursor_hide(&mut lock)?;
+                }
+                lock.flush()?;
+
                 dirty = false;
             }
         }
@@ -403,7 +433,7 @@ mod tests {
 
     struct MinimalApp;
     impl App for MinimalApp {
-        fn paint(&self, _buf: &mut FrameBuffer) {}
+        fn paint(&mut self, _buf: &mut FrameBuffer) {}
     }
 
     #[test]
@@ -431,13 +461,21 @@ mod tests {
     fn paint_receives_sized_buffer() {
         struct CheckSize;
         impl App for CheckSize {
-            fn paint(&self, buf: &mut FrameBuffer) {
+            fn paint(&mut self, buf: &mut FrameBuffer) {
                 assert!(buf.width() > 0);
                 assert!(buf.height() > 0);
             }
         }
-        let app = CheckSize;
+        let mut app = CheckSize;
         let mut buf = FrameBuffer::new(80, 24);
         app.paint(&mut buf);
+    }
+
+    // ── Cursor defaults ───────────────────────────────────────
+
+    #[test]
+    fn app_default_cursor_is_none() {
+        let app = MinimalApp;
+        assert!(app.cursor().is_none());
     }
 }
