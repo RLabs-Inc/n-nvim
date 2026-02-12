@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use n_editor::buffer::Buffer;
+use n_editor::highlight::{detect_language, Highlighter};
 use n_editor::command::{CmdRange, Command, CommandLine, CommandResult, SubFlags};
 use n_editor::cursor::Cursor;
 use n_editor::history::History;
@@ -287,6 +288,8 @@ struct BufEntry {
     last_cursor: Cursor,
     /// Last-seen view state — restored when a window switches to this buffer.
     last_view: View,
+    /// Syntax highlighter (if language was detected for this buffer).
+    highlighter: Option<Highlighter>,
 }
 
 /// Per-window state — how a window views a buffer.
@@ -502,6 +505,9 @@ struct Editor {
     /// The active editor theme (Sacred Geometry mathematical theming).
     theme: Theme,
 
+    /// Syntax highlighter for the active buffer.
+    highlighter: Option<Highlighter>,
+
     // ── Command history ──────────────────────────────────────────────
     /// Previous commands (newest last).
     cmd_history: Vec<String>,
@@ -570,6 +576,7 @@ impl Editor {
             cursorline: false,
             completion: None,
             theme: Theme::terminal(),
+            highlighter: None,
             cmd_history: Vec::new(),
             cmd_history_idx: None,
             cmd_saved_input: String::new(),
@@ -583,6 +590,9 @@ impl Editor {
             eprintln!("n-nvim: {path}: {e}");
             process::exit(1);
         });
+        let theme = Theme::terminal();
+        let highlighter = detect_language(&path_buf)
+            .and_then(|lang| Highlighter::new(lang, &theme));
         Self {
             buffer,
             cursor: Cursor::new(),
@@ -636,7 +646,8 @@ impl Editor {
             wrapscan: true,
             cursorline: false,
             completion: None,
-            theme: Theme::terminal(),
+            theme,
+            highlighter,
             cmd_history: Vec::new(),
             cmd_history_idx: None,
             cmd_saved_input: String::new(),
@@ -666,6 +677,10 @@ impl Editor {
     fn commit_history(&mut self) {
         if let Some(change_pos) = self.history.commit(self.cursor.position()) {
             self.change_list.push(change_pos);
+        }
+        // Syntax tree needs re-parsing after buffer changes.
+        if let Some(ref mut hl) = self.highlighter {
+            hl.mark_dirty();
         }
     }
 
@@ -699,6 +714,7 @@ impl Editor {
             last_visual_lines: self.last_visual_lines.take(),
             last_cursor: self.cursor.clone(),
             last_view: self.view.clone(),
+            highlighter: self.highlighter.take(),
         }
     }
 
@@ -710,6 +726,7 @@ impl Editor {
         self.marks = be.marks;
         self.change_list = be.change_list;
         self.last_visual_lines = be.last_visual_lines;
+        self.highlighter = be.highlighter;
     }
 
     // ── Window pack/unpack ─────────────────────────────────────────
@@ -862,6 +879,8 @@ impl Editor {
         self.marks = [None; 26];
         self.change_list = ChangeList::new();
         self.last_visual_lines = None;
+        self.highlighter = detect_language(path)
+            .and_then(|lang| Highlighter::new(lang, &self.theme));
 
         // Record alternate.
         self.alternate_buf_id = Some(old_id);
@@ -1124,7 +1143,7 @@ impl Editor {
         let buf = self.get_buffer_by_id(ws.buf_id);
         ws.view.render(
             buf, &ws.cursor, Mode::Normal, None, buf_info,
-            frame, rect.x, rect.y, rect.w, rect.h, false, &self.theme,
+            frame, rect.x, rect.y, rect.w, rect.h, false, &self.theme, None,
         );
         self.other_wins.insert(ws_idx, ws);
     }
@@ -1467,6 +1486,9 @@ impl Editor {
                     }
                     if let Some(pos) = last_pos {
                         self.cursor.set_position(pos, &self.buffer, pe);
+                        if let Some(ref mut hl) = self.highlighter {
+                            hl.mark_dirty();
+                        }
                     }
                     return Action::Continue;
                 }
@@ -2475,6 +2497,9 @@ impl Editor {
                 }
                 if let Some(pos) = last_pos {
                     self.cursor.set_position(pos, &self.buffer, pe);
+                    if let Some(ref mut hl) = self.highlighter {
+                        hl.mark_dirty();
+                    }
                 }
             }
 
@@ -3627,6 +3652,14 @@ impl Editor {
         self.execute_substitute(range, &pattern, &replacement, flags)
     }
 
+    /// Set the active theme and update the highlighter's color mapping.
+    fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        if let Some(ref mut hl) = self.highlighter {
+            hl.update_theme(&self.theme);
+        }
+    }
+
     /// `:colorscheme <args>` — theme commands.
     ///
     /// - `:colorscheme` — show current theme name
@@ -3645,7 +3678,7 @@ impl Editor {
 
         // `:colorscheme terminal` — ANSI default.
         if args == "terminal" {
-            self.theme = Theme::terminal();
+            self.set_theme(Theme::terminal());
             return CommandResult::Ok(Some("terminal".to_string()));
         }
 
@@ -3664,7 +3697,7 @@ impl Editor {
 
         // `:colorscheme random` — fully random.
         if args == "random" {
-            self.theme = Theme::generate_surprise();
+            self.set_theme(Theme::generate_surprise());
             let pattern = self.theme.pattern.map_or("?", |p| p.name());
             let hue = self.theme.base_hue.unwrap_or(0.0);
             return CommandResult::Ok(Some(format!(
@@ -3696,22 +3729,21 @@ impl Editor {
                     #[allow(clippy::cast_precision_loss)]
                     { (scrambled % 360) as f32 }
                 });
-            self.theme = Theme::generate_random(pattern, hue, true);
+            self.set_theme(Theme::generate_random(pattern, hue, true));
             return CommandResult::Ok(Some(format!(
                 "{} (hue={hue:.0})", pattern.name(),
             )));
         }
 
         // `:colorscheme <name>` — load a builtin.
-        if let Some(theme) = n_theme::builtin::builtin_theme(args) {
-            let msg = args.to_string();
-            self.theme = theme;
-            CommandResult::Ok(Some(msg))
-        } else {
-            CommandResult::Err(format!(
-                "E185: Unknown \"{args}\". Try :colorscheme list"
-            ))
-        }
+        n_theme::builtin::builtin_theme(args).map_or_else(
+            || CommandResult::Err(format!("E185: Unknown \"{args}\". Try :colorscheme list")),
+            |theme| {
+                let msg = args.to_string();
+                self.set_theme(theme);
+                CommandResult::Ok(Some(msg))
+            },
+        )
     }
 
     /// `:set` — apply one or more option directives.
@@ -6004,6 +6036,11 @@ impl App for Editor {
         let h = frame.height();
         self.last_frame_size = (w, h);
 
+        // Ensure syntax tree is up-to-date before rendering.
+        if let Some(ref mut hl) = self.highlighter {
+            hl.ensure_parsed(self.buffer.rope());
+        }
+
         if h < 2 {
             // Too small for multi-window — just render the active window.
             let selection = match self.mode {
@@ -6011,9 +6048,17 @@ impl App for Editor {
                 _ => None,
             };
             let buf_info = self.buf_info_label();
+            // Settle scroll position before computing syntax colors — render()
+            // calls ensure_cursor_visible internally, but we need the final
+            // top_line *before* viewport_colors so the line indices align.
+            self.view.ensure_cursor_visible(&self.cursor, &self.buffer, w, h);
+            let syntax = self.highlighter.as_ref().map(|hl| {
+                hl.viewport_colors(self.view.top_line(), h as usize, self.buffer.rope())
+            });
             self.cursor_screen = self.view.render(
                 &self.buffer, &self.cursor, self.mode, selection, &buf_info,
                 frame, 0, 0, w, h, true, &self.theme,
+                syntax.as_deref(),
             );
             if self.cursorline {
                 view::highlight_cursorline(
@@ -6042,9 +6087,16 @@ impl App for Editor {
                 };
                 // Store text height for active window (for Ctrl+D/U).
                 self.last_text_height = rect.h.saturating_sub(1) as usize;
+                let text_h = rect.h.saturating_sub(1) as usize;
+                // Settle scroll before computing syntax colors (see comment above).
+                self.view.ensure_cursor_visible(&self.cursor, &self.buffer, rect.w, rect.h);
+                let syntax = self.highlighter.as_ref().map(|hl| {
+                    hl.viewport_colors(self.view.top_line(), text_h, self.buffer.rope())
+                });
                 self.cursor_screen = self.view.render(
                     &self.buffer, &self.cursor, self.mode, selection, &buf_info,
                     frame, rect.x, rect.y, rect.w, rect.h, true, &self.theme,
+                    syntax.as_deref(),
                 );
                 // Highlight cursorline in the active window.
                 if self.cursorline {
