@@ -120,6 +120,39 @@ fn clipboard_read() -> Option<String> {
     }
 }
 
+// ─── Comment syntax ─────────────────────────────────────────────────────────
+
+/// Returns the single-line comment prefix for a file, based on its extension.
+///
+/// Covers the most common languages. Returns `None` for file types that only
+/// support block comments (HTML, CSS) or that we don't recognize.
+fn comment_prefix(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?;
+    match ext {
+        // C-family: //
+        "rs" | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "hxx" | "go" | "java" | "js"
+        | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "swift" | "kt" | "kts" | "scala"
+        | "dart" | "php" | "cs" | "zig" | "d" | "v" | "proto" | "groovy" | "jsonc"
+        | "sc" | "gradle" => Some("//"),
+        // Scripting: #
+        "py" | "pyi" | "rb" | "sh" | "bash" | "zsh" | "fish" | "pl" | "pm" | "r" | "toml"
+        | "yaml" | "yml" | "dockerfile" | "ex" | "exs" | "cr" | "nim" | "jl" | "coffee"
+        | "mk" | "cmake" | "tf" | "nix" | "ps1" | "psm1" | "tcl" | "gd" | "conf" => {
+            Some("#")
+        }
+        // Lua / SQL / Haskell: --
+        "lua" | "sql" | "hs" | "lhs" | "ada" | "adb" | "ads" | "elm" => Some("--"),
+        // Vim script: "
+        "vim" => Some("\""),
+        // Lisp family: ;
+        "lisp" | "cl" | "clj" | "cljs" | "cljc" | "scm" | "el" | "asm" | "s" | "ini"
+        | "rkt" => Some(";"),
+        // LaTeX / Erlang: %
+        "tex" | "latex" | "cls" | "sty" | "erl" | "hrl" | "m" => Some("%"),
+        _ => None,
+    }
+}
+
 // ─── Character find direction ───────────────────────────────────────────────
 
 /// Direction and mode for `f`/`F`/`t`/`T` character-find motions.
@@ -1643,9 +1676,11 @@ impl Editor {
                     self.dot_keys.push(*key);
                 }
 
-                // Same key = line operation (dd, yy, cc, >>, <<).
+                // Same key = line operation (dd, yy, cc, >>, <<, gcc).
+                // For comment toggle (#), the repeat key is 'c' (from `gcc`).
                 // Effective count: op_count * motion_count.
-                if key.code == KeyCode::Char(op) {
+                let repeat_char = if op == '#' { 'c' } else { op };
+                if key.code == KeyCode::Char(repeat_char) {
                     let raw_motion_count = self.take_raw_count();
                     let motion_count = raw_motion_count.unwrap_or(1);
                     let effective = op_count * motion_count;
@@ -1657,6 +1692,9 @@ impl Editor {
 
                     let action = if op == '>' || op == '<' {
                         self.indent_outdent_line_op(op, effective);
+                        Action::Continue
+                    } else if op == '#' {
+                        self.comment_line_op(effective);
                         Action::Continue
                     } else {
                         self.operator_line(op, effective)
@@ -2022,6 +2060,25 @@ impl Editor {
                                 break;
                             }
                         }
+                    }
+                    KeyCode::Char('c') => {
+                        // `gc` — enter comment toggle operator-pending mode.
+                        // We use '#' as the internal operator code for comments.
+                        // The Operator handler treats 'c' as the repeat key for
+                        // '#' so that `gcc` works like `dd`/`>>`.
+                        let op_count = count.unwrap_or(1);
+                        self.dot_recording = true;
+                        self.dot_keys.clear();
+                        self.dot_keys.push(KeyEvent {
+                            code: KeyCode::Char('g'),
+                            modifiers: Modifiers::empty(),
+                            kind: n_term::input::KeyEventKind::Press,
+                        });
+                        self.dot_keys.push(*key);
+                        self.dot_effective_count = count;
+                        self.pending =
+                            Some(Pending::Operator { op: '#', count: op_count });
+                        return Action::Continue;
                     }
                     _ => {} // Unrecognized — cancel silently.
                 }
@@ -4164,16 +4221,19 @@ impl Editor {
                         self.goto_mark(ch, exact);
                     }
                 }
-                Pending::GPrefix { count } => {
+                Pending::GPrefix { count: vis_count } => {
                     if key.code == KeyCode::Char('g') {
                         // `gg` — goto first/Nth line.
                         self.jump_list.push(self.cursor.position());
-                        if let Some(n) = count {
+                        if let Some(n) = vis_count {
                             self.cursor
                                 .goto_line(n.saturating_sub(1), &self.buffer, pe);
                         } else {
                             self.cursor.move_to_first_line(&self.buffer, pe);
                         }
+                    } else if key.code == KeyCode::Char('c') {
+                        // `gc` in visual mode — toggle comments on selection.
+                        self.visual_comment_toggle();
                     }
                     // g; and g, are not valid in visual mode — cancel.
                 }
@@ -4879,6 +4939,25 @@ impl Editor {
             }
         }
         self.commit_history();
+    }
+
+    /// Toggle comments on the visual selection (`gc` in visual mode).
+    ///
+    /// Comments or uncomments all lines in the selection, then exits visual
+    /// mode.
+    fn visual_comment_toggle(&mut self) {
+        if !matches!(self.mode, Mode::Visual(_)) {
+            return;
+        }
+        let Some(range) = self.cursor.selection() else {
+            self.cursor.clear_anchor();
+            self.mode = Mode::Normal;
+            return;
+        };
+
+        self.cursor.clear_anchor();
+        self.mode = Mode::Normal;
+        self.toggle_comment_lines(range.start.line, range.end.line);
     }
 
     /// Indent the visual selection (`>` in visual mode).
@@ -5589,6 +5668,10 @@ impl Editor {
                 self.indent_outdent_range(op, range);
                 Action::Continue
             }
+            '#' => {
+                self.comment_toggle_range(range);
+                Action::Continue
+            }
             _ => self.apply_operator(op, range, linewise),
         }
     }
@@ -5635,6 +5718,169 @@ impl Editor {
             '>' => self.indent_lines(first, last),
             '<' => self.outdent_lines(first, last),
             _ => {}
+        }
+    }
+
+    // ── Comment toggle (gcc / gc{motion}) ─────────────────────────────
+
+    /// Toggle line comments on `count` lines starting from the cursor (`gcc`).
+    fn comment_line_op(&mut self, count: usize) {
+        let first = self.cursor.line();
+        let last = (first + count - 1).min(self.buffer.line_count().saturating_sub(1));
+        self.toggle_comment_lines(first, last);
+    }
+
+    /// Toggle line comments on lines covered by an arbitrary range (`gc{motion}`).
+    ///
+    /// Like `>` / `<`, comment toggle is linewise — `gcw` comments the full
+    /// line the motion spans. If the range ends at column 0, that line is
+    /// excluded (exclusive end of a linewise range).
+    fn comment_toggle_range(&mut self, range: Range) {
+        let start_content_len = self.buffer.line_content_len(range.start.line).unwrap_or(0);
+        let first_line = if start_content_len > 0 && range.start.col >= start_content_len {
+            range.start.line + 1
+        } else {
+            range.start.line
+        };
+
+        let last_line = if range.end.col == 0 && range.end.line > first_line {
+            range.end.line - 1
+        } else {
+            range.end.line
+        };
+
+        if first_line > last_line {
+            return;
+        }
+        self.toggle_comment_lines(first_line, last_line);
+    }
+
+    /// Core comment toggle: if all non-empty lines are commented, uncomment;
+    /// otherwise comment all.
+    ///
+    /// Comment markers are inserted at the minimum indentation level of the
+    /// range (vim-commentary style), preserving relative indentation.
+    fn toggle_comment_lines(&mut self, first: usize, last: usize) {
+        let Some(prefix) = self
+            .buffer
+            .path()
+            .and_then(comment_prefix)
+        else {
+            self.set_error("No comment syntax known for this file type");
+            return;
+        };
+
+        // Determine toggle direction: if ALL non-empty lines are commented,
+        // uncomment. Otherwise, comment all.
+        let mut all_commented = true;
+        for line_idx in first..=last {
+            let Some(line) = self.buffer.line(line_idx) else {
+                continue;
+            };
+            let text: String = line.to_string();
+            let trimmed = text.trim_start();
+            if trimmed.is_empty() || trimmed == "\n" {
+                continue; // skip empty / whitespace-only
+            }
+            if !trimmed.starts_with(prefix) {
+                all_commented = false;
+                break;
+            }
+        }
+
+        self.history.begin(self.cursor.position());
+
+        if all_commented {
+            self.uncomment_lines(first, last, prefix);
+        } else {
+            self.comment_lines(first, last, prefix);
+        }
+
+        // Cursor to first non-blank of first line.
+        self.cursor
+            .set_position(Position::new(first, 0), &self.buffer, false);
+        self.cursor.move_to_first_non_blank(&self.buffer, false);
+        self.commit_history();
+
+        let count = last - first + 1;
+        if count > 1 {
+            let action = if all_commented {
+                "uncommented"
+            } else {
+                "commented"
+            };
+            self.set_message(format!("{count} lines {action}"));
+        }
+    }
+
+    /// Insert comment markers at the minimum indent level of the range.
+    fn comment_lines(&mut self, first: usize, last: usize, prefix: &str) {
+        // Find the minimum indentation among non-empty lines.
+        let min_indent = (first..=last)
+            .filter_map(|i| {
+                let line = self.buffer.line(i)?;
+                let text: String = line.to_string();
+                let trimmed = text.trim_start();
+                if trimmed.is_empty() || trimmed == "\n" {
+                    None
+                } else {
+                    Some(text.len() - trimmed.len())
+                }
+            })
+            .min()
+            .unwrap_or(0);
+
+        let insert_text = format!("{prefix} ");
+
+        // Insert in reverse for position stability.
+        for line_idx in (first..=last).rev() {
+            let Some(line) = self.buffer.line(line_idx) else {
+                continue;
+            };
+            let text: String = line.to_string();
+            let trimmed = text.trim_start();
+            if trimmed.is_empty() || trimmed == "\n" {
+                continue; // skip empty / whitespace-only
+            }
+            let pos = Position::new(line_idx, min_indent);
+            self.history.record_insert(pos, &insert_text);
+            self.buffer.insert(pos, &insert_text);
+        }
+    }
+
+    /// Remove comment markers from each line.
+    fn uncomment_lines(&mut self, first: usize, last: usize, prefix: &str) {
+        // Remove in reverse for position stability.
+        for line_idx in (first..=last).rev() {
+            let Some(line) = self.buffer.line(line_idx) else {
+                continue;
+            };
+            let text: String = line.to_string();
+            let trimmed = text.trim_start();
+            if trimmed.is_empty() || trimmed == "\n" {
+                continue;
+            }
+            if !trimmed.starts_with(prefix) {
+                continue;
+            }
+
+            let leading_ws = text.len() - trimmed.len();
+            // Remove `prefix` + optional trailing space.
+            let remove_len = if trimmed[prefix.len()..].starts_with(' ') {
+                prefix.len() + 1
+            } else {
+                prefix.len()
+            };
+            let from = Position::new(line_idx, leading_ws);
+            let to = Position::new(line_idx, leading_ws + remove_len);
+            let range = Range::new(from, to);
+            let deleted: String = self
+                .buffer
+                .slice(range)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            self.history.record_delete(range.start, &deleted);
+            self.buffer.delete(range);
         }
     }
 
@@ -11562,5 +11808,368 @@ mod tests {
         // delete + insert. Undo reverses the insert-mode transaction as a whole.
         // This just verifies undo doesn't crash.
         assert!(e.buffer.contents().contains("world"));
+    }
+
+    // ── Comment toggle (gcc / gc{motion}) ──────────────────────────────
+
+    /// Helper: create an editor with a `.rs` file path so comment prefix is `//`.
+    fn rust_editor(text: &str) -> Editor {
+        let mut e = editor_with(text);
+        e.buffer.set_path(PathBuf::from("test.rs"));
+        e
+    }
+
+    /// Helper: create an editor with a `.py` file path so comment prefix is `#`.
+    fn python_editor(text: &str) -> Editor {
+        let mut e = editor_with(text);
+        e.buffer.set_path(PathBuf::from("test.py"));
+        e
+    }
+
+    #[test]
+    fn gcc_comments_single_line() {
+        let mut e = rust_editor("hello world");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "// hello world");
+    }
+
+    #[test]
+    fn gcc_uncomments_single_line() {
+        let mut e = rust_editor("// hello world");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "hello world");
+    }
+
+    #[test]
+    fn gcc_comments_preserves_indent() {
+        let mut e = rust_editor("    let x = 1;");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "    // let x = 1;");
+    }
+
+    #[test]
+    fn gcc_uncomments_indented_line() {
+        let mut e = rust_editor("    // let x = 1;");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "    let x = 1;");
+    }
+
+    #[test]
+    fn gcc_with_count() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\n// ccc");
+    }
+
+    #[test]
+    fn gcc_uncomment_with_count() {
+        let mut e = rust_editor("// aaa\n// bbb\nccc");
+        feed(
+            &mut e,
+            &[press('2'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+    }
+
+    #[test]
+    fn gcc_skips_empty_lines() {
+        let mut e = rust_editor("aaa\n\nccc");
+        // Comment 3 lines — empty line should be left alone.
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n\n// ccc");
+    }
+
+    #[test]
+    fn gcc_minimum_indent() {
+        // The minimum indent is 4 (from line 1). Comment marker goes at col 4.
+        let mut e = rust_editor("    if true {\n        foo();\n    }");
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(
+            e.buffer.contents(),
+            "    // if true {\n    //     foo();\n    // }"
+        );
+    }
+
+    #[test]
+    fn gcc_uncomment_at_indent() {
+        let mut e = rust_editor("    // if true {\n    //     foo();\n    // }");
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(
+            e.buffer.contents(),
+            "    if true {\n        foo();\n    }"
+        );
+    }
+
+    #[test]
+    fn gcc_toggle_mixed_only_comments() {
+        // If NOT all lines are commented, commenting wins.
+        let mut e = rust_editor("// aaa\nbbb\n// ccc");
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "// // aaa\n// bbb\n// // ccc");
+    }
+
+    #[test]
+    fn gc_motion_j() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        // gc j = comment 2 lines.
+        feed(
+            &mut e,
+            &[press('g'), press('c'), press('j')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\nccc");
+    }
+
+    #[test]
+    fn gc_motion_2j() {
+        let mut e = rust_editor("aaa\nbbb\nccc\nddd");
+        // gc2j = comment 3 lines (current + 2 down).
+        feed(
+            &mut e,
+            &[press('g'), press('c'), press('2'), press('j')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\n// ccc\nddd");
+    }
+
+    #[test]
+    fn gc_motion_gg() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        // Move to last line, then gcgg = comment from bottom to top.
+        feed(
+            &mut e,
+            &[press('G'), press('g'), press('c'), press('g'), press('g')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\n// ccc");
+    }
+
+    #[test]
+    fn visual_gc() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        // v j gc = select 2 lines, toggle comment.
+        feed(
+            &mut e,
+            &[press('v'), press('j'), press('g'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\nccc");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_gc_uncomment() {
+        let mut e = rust_editor("// aaa\n// bbb\nccc");
+        // V j gc = select 2 lines, uncomment.
+        feed(
+            &mut e,
+            &[press('V'), press('j'), press('g'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "aaa\nbbb\nccc");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn gcc_undo() {
+        let mut e = rust_editor("hello");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "// hello");
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "hello");
+    }
+
+    #[test]
+    fn gcc_undo_multiline() {
+        let mut e = rust_editor("aaa\nbbb");
+        feed(
+            &mut e,
+            &[press('2'), press('g'), press('c'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb");
+        // Single undo should undo the entire operation.
+        feed(&mut e, &[press('u')]);
+        assert_eq!(e.buffer.contents(), "aaa\nbbb");
+    }
+
+    #[test]
+    fn gcc_dot_repeat() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        // gcc on first line, then j . to repeat on second line.
+        feed(
+            &mut e,
+            &[press('g'), press('c'), press('c'), press('j'), press('.')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\nccc");
+    }
+
+    #[test]
+    fn gcc_dot_repeat_with_count() {
+        let mut e = rust_editor("aaa\nbbb\nccc\nddd");
+        // 2gcc on lines 0-1, then move to line 2 (2j) and dot-repeat.
+        feed(
+            &mut e,
+            &[
+                press('2'), press('g'), press('c'), press('c'),
+                press('2'), press('j'), press('.'),
+            ],
+        );
+        assert_eq!(
+            e.buffer.contents(),
+            "// aaa\n// bbb\n// ccc\n// ddd"
+        );
+    }
+
+    #[test]
+    fn gcc_python_hash_comment() {
+        let mut e = python_editor("x = 1");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "# x = 1");
+    }
+
+    #[test]
+    fn gcc_python_uncomment() {
+        let mut e = python_editor("# x = 1");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "x = 1");
+    }
+
+    #[test]
+    fn gcc_no_file_type_shows_error() {
+        let mut e = editor_with("hello");
+        // No file path set — should show error.
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "hello"); // unchanged
+    }
+
+    #[test]
+    fn gcc_uncomment_no_space_after_prefix() {
+        // `//foo` (no space) should still uncomment.
+        let mut e = rust_editor("//foo");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "foo");
+    }
+
+    #[test]
+    fn gcc_message_multiline() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        // Should display "3 lines commented".
+        assert!(e.message.is_some());
+        let msg = e.message.as_ref().unwrap();
+        assert!(msg.contains("3 lines"), "msg={msg}");
+    }
+
+    #[test]
+    fn gcc_no_message_single_line() {
+        let mut e = rust_editor("hello");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        // Single line — no message.
+        assert!(e.message.is_none());
+    }
+
+    #[test]
+    fn gc_inner_braces() {
+        let mut e = rust_editor("fn f() {\n    x\n    y\n}");
+        // Move inside braces, gciB to comment inner block.
+        feed(
+            &mut e,
+            &[
+                press('j'), press('g'), press('c'), press('i'), press('B'),
+            ],
+        );
+        assert_eq!(e.buffer.contents(), "fn f() {\n    // x\n    // y\n}");
+    }
+
+    #[test]
+    fn gcc_cursor_position() {
+        let mut e = rust_editor("    hello");
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        // Cursor should be at first non-blank (the `/` of `//`).
+        assert_eq!(e.cursor.col(), 4);
+    }
+
+    #[test]
+    fn gcc_whitespace_only_line_skipped() {
+        let mut e = rust_editor("foo\n   \nbar");
+        feed(
+            &mut e,
+            &[press('3'), press('g'), press('c'), press('c')],
+        );
+        // Whitespace-only line should be left alone.
+        assert_eq!(e.buffer.contents(), "// foo\n   \n// bar");
+    }
+
+    #[test]
+    fn visual_block_gc() {
+        let mut e = rust_editor("aaa\nbbb\nccc");
+        // Ctrl+V, j, j, gc = block select 3 lines, toggle comment.
+        feed(
+            &mut e,
+            &[ctrl('v'), press('j'), press('j'), press('g'), press('c')],
+        );
+        assert_eq!(e.buffer.contents(), "// aaa\n// bbb\n// ccc");
+        assert_eq!(e.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn gcc_lua_double_dash() {
+        let mut e = editor_with("print('hi')");
+        e.buffer.set_path(PathBuf::from("test.lua"));
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "-- print('hi')");
+    }
+
+    #[test]
+    fn gcc_lua_uncomment() {
+        let mut e = editor_with("-- print('hi')");
+        e.buffer.set_path(PathBuf::from("test.lua"));
+        feed(&mut e, &[press('g'), press('c'), press('c')]);
+        assert_eq!(e.buffer.contents(), "print('hi')");
+    }
+
+    #[test]
+    fn comment_prefix_coverage() {
+        // Verify a few key extensions.
+        assert_eq!(comment_prefix(Path::new("a.rs")), Some("//"));
+        assert_eq!(comment_prefix(Path::new("a.py")), Some("#"));
+        assert_eq!(comment_prefix(Path::new("a.lua")), Some("--"));
+        assert_eq!(comment_prefix(Path::new("a.vim")), Some("\""));
+        assert_eq!(comment_prefix(Path::new("a.el")), Some(";"));
+        assert_eq!(comment_prefix(Path::new("a.tex")), Some("%"));
+        assert_eq!(comment_prefix(Path::new("a.html")), None);
+        assert_eq!(comment_prefix(Path::new("a.unknown")), None);
+        assert_eq!(comment_prefix(Path::new("no_ext")), None);
+    }
+
+    #[test]
+    fn gcc_dot_repeat_count_override() {
+        let mut e = rust_editor("aaa\nbbb\nccc\nddd\neee");
+        // gcc (comment 1 line), then move and 3. (repeat on 3 lines).
+        feed(
+            &mut e,
+            &[
+                press('g'), press('c'), press('c'),
+                press('j'),
+                press('3'), press('.'),
+            ],
+        );
+        assert_eq!(
+            e.buffer.contents(),
+            "// aaa\n// bbb\n// ccc\n// ddd\neee"
+        );
     }
 }
