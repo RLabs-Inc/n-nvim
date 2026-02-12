@@ -42,6 +42,8 @@ use n_term::buffer::FrameBuffer;
 use n_term::cell::{Attr, Cell, UnderlineStyle};
 use n_term::color::CellColor;
 
+use n_theme::Theme;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -428,6 +430,7 @@ impl View {
         area_width: u16,
         area_height: u16,
         active: bool,
+        theme: &Theme,
     ) -> Option<(u16, u16)> {
         if area_width == 0 || area_height == 0 {
             return None;
@@ -466,12 +469,12 @@ impl View {
                     } else {
                         buf_line + 1
                     };
-                    render_line_number(frame, area_x, screen_y, gw, num, is_cursor_line);
+                    render_line_number(frame, area_x, screen_y, gw, num, is_cursor_line, theme);
                 }
 
                 // Text content (with optional selection highlighting)
                 let line_sel = selection.and_then(|(r, k)| line_selection_cols(r, k, buf_line));
-                self.render_text_line(frame, buf, buf_line, text_x, screen_y, text_width, line_sel);
+                self.render_text_line(frame, buf, buf_line, text_x, screen_y, text_width, line_sel, theme);
 
                 // Cursor screen position
                 if buf_line == cursor_line {
@@ -490,7 +493,7 @@ impl View {
                 }
             } else {
                 // Past end of buffer: tilde line
-                render_tilde_line(frame, area_x, screen_y, area_width);
+                render_tilde_line(frame, area_x, screen_y, area_width, theme);
             }
         }
 
@@ -498,7 +501,7 @@ impl View {
 
         if area_height > 0 {
             let status_y = area_y + text_height;
-            render_status_line(frame, buf, cursor, mode, buf_info, area_x, status_y, area_width, active);
+            render_status_line(frame, buf, cursor, mode, buf_info, area_x, status_y, area_width, active, theme);
         }
 
         cursor_screen
@@ -507,7 +510,7 @@ impl View {
     /// Paint one line of text content into the framebuffer.
     ///
     /// `line_sel` is the optional column range `[start, end)` to highlight
-    /// with `Attr::INVERSE` for visual selection. `None` means no selection
+    /// with the theme's visual selection style. `None` means no selection
     /// on this line.
     #[allow(clippy::too_many_arguments)]
     fn render_text_line(
@@ -519,12 +522,14 @@ impl View {
         y: u16,
         width: u16,
         line_sel: Option<(usize, usize)>,
+        theme: &Theme,
     ) {
         let Some(line) = buf.line(line_idx) else {
             fill_empty(frame, x, y, width);
             return;
         };
 
+        let vis_bg = theme.visual.bg;
         let tab_w = self.tab_width.max(1) as usize;
         let left_col = self.left_col;
         let mut display_col: usize = 0;
@@ -550,7 +555,7 @@ impl View {
                         if screen_col >= width {
                             break 'chars;
                         }
-                        frame.set(x + screen_col, y, sel_cell(' ', selected));
+                        frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg));
                         screen_col += 1;
                     }
                     display_col += 1;
@@ -570,31 +575,31 @@ impl View {
                     if char_w == 2 {
                         // Wide character: needs 2 screen columns.
                         if screen_col + 1 < width {
-                            frame.set(x + screen_col, y, sel_cell(ch, selected));
+                            frame.set(x + screen_col, y, sel_cell(ch, selected, vis_bg));
                             frame.set(
                                 x + screen_col + 1,
                                 y,
                                 Cell::continuation(
                                     CellColor::Default,
-                                    CellColor::Default,
-                                    if selected { Attr::INVERSE } else { Attr::empty() },
+                                    if selected { vis_bg } else { CellColor::Default },
+                                    Attr::empty(),
                                 ),
                             );
                             screen_col += 2;
                         } else {
                             // Wide char doesn't fit — place a space instead.
-                            frame.set(x + screen_col, y, sel_cell(' ', selected));
+                            frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg));
                             screen_col += 1;
                         }
                     } else {
-                        frame.set(x + screen_col, y, sel_cell(ch, selected));
+                        frame.set(x + screen_col, y, sel_cell(ch, selected, vis_bg));
                         screen_col += 1;
                     }
                 } else if display_col + char_w > left_col {
                     // Wide char straddles the left scroll boundary — the left
                     // half is off-screen, so show a space for the visible part.
                     if screen_col < width {
-                        frame.set(x + screen_col, y, sel_cell(' ', selected));
+                        frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg));
                         screen_col += 1;
                     }
                 }
@@ -611,7 +616,7 @@ impl View {
         let trail_selected =
             line_sel.is_some_and(|(_, sel_end)| char_col < sel_end);
         while screen_col < width {
-            frame.set(x + screen_col, y, sel_cell(' ', trail_selected));
+            frame.set(x + screen_col, y, sel_cell(' ', trail_selected, vis_bg));
             screen_col += 1;
         }
     }
@@ -632,20 +637,21 @@ fn render_line_number(
     gutter_w: u16,
     line_num: usize,
     is_cursor_line: bool,
+    theme: &Theme,
 ) {
     let num_str = line_num.to_string();
     let digit_space = gutter_w.saturating_sub(1) as usize; // reserve 1 for separator
     let padding = digit_space.saturating_sub(num_str.len());
 
-    // Cursor line number stands out; other lines are subdued.
-    let style = if is_cursor_line {
-        Attr::empty()
+    // Cursor line number uses cursor_line_nr; other lines use line_nr.
+    let group = if is_cursor_line {
+        &theme.cursor_line_nr
     } else {
-        Attr::DIM
+        &theme.line_nr
     };
 
     let styled_cell = |ch: char| {
-        Cell::styled(ch, CellColor::Default, CellColor::Default, style, UnderlineStyle::None)
+        Cell::styled(ch, group.fg, group.bg, group.attrs, group.underline)
     };
 
     let mut col = x;
@@ -669,22 +675,16 @@ fn render_line_number(
 }
 
 /// Render a tilde line (past end of buffer).
-fn render_tilde_line(frame: &mut FrameBuffer, x: u16, y: u16, width: u16) {
+fn render_tilde_line(frame: &mut FrameBuffer, x: u16, y: u16, width: u16, theme: &Theme) {
     if width == 0 {
         return;
     }
 
-    // Tilde in blue, matching Vim's NonText highlight group.
+    let nt = &theme.non_text;
     frame.set(
         x,
         y,
-        Cell::styled(
-            '~',
-            CellColor::Ansi256(4), // standard blue
-            CellColor::Default,
-            Attr::empty(),
-            UnderlineStyle::None,
-        ),
+        Cell::styled('~', nt.fg, nt.bg, nt.attrs, nt.underline),
     );
 
     // Fill rest of line.
@@ -709,6 +709,7 @@ fn render_status_line(
     y: u16,
     width: u16,
     active: bool,
+    theme: &Theme,
 ) {
     if width == 0 {
         return;
@@ -732,13 +733,11 @@ fn render_status_line(
     // Right: " line:col "
     let right = format!(" {}:{} ", cursor.line() + 1, cursor.col() + 1);
 
-    // Active window: bright INVERSE status line.
-    // Inactive window: subdued (INVERSE + DIM).
-    let style = if active {
-        Attr::INVERSE.union(Attr::BOLD)
-    } else {
-        Attr::INVERSE.union(Attr::DIM)
-    };
+    // Active vs inactive status line from theme.
+    let group = if active { &theme.status_line } else { &theme.status_line_nc };
+    let fg = group.fg;
+    let bg = group.bg;
+    let style = group.attrs;
     // Safe: status line right portion is always short ASCII.
     #[allow(clippy::cast_possible_truncation)]
     let right_len = right.chars().count() as u16;
@@ -751,33 +750,13 @@ fn render_status_line(
         if col >= right_start || col >= width {
             break;
         }
-        frame.set(
-            x + col,
-            y,
-            Cell::styled(
-                ch,
-                CellColor::Default,
-                CellColor::Default,
-                style,
-                UnderlineStyle::None,
-            ),
-        );
+        frame.set(x + col, y, Cell::styled(ch, fg, bg, style, UnderlineStyle::None));
         col += 1;
     }
 
     // Middle fill.
     while col < right_start && col < width {
-        frame.set(
-            x + col,
-            y,
-            Cell::styled(
-                ' ',
-                CellColor::Default,
-                CellColor::Default,
-                style,
-                UnderlineStyle::None,
-            ),
-        );
+        frame.set(x + col, y, Cell::styled(' ', fg, bg, style, UnderlineStyle::None));
         col += 1;
     }
 
@@ -786,35 +765,23 @@ fn render_status_line(
         if col >= width {
             break;
         }
-        frame.set(
-            x + col,
-            y,
-            Cell::styled(
-                ch,
-                CellColor::Default,
-                CellColor::Default,
-                style,
-                UnderlineStyle::None,
-            ),
-        );
+        frame.set(x + col, y, Cell::styled(ch, fg, bg, style, UnderlineStyle::None));
         col += 1;
     }
 }
 
-/// Create a cell with optional `INVERSE` for visual selection highlighting.
+/// Create a cell with optional visual selection highlighting.
 ///
-/// When `selected` is true the cell gets the `INVERSE` attribute, which
-/// swaps foreground and background — the standard Vim highlight for visual
-/// selections.
-const fn sel_cell(ch: char, selected: bool) -> Cell {
+/// When `selected` is true the cell gets the visual selection background
+/// color from the theme. When `visual_bg` is `CellColor::Default`, falls
+/// back to `Attr::INVERSE` for compatibility.
+const fn sel_cell(ch: char, selected: bool, visual_bg: CellColor) -> Cell {
     if selected {
-        Cell::styled(
-            ch,
-            CellColor::Default,
-            CellColor::Default,
-            Attr::INVERSE,
-            UnderlineStyle::None,
-        )
+        if visual_bg.is_default() {
+            Cell::styled(ch, CellColor::Default, CellColor::Default, Attr::INVERSE, UnderlineStyle::None)
+        } else {
+            Cell::styled(ch, CellColor::Default, visual_bg, Attr::empty(), UnderlineStyle::None)
+        }
     } else {
         Cell::new(ch)
     }
@@ -838,6 +805,7 @@ pub fn highlight_matches(
     area_y: u16,
     area_width: u16,
     area_height: u16,
+    theme: &Theme,
 ) {
     if pattern.is_empty() || area_height == 0 || area_width == 0 {
         return;
@@ -897,28 +865,19 @@ pub fn highlight_matches(
             let sy = area_y + row as u16;
 
             if let Some(cell) = frame.get(sx, sy) {
+                let sg = &theme.search;
                 if cell.is_continuation() {
                     frame.set(
                         sx,
                         sy,
-                        Cell::continuation(
-                            CellColor::Ansi256(0),  // black
-                            CellColor::Ansi256(3),  // yellow
-                            Attr::empty(),
-                        ),
+                        Cell::continuation(sg.fg, sg.bg, sg.attrs),
                     );
                 } else {
                     let ch = cell.character().unwrap_or(' ');
                     frame.set(
                         sx,
                         sy,
-                        Cell::styled(
-                            ch,
-                            CellColor::Ansi256(0),  // black
-                            CellColor::Ansi256(3),  // yellow
-                            Attr::BOLD,
-                            UnderlineStyle::None,
-                        ),
+                        Cell::styled(ch, sg.fg, sg.bg, sg.attrs, sg.underline),
                     );
                 }
             }
@@ -944,6 +903,7 @@ pub fn highlight_cursorline(
     area_y: u16,
     area_width: u16,
     area_height: u16,
+    theme: &Theme,
 ) {
     if area_height == 0 || area_width == 0 {
         return;
@@ -963,12 +923,19 @@ pub fn highlight_cursorline(
     #[allow(clippy::cast_possible_truncation)]
     let screen_y = area_y + row as u16;
 
-    // Underline every cell on this row (gutter + text + empty space).
+    let cl = &theme.cursor_line;
+
+    // Apply cursorline style to every cell on this row (gutter + text + empty).
     for col in 0..area_width {
         let sx = area_x + col;
         if let Some(cell) = frame.get(sx, screen_y) {
             let mut c = *cell;
-            if c.underline == UnderlineStyle::None {
+            // Apply cursorline background only to cells without a custom bg
+            // (e.g., visual selection takes precedence).
+            if c.bg.is_default() && !cl.bg.is_default() {
+                c.bg = cl.bg;
+            } else if cl.bg.is_default() && c.underline == UnderlineStyle::None {
+                // Fallback: no theme bg, use underline.
                 c.underline = UnderlineStyle::Straight;
             }
             frame.set(sx, screen_y, c);
@@ -984,6 +951,7 @@ pub fn highlight_cursorline(
 ///
 /// The `selected` index highlights one candidate with inverse video. The
 /// `prefix` is shown as the last entry (cycling back to what the user typed).
+#[allow(clippy::too_many_arguments)]
 pub fn render_completion_popup(
     frame: &mut FrameBuffer,
     candidates: &[String],
@@ -992,6 +960,7 @@ pub fn render_completion_popup(
     cursor_y: u16,
     frame_width: u16,
     frame_height: u16,
+    theme: &Theme,
 ) {
     const MAX_POPUP_HEIGHT: u16 = 10;
 
@@ -1040,19 +1009,8 @@ pub fn render_completion_popup(
         let sy = popup_y + row;
         let is_selected = idx == selected;
 
-        let (fg, bg, attrs) = if is_selected {
-            (
-                CellColor::Ansi256(0),   // black text
-                CellColor::Ansi256(4),   // blue background
-                Attr::BOLD,
-            )
-        } else {
-            (
-                CellColor::Default,
-                CellColor::Ansi256(237), // dark gray background
-                Attr::empty(),
-            )
-        };
+        let group = if is_selected { &theme.pmenu_sel } else { &theme.pmenu };
+        let (fg, bg, attrs) = (group.fg, group.bg, group.attrs);
 
         // Leading space.
         if popup_x < frame_width {
@@ -1192,32 +1150,24 @@ pub fn render_message_line(
     x: u16,
     y: u16,
     width: u16,
+    theme: &Theme,
 ) {
     if width == 0 {
         return;
     }
 
+    let group = if is_error { &theme.error_msg } else { &theme.msg };
     let mut col: u16 = 0;
 
     for ch in message.chars() {
         if col >= width {
             break;
         }
-        if is_error {
-            frame.set(
-                x + col,
-                y,
-                Cell::styled(
-                    ch,
-                    CellColor::Ansi256(1), // red
-                    CellColor::Default,
-                    Attr::BOLD,
-                    UnderlineStyle::None,
-                ),
-            );
-        } else {
-            frame.set(x + col, y, Cell::new(ch));
-        }
+        frame.set(
+            x + col,
+            y,
+            Cell::styled(ch, group.fg, group.bg, group.attrs, group.underline),
+        );
         col += 1;
     }
 
@@ -1238,6 +1188,10 @@ mod tests {
     use crate::position::Position;
     use std::path::PathBuf;
 
+    fn test_theme() -> Theme {
+        Theme::default_theme()
+    }
+
     // Helper: create a FrameBuffer and extract a row as characters.
     fn row_chars(frame: &FrameBuffer, y: u16) -> String {
         let row = frame.row(y).unwrap();
@@ -1247,11 +1201,11 @@ mod tests {
             .collect()
     }
 
-    // Helper: check if a cell has the INVERSE attribute (for status line).
-    fn is_inverse(frame: &FrameBuffer, x: u16, y: u16) -> bool {
+    // Helper: check if a cell has a non-default background (for themed status line).
+    fn has_status_bg(frame: &FrameBuffer, x: u16, y: u16) -> bool {
         frame
             .get(x, y)
-            .is_some_and(|c| c.attrs.contains(Attr::INVERSE))
+            .is_some_and(|c| !c.bg.is_default())
     }
 
     // Helper: check if a cell has the DIM attribute (for line numbers).
@@ -1566,9 +1520,9 @@ mod tests {
         let mut frame = FrameBuffer::new(80, 24);
         let mut v = View::new();
 
-        assert!(v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 0, 0, true).is_none());
-        assert!(v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 0, 5, true).is_none());
-        assert!(v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 5, 0, true).is_none());
+        assert!(v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 0, 0, true, &test_theme()).is_none());
+        assert!(v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 0, 5, true, &test_theme()).is_none());
+        assert!(v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 5, 0, true, &test_theme()).is_none());
     }
 
     #[test]
@@ -1579,11 +1533,11 @@ mod tests {
         let mut v = View::new();
 
         // height=1 → text_height=0, only status line.
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 1, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 1, true, &test_theme());
         assert!(pos.is_none()); // no text rows, cursor not placed
 
         // Status line should be rendered on row 0.
-        assert!(is_inverse(&frame, 0, 0));
+        assert!(has_status_bg(&frame, 0, 0));
     }
 
     // ── render — line numbers ─────────────────────────────────────────────
@@ -1595,7 +1549,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 5, true, &test_theme());
 
         // Gutter is 2 wide for 3 lines: "1 ", "2 ", "3 "
         let row0 = row_chars(&frame, 0);
@@ -1615,7 +1569,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 14);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 14, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 14, true, &test_theme());
 
         // Line 1: " 1 " (space, digit, space)
         let row0 = row_chars(&frame, 0);
@@ -1626,17 +1580,21 @@ mod tests {
     }
 
     #[test]
-    fn render_line_numbers_are_dim() {
+    fn render_line_numbers_styled_by_theme() {
         let buf = Buffer::from_text("hello\nworld");
         let cursor = Cursor::new(); // cursor on line 0
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
+        let theme = test_theme();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &theme);
 
-        // Cursor line (0) is bright, non-cursor line (1) is DIM.
-        assert!(!is_dim(&frame, 0, 0), "cursor line number should be bright");
-        assert!(is_dim(&frame, 0, 1), "non-cursor line number should be DIM");
+        // Cursor line number uses cursor_line_nr fg, non-cursor uses line_nr fg.
+        let cursor_nr = frame.get(0, 0).unwrap();
+        let other_nr = frame.get(0, 1).unwrap();
+        assert_eq!(cursor_nr.fg, theme.cursor_line_nr.fg, "cursor line number fg");
+        assert_eq!(other_nr.fg, theme.line_nr.fg, "non-cursor line number fg");
+        assert_ne!(cursor_nr.fg, other_nr.fg, "cursor and non-cursor should differ");
     }
 
     #[test]
@@ -1647,7 +1605,7 @@ mod tests {
         let mut v = View::new();
         v.set_line_numbers(false);
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // First column should be text, not a line number.
         let row0 = row_chars(&frame, 0);
@@ -1663,7 +1621,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // Gutter = 2, text starts at col 2.
         let row0 = row_chars(&frame, 0);
@@ -1677,7 +1635,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // Tab should expand to 4 spaces: "1     hello" (gutter "1 " + 4 spaces + "hello")
         let row0 = row_chars(&frame, 0);
@@ -1691,7 +1649,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // After gutter "1 ": 中 takes 2 cols, 文 takes 2 cols, h=1, i=1.
         // Check the main characters (skipping continuations).
@@ -1720,7 +1678,7 @@ mod tests {
             }
         }
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 3, true, &test_theme());
 
         // After "1 hi" (4 cols), remaining cols should be EMPTY (space).
         let row = frame.row(0).unwrap();
@@ -1740,7 +1698,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true, &test_theme());
 
         // Line 1 should show "1 " then empty text.
         let row0 = row_chars(&frame, 0);
@@ -1759,7 +1717,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true, &test_theme());
 
         let row0 = row_chars(&frame, 0);
         let row1 = row_chars(&frame, 1);
@@ -1778,7 +1736,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true, &test_theme());
 
         // Row 0: text. Rows 1-3: tildes. Row 4: status.
         assert_eq!(frame.get(0, 1).unwrap().character(), Some('~'));
@@ -1793,11 +1751,11 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
 
         // Tilde on row 1 should have Ansi256(4) foreground.
         let tilde_cell = frame.get(0, 1).unwrap();
-        assert_eq!(tilde_cell.fg, CellColor::Ansi256(4));
+        assert_eq!(tilde_cell.fg, test_theme().non_text.fg);
     }
 
     // ── render — status line ──────────────────────────────────────────────
@@ -1809,7 +1767,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true, &test_theme());
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("NORMAL"), "status = '{status}'");
@@ -1822,7 +1780,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Insert, None, "", &mut frame, 0, 0, 40, 3, true);
+        v.render(&buf, &cursor, Mode::Insert, None, "", &mut frame, 0, 0, 40, 3, true, &test_theme());
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("INSERT"), "status = '{status}'");
@@ -1836,7 +1794,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true, &test_theme());
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("main.rs"), "status = '{status}'");
@@ -1849,7 +1807,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true, &test_theme());
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("[No Name]"), "status = '{status}'");
@@ -1863,7 +1821,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 3, true, &test_theme());
 
         let status = row_chars(&frame, 2);
         assert!(status.contains("[+]"), "status = '{status}'");
@@ -1876,7 +1834,7 @@ mod tests {
         let mut frame = FrameBuffer::new(40, 4);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 40, 4, true, &test_theme());
 
         let status = row_chars(&frame, 3);
         // Position is 1-indexed: line 2, col 4.
@@ -1884,17 +1842,17 @@ mod tests {
     }
 
     #[test]
-    fn status_line_is_inverse() {
+    fn status_line_has_status_bg() {
         let buf = Buffer::from_text("hello");
         let cursor = Cursor::new();
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // All cells on the status row should have INVERSE.
         for x in 0..20 {
-            assert!(is_inverse(&frame, x, 2), "col {x} not inverse");
+            assert!(has_status_bg(&frame, x, 2), "col {x} not inverse");
         }
     }
 
@@ -1907,7 +1865,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // Gutter = 2, cursor at (2, 0).
         assert_eq!(pos, Some((2, 0)));
@@ -1920,7 +1878,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
 
         // Gutter = 2, cursor at line 1 col 3 → screen (2+3, 1) = (5, 1).
         assert_eq!(pos, Some((5, 1)));
@@ -1934,7 +1892,7 @@ mod tests {
         let mut v = View::new();
 
         // Render in a sub-region starting at (10, 5).
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 10, 5, 20, 3, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 10, 5, 20, 3, true, &test_theme());
 
         // Gutter = 2 → cursor at (10+2, 5) = (12, 5).
         assert_eq!(pos, Some((12, 5)));
@@ -1947,7 +1905,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
 
         // text_height = 3. Cursor at line 4 → top_line = 2.
         // Screen row = 4 - 2 = 2.
@@ -1963,7 +1921,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // Tab expands to 4 display columns. Cursor char col 1 → display col 4.
         // Gutter = 2. Screen x = 2 + 4 = 6.
@@ -1979,7 +1937,7 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 4);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
 
         // text_height = 3. Cursor at line 3 → top_line = 1.
         let row0 = row_chars(&frame, 0);
@@ -1997,7 +1955,7 @@ mod tests {
         let mut frame = FrameBuffer::new(10, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 3, true, &test_theme());
 
         // gutter = 2, text_width = 8. cursor at display_col 14.
         // left_col = 14 - 8 + 1 = 7. First visible char is 'h' (index 7).
@@ -2014,17 +1972,17 @@ mod tests {
 
         // Start at top.
         let cursor = Cursor::new();
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
         assert_eq!(v.top_line(), 0);
 
         // Move cursor down past viewport.
         let cursor = Cursor::at(Position::new(4, 0));
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
         assert_eq!(v.top_line(), 2);
 
         // Move cursor back to top.
         let cursor = Cursor::at(Position::new(0, 0));
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &test_theme());
         assert_eq!(v.top_line(), 0);
     }
 
@@ -2037,7 +1995,7 @@ mod tests {
         let mut frame = FrameBuffer::new(10, 3);
         let mut v = View::new();
 
-        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 3, true);
+        let pos = v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 3, true, &test_theme());
 
         assert_eq!(pos, Some((2, 0)));
         let row0 = row_chars(&frame, 0);
@@ -2051,7 +2009,7 @@ mod tests {
         let mut frame = FrameBuffer::new(10, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 5, true, &test_theme());
 
         // 3 lines (two \n + trailing empty). All should have line numbers.
         let row0 = row_chars(&frame, 0);
@@ -2069,7 +2027,7 @@ mod tests {
         let mut frame = FrameBuffer::new(6, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 6, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 6, 3, true, &test_theme());
 
         // gutter = 2, text_width = 4. Only "hell" visible.
         let row = frame.row(0).unwrap();
@@ -2087,7 +2045,7 @@ mod tests {
         let mut frame = FrameBuffer::new(7, 3); // gutter=2, text_width=5
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 7, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 7, 3, true, &test_theme());
 
         // "ab中" = a(1) b(1) 中(2) = 4 cols. Fits in 5 cols.
         let row = frame.row(0).unwrap();
@@ -2171,7 +2129,7 @@ mod tests {
     #[test]
     fn message_line_normal() {
         let mut frame = FrameBuffer::new(30, 1);
-        render_message_line(&mut frame, "written 42B", false, 0, 0, 30);
+        render_message_line(&mut frame, "written 42B", false, 0, 0, 30, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert!(row.starts_with("written 42B"), "row = '{row}'");
@@ -2184,7 +2142,7 @@ mod tests {
     #[test]
     fn message_line_error() {
         let mut frame = FrameBuffer::new(30, 1);
-        render_message_line(&mut frame, "E37: No write", true, 0, 0, 30);
+        render_message_line(&mut frame, "E37: No write", true, 0, 0, 30, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert!(row.starts_with("E37: No write"), "row = '{row}'");
@@ -2192,7 +2150,7 @@ mod tests {
         // Error message: should be bold + red.
         let cell = frame.get(0, 0).unwrap();
         assert!(cell.attrs.contains(Attr::BOLD));
-        assert_eq!(cell.fg, CellColor::Ansi256(1));
+        assert_eq!(cell.fg, test_theme().error_msg.fg);
     }
 
     #[test]
@@ -2203,7 +2161,7 @@ mod tests {
             frame.set(col, 0, Cell::new('X'));
         }
 
-        render_message_line(&mut frame, "", false, 0, 0, 10);
+        render_message_line(&mut frame, "", false, 0, 0, 10, &test_theme());
 
         // All cells should be empty (space).
         for col in 0..10 {
@@ -2219,13 +2177,13 @@ mod tests {
     fn message_line_zero_width() {
         let mut frame = FrameBuffer::new(20, 1);
         // Should not panic.
-        render_message_line(&mut frame, "hello", false, 0, 0, 0);
+        render_message_line(&mut frame, "hello", false, 0, 0, 0, &test_theme());
     }
 
     #[test]
     fn message_line_truncates() {
         let mut frame = FrameBuffer::new(5, 1);
-        render_message_line(&mut frame, "hello world", false, 0, 0, 5);
+        render_message_line(&mut frame, "hello world", false, 0, 0, 5, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert_eq!(row, "hello");
@@ -2336,18 +2294,18 @@ mod tests {
             Range::new(Position::new(0, 2), Position::new(0, 4)),
             VisualKind::Char,
         ));
-        v.render(&buf, &cursor, Mode::Normal, sel, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, sel, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         // Gutter = 2. Text starts at col 2.
         // Chars 0-1 ('h','e') at screen cols 2-3: NOT inverse.
-        assert!(!is_inverse(&frame, 2, 0)); // 'h'
-        assert!(!is_inverse(&frame, 3, 0)); // 'e'
+        assert!(!has_status_bg(&frame, 2, 0)); // 'h'
+        assert!(!has_status_bg(&frame, 3, 0)); // 'e'
         // Chars 2-4 ('l','l','o') at screen cols 4-6: INVERSE.
-        assert!(is_inverse(&frame, 4, 0)); // 'l'
-        assert!(is_inverse(&frame, 5, 0)); // 'l'
-        assert!(is_inverse(&frame, 6, 0)); // 'o'
+        assert!(has_status_bg(&frame, 4, 0)); // 'l'
+        assert!(has_status_bg(&frame, 5, 0)); // 'l'
+        assert!(has_status_bg(&frame, 6, 0)); // 'o'
         // Char 5 (' ') at screen col 7: NOT inverse.
-        assert!(!is_inverse(&frame, 7, 0));
+        assert!(!has_status_bg(&frame, 7, 0));
     }
 
     #[test]
@@ -2362,17 +2320,17 @@ mod tests {
             Range::new(Position::new(0, 0), Position::new(1, 2)),
             VisualKind::Line,
         ));
-        v.render(&buf, &cursor, Mode::Normal, sel, "", &mut frame, 0, 0, 20, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, sel, "", &mut frame, 0, 0, 20, 5, true, &test_theme());
 
         // Line 0 text area should be inverse (gutter is not).
         let gw = gutter_width(3, true) as usize;
-        assert!(is_inverse(&frame, gw as u16, 0)); // first text char, line 0
-        assert!(is_inverse(&frame, gw as u16, 1)); // first text char, line 1
+        assert!(has_status_bg(&frame, gw as u16, 0)); // first text char, line 0
+        assert!(has_status_bg(&frame, gw as u16, 1)); // first text char, line 1
         // Trailing cells should also be inverse (line-wise highlights to edge).
-        assert!(is_inverse(&frame, 19, 0));
-        assert!(is_inverse(&frame, 19, 1));
+        assert!(has_status_bg(&frame, 19, 0));
+        assert!(has_status_bg(&frame, 19, 1));
         // Line 2 should NOT be inverse.
-        assert!(!is_inverse(&frame, gw as u16, 2));
+        assert!(!has_status_bg(&frame, gw as u16, 2));
     }
 
     #[test]
@@ -2387,23 +2345,23 @@ mod tests {
             Range::new(Position::new(0, 1), Position::new(1, 1)),
             VisualKind::Char,
         ));
-        v.render(&buf, &cursor, Mode::Normal, sel, "", &mut frame, 0, 0, 20, 5, true);
+        v.render(&buf, &cursor, Mode::Normal, sel, "", &mut frame, 0, 0, 20, 5, true, &test_theme());
 
         let gw = gutter_width(3, true);
         // Line 0: chars 0('a') NOT selected, chars 1-2('b','c') selected,
         // trailing space selected (newline included in multi-line).
-        assert!(!is_inverse(&frame, gw, 0)); // 'a'
-        assert!(is_inverse(&frame, gw + 1, 0)); // 'b'
-        assert!(is_inverse(&frame, gw + 2, 0)); // 'c'
-        assert!(is_inverse(&frame, 19, 0)); // trailing (newline)
+        assert!(!has_status_bg(&frame, gw, 0)); // 'a'
+        assert!(has_status_bg(&frame, gw + 1, 0)); // 'b'
+        assert!(has_status_bg(&frame, gw + 2, 0)); // 'c'
+        assert!(has_status_bg(&frame, 19, 0)); // trailing (newline)
 
         // Line 1: chars 0-1('d','e') selected, char 2('f') NOT selected.
-        assert!(is_inverse(&frame, gw, 1)); // 'd'
-        assert!(is_inverse(&frame, gw + 1, 1)); // 'e'
-        assert!(!is_inverse(&frame, gw + 2, 1)); // 'f'
+        assert!(has_status_bg(&frame, gw, 1)); // 'd'
+        assert!(has_status_bg(&frame, gw + 1, 1)); // 'e'
+        assert!(!has_status_bg(&frame, gw + 2, 1)); // 'f'
 
         // Line 2: nothing selected.
-        assert!(!is_inverse(&frame, gw, 2));
+        assert!(!has_status_bg(&frame, gw, 2));
     }
 
     #[test]
@@ -2413,12 +2371,12 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
 
         let gw = gutter_width(1, true);
         // No selection: no text cells should be inverse.
         for col in gw..20 {
-            assert!(!is_inverse(&frame, col, 0), "col {col} should not be inverse");
+            assert!(!has_status_bg(&frame, col, 0), "col {col} should not be inverse");
         }
     }
 
@@ -2441,6 +2399,7 @@ mod tests {
             40,
             3,
             true,
+            &test_theme(),
         );
 
         let status = row_chars(&frame, 2);
@@ -2466,6 +2425,7 @@ mod tests {
             40,
             3,
             true,
+            &test_theme(),
         );
 
         let status = row_chars(&frame, 2);
@@ -2474,21 +2434,22 @@ mod tests {
 
     #[test]
     fn sel_cell_helper() {
-        let normal = sel_cell('a', false);
+        let normal = sel_cell('a', false, CellColor::Default);
         assert_eq!(normal.character(), Some('a'));
         assert!(!normal.attrs.contains(Attr::INVERSE));
 
-        let selected = sel_cell('b', true);
+        let selected = sel_cell('b', true, CellColor::Default);
         assert_eq!(selected.character(), Some('b'));
         assert!(selected.attrs.contains(Attr::INVERSE));
     }
 
     // ── highlight_matches ───────────────────────────────────────────────
 
-    fn is_yellow_bg(frame: &FrameBuffer, x: u16, y: u16) -> bool {
+    fn is_search_bg(frame: &FrameBuffer, x: u16, y: u16) -> bool {
+        let theme = test_theme();
         frame
             .get(x, y)
-            .is_some_and(|c| c.bg == CellColor::Ansi256(3))
+            .is_some_and(|c| c.bg == theme.search.bg)
     }
 
     #[test]
@@ -2498,19 +2459,19 @@ mod tests {
         let mut frame = FrameBuffer::new(30, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 30, 3, true);
-        highlight_matches(&v, &mut frame, &buf, "hello", 0, 0, 30, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 30, 3, true, &test_theme());
+        highlight_matches(&v, &mut frame, &buf, "hello", 0, 0, 30, 3, &test_theme());
 
         let gw = gutter_width(1, true);
         // First "hello" at cols gw..gw+5 should be highlighted.
         for i in 0..5 {
-            assert!(is_yellow_bg(&frame, gw + i, 0), "col {} not highlighted", gw + i);
+            assert!(is_search_bg(&frame, gw + i, 0), "col {} not highlighted", gw + i);
         }
         // Space after first "hello" should NOT be highlighted.
-        assert!(!is_yellow_bg(&frame, gw + 5, 0));
+        assert!(!is_search_bg(&frame, gw + 5, 0));
         // Second "hello" at cols gw+12..gw+17 should be highlighted.
         for i in 12..17 {
-            assert!(is_yellow_bg(&frame, gw + i, 0), "col {} not highlighted", gw + i);
+            assert!(is_search_bg(&frame, gw + i, 0), "col {} not highlighted", gw + i);
         }
     }
 
@@ -2521,17 +2482,17 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 5);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true);
-        highlight_matches(&v, &mut frame, &buf, "abc", 0, 0, 20, 5);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 5, true, &test_theme());
+        highlight_matches(&v, &mut frame, &buf, "abc", 0, 0, 20, 5, &test_theme());
 
         let gw = gutter_width(3, true);
         // Lines 0 and 1 have "abc" highlighted.
-        assert!(is_yellow_bg(&frame, gw, 0));
-        assert!(is_yellow_bg(&frame, gw + 2, 0));
-        assert!(is_yellow_bg(&frame, gw, 1));
-        assert!(is_yellow_bg(&frame, gw + 2, 1));
+        assert!(is_search_bg(&frame, gw, 0));
+        assert!(is_search_bg(&frame, gw + 2, 0));
+        assert!(is_search_bg(&frame, gw, 1));
+        assert!(is_search_bg(&frame, gw + 2, 1));
         // Line 2 "xyz" should NOT be highlighted.
-        assert!(!is_yellow_bg(&frame, gw, 2));
+        assert!(!is_search_bg(&frame, gw, 2));
     }
 
     #[test]
@@ -2541,12 +2502,12 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
-        highlight_matches(&v, &mut frame, &buf, "", 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
+        highlight_matches(&v, &mut frame, &buf, "", 0, 0, 20, 3, &test_theme());
 
         let gw = gutter_width(1, true);
         // Nothing should be highlighted.
-        assert!(!is_yellow_bg(&frame, gw, 0));
+        assert!(!is_search_bg(&frame, gw, 0));
     }
 
     #[test]
@@ -2556,8 +2517,8 @@ mod tests {
         let mut frame = FrameBuffer::new(20, 3);
         let mut v = View::new();
 
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true);
-        highlight_matches(&v, &mut frame, &buf, "ell", 0, 0, 20, 3);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 3, true, &test_theme());
+        highlight_matches(&v, &mut frame, &buf, "ell", 0, 0, 20, 3, &test_theme());
 
         let gw = gutter_width(1, true);
         // Characters should be preserved even though colors changed.
@@ -2730,7 +2691,7 @@ mod tests {
         cursor.move_down(1, &buf, false);
 
         let mut frame = FrameBuffer::new(20, 7); // 5 text + 1 status + 1 cmd
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 6, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 6, true, &test_theme());
 
         let gw = gutter_width(5, true) as usize;
         // Line 0 = distance 2 from cursor
@@ -2761,7 +2722,7 @@ mod tests {
         cursor.move_down(1, &buf, false);
 
         let mut frame = FrameBuffer::new(20, 7);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 6, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 6, true, &test_theme());
 
         let gw = gutter_width(5, true) as usize;
         // Line 0 = distance 2 (relative)
@@ -2780,20 +2741,23 @@ mod tests {
 
     #[test]
     fn cursor_line_number_is_bright() {
-        // Cursor line number should NOT be DIM.
+        // Cursor line number uses cursor_line_nr, others use line_nr.
         let buf = Buffer::from_text("aaa\nbbb\nccc");
         let mut cursor = Cursor::new();
         cursor.move_down(1, &buf, false); // cursor on line 1
         let mut v = View::new();
         v.set_relativenumber(true);
+        let theme = test_theme();
 
         let mut frame = FrameBuffer::new(20, 5);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 4, true, &theme);
 
-        // Line 1 (cursor) — gutter should NOT be DIM.
-        assert!(!is_dim(&frame, 0, 1), "cursor line number should not be DIM");
-        // Line 0 (not cursor) — gutter should be DIM.
-        assert!(is_dim(&frame, 0, 0), "non-cursor line number should be DIM");
+        // Line 1 (cursor) — should use cursor_line_nr fg.
+        assert_eq!(frame.get(0, 1).unwrap().fg, theme.cursor_line_nr.fg,
+            "cursor line number should use cursor_line_nr");
+        // Line 0 (not cursor) — should use line_nr fg.
+        assert_eq!(frame.get(0, 0).unwrap().fg, theme.line_nr.fg,
+            "non-cursor line number should use line_nr");
     }
 
     #[test]
@@ -2806,7 +2770,7 @@ mod tests {
         v.set_relativenumber(false);
 
         let mut frame = FrameBuffer::new(20, 3);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 2, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 2, true, &test_theme());
 
         // First cell should be 'h' (no gutter padding).
         assert_eq!(frame.get(0, 0).unwrap().character(), Some('h'));
@@ -2815,26 +2779,25 @@ mod tests {
     // ── Cursorline tests ──────────────────────────────────────────────
 
     #[test]
-    fn cursorline_underlines_cursor_row() {
+    fn cursorline_highlights_cursor_row() {
         let buf = Buffer::from_text("aaa\nbbb\nccc");
         let mut cursor = Cursor::new();
         cursor.move_down(1, &buf, false); // cursor on line 1
         let mut v = View::new();
+        let theme = test_theme();
 
         let mut frame = FrameBuffer::new(10, 5);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 4, true);
-        highlight_cursorline(&v, &mut frame, 1, 0, 0, 10, 4);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 4, true, &theme);
+        highlight_cursorline(&v, &mut frame, 1, 0, 0, 10, 4, &theme);
 
-        // Row 1 (cursor line) should be underlined.
-        assert!(frame.get(0, 1).unwrap().underline.is_underlined(),
-            "cursor row gutter should be underlined");
-        assert!(frame.get(5, 1).unwrap().underline.is_underlined(),
-            "cursor row text should be underlined");
-        // Row 0 (not cursor) should NOT be underlined.
-        assert!(!frame.get(0, 0).unwrap().underline.is_underlined(),
-            "non-cursor row should not be underlined");
-        assert!(!frame.get(5, 0).unwrap().underline.is_underlined(),
-            "non-cursor row text should not be underlined");
+        // Row 1 (cursor line) should have cursor_line background.
+        assert_eq!(frame.get(0, 1).unwrap().bg, theme.cursor_line.bg,
+            "cursor row gutter should have cursorline bg");
+        assert_eq!(frame.get(5, 1).unwrap().bg, theme.cursor_line.bg,
+            "cursor row text should have cursorline bg");
+        // Row 0 (not cursor) should NOT have cursorline bg.
+        assert!(frame.get(0, 0).unwrap().bg != theme.cursor_line.bg,
+            "non-cursor row should not have cursorline bg");
     }
 
     #[test]
@@ -2844,14 +2807,15 @@ mod tests {
         let cursor = Cursor::new();
         let mut v = View::new();
         v.set_line_numbers(false);
+        let theme = test_theme();
 
         let mut frame = FrameBuffer::new(20, 3);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 2, true);
-        highlight_cursorline(&v, &mut frame, 0, 0, 0, 20, 2);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 20, 2, true, &theme);
+        highlight_cursorline(&v, &mut frame, 0, 0, 0, 20, 2, &theme);
 
-        // Cell past the text (col 10) should still be underlined.
-        assert!(frame.get(10, 0).unwrap().underline.is_underlined(),
-            "empty cell past text should be underlined on cursor line");
+        // Cell past the text (col 10) should have cursorline bg.
+        assert_eq!(frame.get(10, 0).unwrap().bg, theme.cursor_line.bg,
+            "empty cell past text should have cursorline bg");
     }
 
     #[test]
@@ -2863,10 +2827,10 @@ mod tests {
         v.set_line_numbers(false);
 
         let mut frame = FrameBuffer::new(10, 3);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true, &test_theme());
 
         // Ask to highlight cursor_line=99 which doesn't exist on screen.
-        highlight_cursorline(&v, &mut frame, 99, 0, 0, 10, 2);
+        highlight_cursorline(&v, &mut frame, 99, 0, 0, 10, 2, &test_theme());
 
         // No row should be underlined since cursor line (99) is past visible area.
         assert!(!frame.get(0, 0).unwrap().underline.is_underlined());
@@ -2875,27 +2839,29 @@ mod tests {
 
     #[test]
     fn cursorline_preserves_existing_underline() {
-        // If a cell already has underline (e.g., from search highlight), it
-        // should keep its existing style, not be overwritten.
+        // If a cell already has underline (e.g., from LSP errors), cursorline
+        // should apply background but NOT overwrite the underline style.
         let buf = Buffer::from_text("hello");
         let cursor = Cursor::new();
         let mut v = View::new();
         v.set_line_numbers(false);
+        let theme = test_theme();
 
         let mut frame = FrameBuffer::new(10, 3);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true, &theme);
 
         // Manually set a curly underline on one cell.
         let mut c = *frame.get(0, 0).unwrap();
         c.underline = UnderlineStyle::Curly;
         frame.set(0, 0, c);
 
-        highlight_cursorline(&v, &mut frame, 0, 0, 0, 10, 2);
+        highlight_cursorline(&v, &mut frame, 0, 0, 0, 10, 2, &theme);
 
-        // Curly underline should be preserved, not overwritten to Straight.
+        // Curly underline should be preserved.
         assert_eq!(frame.get(0, 0).unwrap().underline, UnderlineStyle::Curly);
-        // Other cells should get Straight underline.
-        assert_eq!(frame.get(1, 0).unwrap().underline, UnderlineStyle::Straight);
+        // Background should be set to cursorline bg.
+        assert_eq!(frame.get(0, 0).unwrap().bg, theme.cursor_line.bg);
+        assert_eq!(frame.get(1, 0).unwrap().bg, theme.cursor_line.bg);
     }
 
     #[test]
@@ -2907,15 +2873,17 @@ mod tests {
         v.set_line_numbers(false);
 
         let mut frame = FrameBuffer::new(10, 3);
-        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true);
+        v.render(&buf, &cursor, Mode::Normal, None, "", &mut frame, 0, 0, 10, 2, true, &test_theme());
 
         let before = *frame.get(0, 0).unwrap();
-        highlight_cursorline(&v, &mut frame, 0, 0, 0, 10, 2);
+        highlight_cursorline(&v, &mut frame, 0, 0, 0, 10, 2, &test_theme());
         let after = *frame.get(0, 0).unwrap();
 
         assert_eq!(before.character(), after.character());
         assert_eq!(before.fg, after.fg);
-        assert_eq!(before.bg, after.bg);
+        // With theme, cursorline applies a background color.
+        // bg changes from Default to theme.cursor_line.bg.
+        assert!(!after.bg.is_default());
         assert_eq!(before.attrs, after.attrs);
     }
 
@@ -2925,7 +2893,7 @@ mod tests {
     fn completion_popup_renders_candidates() {
         let mut frame = FrameBuffer::new(40, 20);
         let candidates = vec!["hello".to_string(), "help".to_string(), "heap".to_string()];
-        render_completion_popup(&mut frame, &candidates, 0, 5, 3, 40, 20);
+        render_completion_popup(&mut frame, &candidates, 0, 5, 3, 40, 20, &test_theme());
 
         // Popup should be at row 4 (below cursor_y=3), starting at col 5.
         // Selected item (0 = "hello") should have BOLD.
@@ -2941,7 +2909,7 @@ mod tests {
     fn completion_popup_empty_noop() {
         let mut frame = FrameBuffer::new(40, 20);
         let empty: Vec<String> = vec![];
-        render_completion_popup(&mut frame, &empty, 0, 5, 3, 40, 20);
+        render_completion_popup(&mut frame, &empty, 0, 5, 3, 40, 20, &test_theme());
         // Should not crash or modify the frame.
         assert!(frame.get(5, 4).unwrap().ch == b' ' as u32);
     }
@@ -2951,7 +2919,7 @@ mod tests {
         // Cursor at row 18 (near bottom of 20-row frame) with 5 candidates.
         let mut frame = FrameBuffer::new(40, 20);
         let candidates: Vec<String> = (0..5).map(|i| format!("word{i}")).collect();
-        render_completion_popup(&mut frame, &candidates, 0, 5, 18, 40, 20);
+        render_completion_popup(&mut frame, &candidates, 0, 5, 18, 40, 20, &test_theme());
 
         // Popup should shift above cursor since row 19 is the last.
         // It should NOT render below row 19.
@@ -2963,7 +2931,7 @@ mod tests {
     fn completion_popup_selection_highlight() {
         let mut frame = FrameBuffer::new(40, 20);
         let candidates = vec!["aaa".to_string(), "bbb".to_string()];
-        render_completion_popup(&mut frame, &candidates, 1, 5, 3, 40, 20);
+        render_completion_popup(&mut frame, &candidates, 1, 5, 3, 40, 20, &test_theme());
 
         // Selection index 1 ("bbb") should be at row 5 and be BOLD.
         let cell = frame.get(6, 5).unwrap();

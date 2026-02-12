@@ -163,6 +163,9 @@ pub enum Command {
     /// `:set [option[=value] ...]` — get or set editor options.
     Set(Vec<SetDirective>),
 
+    /// `:colorscheme <name>` — switch the editor theme.
+    Colorscheme(String),
+
     /// Unknown command — contains the full input for error reporting.
     Unknown(String),
 }
@@ -376,6 +379,13 @@ fn parse_command(input: &str) -> Command {
         "close" | "clo" => Command::WinClose,
         "only" | "on" => Command::WinOnly,
         "set" | "se" => Command::Set(options::parse_set(arg)),
+        "colorscheme" | "colo" => {
+            if arg.is_empty() {
+                Command::Unknown("E471: Argument required".to_string())
+            } else {
+                Command::Colorscheme(arg.to_string())
+            }
+        }
         _ => Command::Unknown(trimmed.to_string()),
     }
 }

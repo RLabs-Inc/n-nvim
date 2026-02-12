@@ -41,6 +41,8 @@ use n_editor::split::{Direction, Rect, Split, WinId};
 use n_editor::text_object;
 use n_editor::view::{self, View};
 
+use n_theme::Theme;
+
 use n_term::ansi::CursorShape;
 use n_term::buffer::FrameBuffer;
 use n_term::event_loop::{Action, App, EventLoop};
@@ -496,6 +498,9 @@ struct Editor {
 
     /// Active buffer word completion state (`Ctrl+N` / `Ctrl+P`).
     completion: Option<Completion>,
+
+    /// The active editor theme (Sacred Geometry mathematical theming).
+    theme: Theme,
 }
 
 impl Editor {
@@ -554,6 +559,7 @@ impl Editor {
             wrapscan: true,
             cursorline: false,
             completion: None,
+            theme: Theme::terminal(),
         }
     }
 
@@ -617,6 +623,7 @@ impl Editor {
             wrapscan: true,
             cursorline: false,
             completion: None,
+            theme: Theme::terminal(),
         }
     }
 
@@ -1101,7 +1108,7 @@ impl Editor {
         let buf = self.get_buffer_by_id(ws.buf_id);
         ws.view.render(
             buf, &ws.cursor, Mode::Normal, None, buf_info,
-            frame, rect.x, rect.y, rect.w, rect.h, false,
+            frame, rect.x, rect.y, rect.w, rect.h, false, &self.theme,
         );
         self.other_wins.insert(ws_idx, ws);
     }
@@ -3297,6 +3304,7 @@ impl Editor {
             Command::WinClose => self.win_close(),
             Command::WinOnly => self.win_only(),
             Command::Set(directives) => self.cmd_set(&directives),
+            Command::Colorscheme(name) => self.cmd_colorscheme(&name),
             Command::Unknown(input) => {
                 if input.is_empty() {
                     CommandResult::Ok(None)
@@ -3414,6 +3422,69 @@ impl Editor {
             return CommandResult::Err("E33: No previous substitute regular expression".to_string());
         };
         self.execute_substitute(range, &pattern, &replacement, flags)
+    }
+
+    /// `:colorscheme <args>` — theme commands.
+    ///
+    /// - `:colorscheme` — show current theme name
+    /// - `:colorscheme <name>` — load a builtin theme
+    /// - `:colorscheme terminal` — switch to terminal-native ANSI theme
+    /// - `:colorscheme random` — fully random Sacred Geometry theme
+    /// - `:colorscheme generate [pattern] [hue]` — generate with random seed
+    fn cmd_colorscheme(&mut self, args: &str) -> CommandResult {
+        let args = args.trim();
+
+        // `:colorscheme` (no args) — show current.
+        if args.is_empty() {
+            return CommandResult::Ok(Some(format!("colorscheme: {}", self.theme.name)));
+        }
+
+        // `:colorscheme terminal` — ANSI default.
+        if args == "terminal" {
+            self.theme = Theme::terminal();
+            return CommandResult::Ok(Some("terminal".to_string()));
+        }
+
+        // `:colorscheme random` — fully random.
+        if args == "random" {
+            self.theme = Theme::generate_surprise();
+            return CommandResult::Ok(Some(format!("Generated: {}", self.theme.name)));
+        }
+
+        // `:colorscheme generate [pattern] [hue]` — interactive generation.
+        if let Some(rest) = args.strip_prefix("generate") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let pattern = parts.first()
+                .and_then(|s| n_theme::PatternKind::from_name(s))
+                .unwrap_or(n_theme::PatternKind::GoldenRatio);
+            let hue: f32 = parts.get(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    // Random hue from timestamp.
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(180, |d| d.subsec_nanos());
+                    #[allow(clippy::cast_precision_loss)]
+                    { (t % 360) as f32 }
+                });
+            self.theme = Theme::generate_random(pattern, hue, true);
+            return CommandResult::Ok(Some(format!(
+                "Generated: {} (pattern={}, hue={:.0})",
+                self.theme.name, pattern.name(), hue,
+            )));
+        }
+
+        // `:colorscheme <name>` — load a builtin.
+        if let Some(theme) = n_theme::builtin::builtin_theme(args) {
+            let msg = args.to_string();
+            self.theme = theme;
+            CommandResult::Ok(Some(msg))
+        } else {
+            let builtins = n_theme::builtin::builtin_names().join(", ");
+            CommandResult::Err(format!(
+                "E185: Unknown \"{args}\". Builtins: {builtins}. Or: random, generate <pattern> [hue], terminal"
+            ))
+        }
     }
 
     /// `:set` — apply one or more option directives.
@@ -5695,12 +5766,12 @@ impl App for Editor {
             let buf_info = self.buf_info_label();
             self.cursor_screen = self.view.render(
                 &self.buffer, &self.cursor, self.mode, selection, &buf_info,
-                frame, 0, 0, w, h, true,
+                frame, 0, 0, w, h, true, &self.theme,
             );
             if self.cursorline {
                 view::highlight_cursorline(
                     &self.view, frame, self.cursor.line(),
-                    0, 0, w, h,
+                    0, 0, w, h, &self.theme,
                 );
             }
             return;
@@ -5726,13 +5797,13 @@ impl App for Editor {
                 self.last_text_height = rect.h.saturating_sub(1) as usize;
                 self.cursor_screen = self.view.render(
                     &self.buffer, &self.cursor, self.mode, selection, &buf_info,
-                    frame, rect.x, rect.y, rect.w, rect.h, true,
+                    frame, rect.x, rect.y, rect.w, rect.h, true, &self.theme,
                 );
                 // Highlight cursorline in the active window.
                 if self.cursorline {
                     view::highlight_cursorline(
                         &self.view, frame, self.cursor.line(),
-                        rect.x, rect.y, rect.w, rect.h,
+                        rect.x, rect.y, rect.w, rect.h, &self.theme,
                     );
                 }
                 // Highlight search matches in the active window.
@@ -5744,7 +5815,7 @@ impl App for Editor {
                 if !hl_pattern.is_empty() {
                     view::highlight_matches(
                         &self.view, frame, &self.buffer, hl_pattern,
-                        rect.x, rect.y, rect.w, rect.h,
+                        rect.x, rect.y, rect.w, rect.h, &self.theme,
                     );
                 }
             } else {
@@ -5754,6 +5825,7 @@ impl App for Editor {
         }
 
         // Draw vertical separators.
+        let vs = &self.theme.vert_split;
         let separators = self.split.separators(main_area);
         for (sx, sy, sh) in separators {
             for row in 0..sh {
@@ -5761,11 +5833,7 @@ impl App for Editor {
                     sx,
                     sy + row,
                     n_term::cell::Cell::styled(
-                        '│',
-                        n_term::color::CellColor::Default,
-                        n_term::color::CellColor::Default,
-                        n_term::cell::Attr::DIM,
-                        n_term::cell::UnderlineStyle::None,
+                        '│', vs.fg, vs.bg, vs.attrs, vs.underline,
                     ),
                 );
             }
@@ -5790,11 +5858,11 @@ impl App for Editor {
             #[allow(clippy::cast_possible_truncation)]
             let ch = (b'a' + idx as u8) as char;
             let msg = format!("recording @{ch}");
-            view::render_message_line(frame, &msg, false, 0, bottom_y, w);
+            view::render_message_line(frame, &msg, false, 0, bottom_y, w, &self.theme);
         } else if let Some(ref msg) = self.message {
-            view::render_message_line(frame, msg, self.message_is_error, 0, bottom_y, w);
+            view::render_message_line(frame, msg, self.message_is_error, 0, bottom_y, w, &self.theme);
         } else {
-            view::render_message_line(frame, "", false, 0, bottom_y, w);
+            view::render_message_line(frame, "", false, 0, bottom_y, w, &self.theme);
         }
 
         // Completion popup (rendered last so it overlays everything).
@@ -5819,6 +5887,7 @@ impl App for Editor {
                         cy,
                         w,
                         h,
+                        &self.theme,
                     );
                 }
             }
@@ -9799,10 +9868,12 @@ mod tests {
         // Window 2 (inactive, bottom): status at row 8.
         let active_status = frame.get(0, 3).unwrap();
         let inactive_status = frame.get(0, 8).unwrap();
-        assert!(active_status.attrs.contains(Attr::BOLD), "active should be BOLD");
-        assert!(active_status.attrs.contains(Attr::INVERSE), "active should be INVERSE");
-        assert!(inactive_status.attrs.contains(Attr::DIM), "inactive should be DIM");
-        assert!(inactive_status.attrs.contains(Attr::INVERSE), "inactive should be INVERSE");
+        // Active status line should have the theme's active attrs.
+        assert_eq!(active_status.attrs, e.theme.status_line.attrs, "active should match theme");
+        // Inactive status line should have the theme's inactive attrs.
+        assert_eq!(inactive_status.attrs, e.theme.status_line_nc.attrs, "inactive should match theme");
+        // Active and inactive should look different.
+        assert_ne!(active_status.attrs, inactive_status.attrs, "active and inactive should differ");
     }
 
     // ── Mouse support ─────────────────────────────────────────────────────
@@ -10961,7 +11032,7 @@ mod tests {
     }
 
     #[test]
-    fn cursorline_renders_underline() {
+    fn cursorline_renders_highlight() {
         let mut e = editor_with("aaa\nbbb\nccc");
         run_cmd(&mut e, "set cursorline");
         feed(&mut e, &[press('j')]); // cursor on line 1
@@ -10969,16 +11040,14 @@ mod tests {
         let mut frame = FrameBuffer::new(30, 6);
         e.paint(&mut frame);
 
-        // Row 1 (cursor line) should be underlined.
-        assert!(
-            frame.get(5, 1).unwrap().underline.is_underlined(),
-            "cursor line should be underlined when cursorline is on"
-        );
-        // Row 0 (not cursor) should NOT be underlined.
-        assert!(
-            !frame.get(5, 0).unwrap().underline.is_underlined(),
-            "non-cursor line should not be underlined"
-        );
+        // Row 1 (cursor line) should look different from row 0.
+        // Terminal theme uses underline; generated themes use bg color.
+        let cursor_cell = frame.get(5, 1).unwrap();
+        let other_cell = frame.get(5, 0).unwrap();
+
+        let cursor_highlighted = cursor_cell.bg != other_cell.bg
+            || cursor_cell.underline != other_cell.underline;
+        assert!(cursor_highlighted, "cursor line should be visually distinct");
     }
 
     #[test]
@@ -11000,18 +11069,24 @@ mod tests {
         let mut e = editor_with("aaa\nbbb\nccc");
         run_cmd(&mut e, "set cursorline");
 
+        // Helper: check if a row has cursorline styling (bg or underline).
+        let is_highlighted = |frame: &FrameBuffer, row: u16| -> bool {
+            let cell = frame.get(5, row).unwrap();
+            !cell.bg.is_default() || cell.underline.is_underlined()
+        };
+
         // Cursor on line 0 initially.
         let mut frame = FrameBuffer::new(30, 6);
         e.paint(&mut frame);
-        assert!(frame.get(5, 0).unwrap().underline.is_underlined());
-        assert!(!frame.get(5, 1).unwrap().underline.is_underlined());
+        assert!(is_highlighted(&frame, 0), "cursor on line 0");
+        assert!(!is_highlighted(&frame, 1), "line 1 not highlighted");
 
         // Move to line 2.
         feed(&mut e, &[press('j'), press('j')]);
         let mut frame = FrameBuffer::new(30, 6);
         e.paint(&mut frame);
-        assert!(!frame.get(5, 0).unwrap().underline.is_underlined());
-        assert!(frame.get(5, 2).unwrap().underline.is_underlined());
+        assert!(!is_highlighted(&frame, 0), "line 0 no longer highlighted");
+        assert!(is_highlighted(&frame, 2), "cursor on line 2");
     }
 
     // ── Ctrl+N / Ctrl+P completion ──────────────────────────────────────

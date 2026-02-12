@@ -815,7 +815,8 @@ fn linear_srgb_to_oklab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 
 /// Convert a single linear sRGB component to sRGB (apply gamma).
 #[inline]
-fn linear_to_srgb(c: f32) -> f32 {
+#[must_use]
+pub fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.003_130_8 {
         c * 12.92
     } else {
@@ -825,7 +826,8 @@ fn linear_to_srgb(c: f32) -> f32 {
 
 /// Convert a single sRGB component to linear sRGB (remove gamma).
 #[inline]
-fn srgb_to_linear(c: f32) -> f32 {
+#[must_use]
+pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.040_45 {
         c / 12.92
     } else {

@@ -34,4 +34,5 @@ workspace = true
 [dependencies]
 n-term = { path = "crates/n-term" }
 n-editor = { path = "crates/n-editor" }
+n-theme = { path = "crates/n-theme" }
 regex = "1.12.3"

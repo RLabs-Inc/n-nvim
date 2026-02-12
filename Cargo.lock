@@ -40,6 +40,7 @@ name = "n-editor"
 version = "0.1.0"
 dependencies = [
  "n-term",
+ "n-theme",
  "ropey",
  "unicode-width",
 ]
@@ -50,6 +51,7 @@ version = "0.1.0"
 dependencies = [
  "n-editor",
  "n-term",
+ "n-theme",
  "regex",
 ]
 
@@ -62,6 +64,13 @@ dependencies = [
  "pretty_assertions",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "n-theme"
+version = "0.1.0"
+dependencies = [
+ "n-term",
 ]
 
 [[package]]

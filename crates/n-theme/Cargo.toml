@@ -1,6 +1,6 @@
 [package]
-name = "n-editor"
-description = "Editor core for n-nvim — text buffers, modes, commands"
+name = "n-theme"
+description = "Mathematical theming engine for n-nvim — Sacred Geometry color palettes"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -12,6 +12,3 @@ workspace = true
 
 [dependencies]
 n-term = { path = "../n-term" }
-n-theme = { path = "../n-theme" }
-ropey = "1"
-unicode-width = "0.2"
