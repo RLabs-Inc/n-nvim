@@ -501,6 +501,16 @@ struct Editor {
 
     /// The active editor theme (Sacred Geometry mathematical theming).
     theme: Theme,
+
+    // ── Command history ──────────────────────────────────────────────
+    /// Previous commands (newest last).
+    cmd_history: Vec<String>,
+
+    /// Current index when browsing history. `None` = not browsing.
+    cmd_history_idx: Option<usize>,
+
+    /// The command text before entering history, so Down past newest restores it.
+    cmd_saved_input: String,
 }
 
 impl Editor {
@@ -560,6 +570,9 @@ impl Editor {
             cursorline: false,
             completion: None,
             theme: Theme::terminal(),
+            cmd_history: Vec::new(),
+            cmd_history_idx: None,
+            cmd_saved_input: String::new(),
         }
     }
 
@@ -624,6 +637,9 @@ impl Editor {
             cursorline: false,
             completion: None,
             theme: Theme::terminal(),
+            cmd_history: Vec::new(),
+            cmd_history_idx: None,
+            cmd_saved_input: String::new(),
         }
     }
 
@@ -3217,6 +3233,7 @@ impl Editor {
             // Ctrl-C cancels command mode (same as Escape).
             self.mode = Mode::Normal;
             self.cmdline.clear();
+            self.cmd_history_idx = None;
             return Action::Continue;
         }
 
@@ -3225,14 +3242,78 @@ impl Editor {
                 // Cancel command mode.
                 self.mode = Mode::Normal;
                 self.cmdline.clear();
+                self.cmd_history_idx = None;
             }
 
             KeyCode::Enter => {
+                // Push to history (dedup consecutive).
+                let input = self.cmdline.input().to_string();
+                if !input.is_empty()
+                    && self.cmd_history.last().is_none_or(|last| *last != input)
+                {
+                    self.cmd_history.push(input);
+                }
+                self.cmd_history_idx = None;
+
                 // Parse and execute the command.
                 let cmd = self.cmdline.parse();
                 self.mode = Mode::Normal;
                 self.cmdline.clear();
                 return self.execute_command(cmd);
+            }
+
+            KeyCode::Up => {
+                // Navigate history backward.
+                if self.cmd_history.is_empty() {
+                    return Action::Continue;
+                }
+                match self.cmd_history_idx {
+                    None => {
+                        // First press: save current input and go to newest.
+                        self.cmd_saved_input = self.cmdline.input().to_string();
+                        let idx = self.cmd_history.len() - 1;
+                        self.cmd_history_idx = Some(idx);
+                        self.cmdline.clear();
+                        for ch in self.cmd_history[idx].chars() {
+                            self.cmdline.insert_char(ch);
+                        }
+                    }
+                    Some(idx) if idx > 0 => {
+                        let idx = idx - 1;
+                        self.cmd_history_idx = Some(idx);
+                        self.cmdline.clear();
+                        for ch in self.cmd_history[idx].chars() {
+                            self.cmdline.insert_char(ch);
+                        }
+                    }
+                    _ => {} // Already at oldest.
+                }
+            }
+
+            KeyCode::Down => {
+                // Navigate history forward.
+                if let Some(idx) = self.cmd_history_idx {
+                    if idx + 1 < self.cmd_history.len() {
+                        let idx = idx + 1;
+                        self.cmd_history_idx = Some(idx);
+                        self.cmdline.clear();
+                        for ch in self.cmd_history[idx].chars() {
+                            self.cmdline.insert_char(ch);
+                        }
+                    } else {
+                        // Past newest: restore saved input.
+                        self.cmd_history_idx = None;
+                        self.cmdline.clear();
+                        let saved = self.cmd_saved_input.clone();
+                        for ch in saved.chars() {
+                            self.cmdline.insert_char(ch);
+                        }
+                    }
+                }
+            }
+
+            KeyCode::Tab => {
+                self.cmd_tab_complete();
             }
 
             KeyCode::Char(ch) => {
@@ -3243,6 +3324,7 @@ impl Editor {
                 if !self.cmdline.backspace() {
                     // Backspace on empty command line cancels (like Vim).
                     self.mode = Mode::Normal;
+                    self.cmd_history_idx = None;
                 }
             }
 
@@ -3259,6 +3341,127 @@ impl Editor {
         }
 
         Action::Continue
+    }
+
+    /// Tab-complete the command line.
+    ///
+    /// Completes command names, and argument values for known commands
+    /// (e.g., `:colorscheme` shows theme names).
+    fn cmd_tab_complete(&mut self) {
+        let input = self.cmdline.input().to_string();
+
+        // If input contains a space, try to complete the argument.
+        if let Some(space_pos) = input.find(' ') {
+            let cmd_part = &input[..space_pos];
+            let arg_part = &input[space_pos + 1..];
+
+            // `:colorscheme <arg>` or `:colo <arg>`.
+            if cmd_part == "colorscheme" || cmd_part == "colo" {
+                let mut candidates: Vec<&str> = Vec::new();
+                // Builtins.
+                for name in n_theme::builtin::builtin_names() {
+                    if name.starts_with(arg_part) {
+                        candidates.push(name);
+                    }
+                }
+                // Pattern names (for `:colorscheme generate <pattern>`).
+                if arg_part.is_empty() || "random".starts_with(arg_part) {
+                    candidates.push("random");
+                }
+                if arg_part.is_empty() || "generate".starts_with(arg_part) {
+                    candidates.push("generate");
+                }
+                if arg_part.is_empty() || "list".starts_with(arg_part) {
+                    candidates.push("list");
+                }
+                // Dedup (terminal is in builtins already).
+                candidates.sort_unstable();
+                candidates.dedup();
+
+                if candidates.len() == 1 {
+                    self.cmdline.clear();
+                    for ch in format!("{cmd_part} {}", candidates[0]).chars() {
+                        self.cmdline.insert_char(ch);
+                    }
+                } else if candidates.len() > 1 {
+                    // Show options as message.
+                    self.message = Some(candidates.join("  "));
+                    self.message_is_error = false;
+                    // Complete longest common prefix.
+                    if let Some(lcp) = longest_common_prefix(&candidates) {
+                        if lcp.len() > arg_part.len() {
+                            self.cmdline.clear();
+                            for ch in format!("{cmd_part} {lcp}").chars() {
+                                self.cmdline.insert_char(ch);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // `:colorscheme generate <pattern>`.
+            if input.starts_with("colorscheme generate ") || input.starts_with("colo generate ") {
+                let gen_arg = if let Some(rest) = input.strip_prefix("colorscheme generate ") {
+                    rest
+                } else if let Some(rest) = input.strip_prefix("colo generate ") {
+                    rest
+                } else {
+                    return;
+                };
+                let candidates: Vec<&str> = n_theme::PatternKind::all()
+                    .iter()
+                    .map(|p| p.name())
+                    .filter(|n| n.starts_with(gen_arg))
+                    .collect();
+                if candidates.len() == 1 {
+                    let base = input[..input.len() - gen_arg.len()].to_string();
+                    self.cmdline.clear();
+                    for ch in format!("{base}{}", candidates[0]).chars() {
+                        self.cmdline.insert_char(ch);
+                    }
+                } else if candidates.len() > 1 {
+                    self.message = Some(candidates.join("  "));
+                    self.message_is_error = false;
+                }
+                return;
+            }
+
+            return; // No completion for other commands' args.
+        }
+
+        // Complete command names.
+        #[allow(clippy::items_after_statements)]
+        static COMMANDS: &[&str] = &[
+            "bd", "bdelete", "bn", "bnext", "bp", "bprev", "bprevious",
+            "buffers", "clo", "close", "colo", "colorscheme",
+            "e", "edit", "ls", "on", "only", "q", "q!",
+            "se", "set", "sp", "split", "vsp", "vsplit",
+            "w", "wq", "x",
+        ];
+
+        let candidates: Vec<&&str> = COMMANDS.iter()
+            .filter(|cmd| cmd.starts_with(input.as_str()))
+            .collect();
+
+        if candidates.len() == 1 {
+            self.cmdline.clear();
+            for ch in candidates[0].chars() {
+                self.cmdline.insert_char(ch);
+            }
+        } else if candidates.len() > 1 {
+            let strs: Vec<&str> = candidates.iter().copied().copied().collect();
+            self.message = Some(strs.join("  "));
+            self.message_is_error = false;
+            if let Some(lcp) = longest_common_prefix(&strs) {
+                if lcp.len() > input.len() {
+                    self.cmdline.clear();
+                    for ch in lcp.chars() {
+                        self.cmdline.insert_char(ch);
+                    }
+                }
+            }
+        }
     }
 
     /// Execute a parsed command and return the appropriate action.
@@ -3427,6 +3630,7 @@ impl Editor {
     /// `:colorscheme <args>` — theme commands.
     ///
     /// - `:colorscheme` — show current theme name
+    /// - `:colorscheme list` — show available themes and patterns
     /// - `:colorscheme <name>` — load a builtin theme
     /// - `:colorscheme terminal` — switch to terminal-native ANSI theme
     /// - `:colorscheme random` — fully random Sacred Geometry theme
@@ -3445,32 +3649,56 @@ impl Editor {
             return CommandResult::Ok(Some("terminal".to_string()));
         }
 
+        // `:colorscheme list` — show available themes and patterns.
+        if args == "list" {
+            let builtins = n_theme::builtin::builtin_names().join(", ");
+            let patterns: Vec<&str> = n_theme::PatternKind::all()
+                .iter()
+                .map(|p| p.name())
+                .collect();
+            let patterns_str = patterns.join(", ");
+            return CommandResult::Ok(Some(format!(
+                "Builtins: {builtins} | Patterns: {patterns_str} | Commands: random, generate <pattern> [hue]",
+            )));
+        }
+
         // `:colorscheme random` — fully random.
         if args == "random" {
             self.theme = Theme::generate_surprise();
-            return CommandResult::Ok(Some(format!("Generated: {}", self.theme.name)));
+            let pattern = self.theme.pattern.map_or("?", |p| p.name());
+            let hue = self.theme.base_hue.unwrap_or(0.0);
+            return CommandResult::Ok(Some(format!(
+                "{pattern} (hue={hue:.0})"
+            )));
         }
 
         // `:colorscheme generate [pattern] [hue]` — interactive generation.
         if let Some(rest) = args.strip_prefix("generate") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
+            // If no pattern given, pick random (same as `random` but explicit).
             let pattern = parts.first()
                 .and_then(|s| n_theme::PatternKind::from_name(s))
-                .unwrap_or(n_theme::PatternKind::GoldenRatio);
+                .unwrap_or_else(|| {
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(42, |d| d.subsec_nanos());
+                    let scrambled = t ^ (t >> 7) ^ (t >> 13);
+                    let all = n_theme::PatternKind::all();
+                    all[(scrambled as usize) % all.len()]
+                });
             let hue: f32 = parts.get(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| {
-                    // Random hue from timestamp.
                     let t = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(180, |d| d.subsec_nanos());
+                    let scrambled = t ^ (t >> 3) ^ (t >> 11);
                     #[allow(clippy::cast_precision_loss)]
-                    { (t % 360) as f32 }
+                    { (scrambled % 360) as f32 }
                 });
             self.theme = Theme::generate_random(pattern, hue, true);
             return CommandResult::Ok(Some(format!(
-                "Generated: {} (pattern={}, hue={:.0})",
-                self.theme.name, pattern.name(), hue,
+                "{} (hue={hue:.0})", pattern.name(),
             )));
         }
 
@@ -3480,9 +3708,8 @@ impl Editor {
             self.theme = theme;
             CommandResult::Ok(Some(msg))
         } else {
-            let builtins = n_theme::builtin::builtin_names().join(", ");
             CommandResult::Err(format!(
-                "E185: Unknown \"{args}\". Builtins: {builtins}. Or: random, generate <pattern> [hue], terminal"
+                "E185: Unknown \"{args}\". Try :colorscheme list"
             ))
         }
     }
@@ -5645,6 +5872,26 @@ fn translate_replacement(s: &str) -> String {
     result
 }
 
+/// Find the longest common prefix among a set of strings.
+fn longest_common_prefix(strings: &[&str]) -> Option<String> {
+    let first = strings.first()?;
+    let mut end = first.len();
+    for s in &strings[1..] {
+        end = end.min(s.len());
+        for (i, (a, b)) in first.bytes().zip(s.bytes()).enumerate() {
+            if a != b {
+                end = end.min(i);
+                break;
+            }
+        }
+    }
+    if end > 0 {
+        Some(first[..end].to_string())
+    } else {
+        None
+    }
+}
+
 fn find_matching_bracket(buf: &Buffer, pos: Position) -> Option<Position> {
     let ch = buf.char_at(pos)?;
 
@@ -5845,13 +6092,13 @@ impl App for Editor {
         if let Some(ref ss) = self.search {
             let search_cursor = view::render_search_line(
                 frame, ss.prefix(), ss.input(), ss.input_cursor(),
-                0, bottom_y, w,
+                0, bottom_y, w, &self.theme,
             );
             self.cursor_screen = search_cursor;
         } else if self.mode == Mode::Command {
             let cmd_cursor = view::render_command_line(
                 frame, self.cmdline.input(), self.cmdline.cursor(),
-                0, bottom_y, w,
+                0, bottom_y, w, &self.theme,
             );
             self.cursor_screen = cmd_cursor;
         } else if let Some(idx) = self.macro_recording {

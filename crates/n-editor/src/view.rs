@@ -525,11 +525,12 @@ impl View {
         theme: &Theme,
     ) {
         let Some(line) = buf.line(line_idx) else {
-            fill_empty(frame, x, y, width);
+            fill_empty(frame, x, y, width, theme.normal.bg);
             return;
         };
 
         let vis_bg = theme.visual.bg;
+        let normal_colors = (theme.normal.fg, theme.normal.bg);
         let tab_w = self.tab_width.max(1) as usize;
         let left_col = self.left_col;
         let mut display_col: usize = 0;
@@ -555,7 +556,7 @@ impl View {
                         if screen_col >= width {
                             break 'chars;
                         }
-                        frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg));
+                        frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg, normal_colors.0, normal_colors.1));
                         screen_col += 1;
                     }
                     display_col += 1;
@@ -575,31 +576,31 @@ impl View {
                     if char_w == 2 {
                         // Wide character: needs 2 screen columns.
                         if screen_col + 1 < width {
-                            frame.set(x + screen_col, y, sel_cell(ch, selected, vis_bg));
+                            frame.set(x + screen_col, y, sel_cell(ch, selected, vis_bg, normal_colors.0, normal_colors.1));
                             frame.set(
                                 x + screen_col + 1,
                                 y,
                                 Cell::continuation(
-                                    CellColor::Default,
-                                    if selected { vis_bg } else { CellColor::Default },
+                                    normal_colors.0,
+                                    if selected { vis_bg } else { normal_colors.1 },
                                     Attr::empty(),
                                 ),
                             );
                             screen_col += 2;
                         } else {
                             // Wide char doesn't fit — place a space instead.
-                            frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg));
+                            frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg, normal_colors.0, normal_colors.1));
                             screen_col += 1;
                         }
                     } else {
-                        frame.set(x + screen_col, y, sel_cell(ch, selected, vis_bg));
+                        frame.set(x + screen_col, y, sel_cell(ch, selected, vis_bg, normal_colors.0, normal_colors.1));
                         screen_col += 1;
                     }
                 } else if display_col + char_w > left_col {
                     // Wide char straddles the left scroll boundary — the left
                     // half is off-screen, so show a space for the visible part.
                     if screen_col < width {
-                        frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg));
+                        frame.set(x + screen_col, y, sel_cell(' ', selected, vis_bg, normal_colors.0, normal_colors.1));
                         screen_col += 1;
                     }
                 }
@@ -616,7 +617,7 @@ impl View {
         let trail_selected =
             line_sel.is_some_and(|(_, sel_end)| char_col < sel_end);
         while screen_col < width {
-            frame.set(x + screen_col, y, sel_cell(' ', trail_selected, vis_bg));
+            frame.set(x + screen_col, y, sel_cell(' ', trail_selected, vis_bg, normal_colors.0, normal_colors.1));
             screen_col += 1;
         }
     }
@@ -668,9 +669,9 @@ fn render_line_number(
         col += 1;
     }
 
-    // Separator space
+    // Separator space (uses line_nr bg for visual consistency).
     if col < x + gutter_w {
-        frame.set(col, y, Cell::EMPTY);
+        frame.set(col, y, Cell::styled(' ', group.fg, group.bg, Attr::empty(), UnderlineStyle::None));
     }
 }
 
@@ -687,9 +688,16 @@ fn render_tilde_line(frame: &mut FrameBuffer, x: u16, y: u16, width: u16, theme:
         Cell::styled('~', nt.fg, nt.bg, nt.attrs, nt.underline),
     );
 
-    // Fill rest of line.
-    for col in 1..width {
-        frame.set(x + col, y, Cell::EMPTY);
+    // Fill rest of line with theme bg.
+    let bg = nt.bg;
+    if bg.is_default() {
+        for col in 1..width {
+            frame.set(x + col, y, Cell::EMPTY);
+        }
+    } else {
+        for col in 1..width {
+            frame.set(x + col, y, Cell::styled(' ', CellColor::Default, bg, Attr::empty(), UnderlineStyle::None));
+        }
     }
 }
 
@@ -733,8 +741,17 @@ fn render_status_line(
     // Right: " line:col "
     let right = format!(" {}:{} ", cursor.line() + 1, cursor.col() + 1);
 
-    // Active vs inactive status line from theme.
-    let group = if active { &theme.status_line } else { &theme.status_line_nc };
+    // Active: mode-specific color. Inactive: always status_line_nc.
+    let group = if active {
+        match mode {
+            Mode::Insert => &theme.status_line_insert,
+            Mode::Visual(_) => &theme.status_line_visual,
+            Mode::Replace => &theme.status_line_replace,
+            _ => &theme.status_line,
+        }
+    } else {
+        &theme.status_line_nc
+    };
     let fg = group.fg;
     let bg = group.bg;
     let style = group.attrs;
@@ -775,15 +792,28 @@ fn render_status_line(
 /// When `selected` is true the cell gets the visual selection background
 /// color from the theme. When `visual_bg` is `CellColor::Default`, falls
 /// back to `Attr::INVERSE` for compatibility.
-const fn sel_cell(ch: char, selected: bool, visual_bg: CellColor) -> Cell {
+///
+/// When not selected, uses the theme's normal fg/bg so generated themes
+/// actually display their colors on screen.
+/// `normal` is `(fg, bg)` from the theme's normal highlight group.
+#[allow(clippy::similar_names)]
+const fn sel_cell(
+    ch: char,
+    selected: bool,
+    visual_bg: CellColor,
+    normal_fg: CellColor,
+    normal_bg: CellColor,
+) -> Cell {
     if selected {
         if visual_bg.is_default() {
             Cell::styled(ch, CellColor::Default, CellColor::Default, Attr::INVERSE, UnderlineStyle::None)
         } else {
             Cell::styled(ch, CellColor::Default, visual_bg, Attr::empty(), UnderlineStyle::None)
         }
-    } else {
+    } else if normal_fg.is_default() && normal_bg.is_default() {
         Cell::new(ch)
+    } else {
+        Cell::styled(ch, normal_fg, normal_bg, Attr::empty(), UnderlineStyle::None)
     }
 }
 
@@ -1045,6 +1075,7 @@ pub fn render_completion_popup(
 ///
 /// Similar to [`render_command_line`] but with a configurable prefix character.
 /// Returns the screen position of the search-line cursor.
+#[allow(clippy::too_many_arguments)]
 pub fn render_search_line(
     frame: &mut FrameBuffer,
     prefix: char,
@@ -1053,13 +1084,17 @@ pub fn render_search_line(
     x: u16,
     y: u16,
     width: u16,
+    theme: &Theme,
 ) -> Option<(u16, u16)> {
     if width == 0 {
         return None;
     }
 
+    let fg = theme.normal.fg;
+    let bg = theme.normal.bg;
+
     // Leading prefix ('/' or '?')
-    frame.set(x, y, Cell::new(prefix));
+    frame.set(x, y, Cell::styled(prefix, fg, bg, Attr::empty(), UnderlineStyle::None));
     let mut col: u16 = 1;
 
     // Input text
@@ -1067,15 +1102,13 @@ pub fn render_search_line(
         if col >= width {
             break;
         }
-        frame.set(x + col, y, Cell::new(ch));
+        frame.set(x + col, y, Cell::styled(ch, fg, bg, Attr::empty(), UnderlineStyle::None));
         col += 1;
     }
 
-    // Fill remaining with empty cells
-    while col < width {
-        frame.set(x + col, y, Cell::EMPTY);
-        col += 1;
-    }
+    // Fill remaining
+    fill_empty(frame, x + col, y, width - col, bg);
+
 
     // Cursor position: after prefix + cursor_col
     #[allow(clippy::cast_possible_truncation)]
@@ -1087,10 +1120,23 @@ pub fn render_search_line(
     }
 }
 
-/// Fill a span with empty cells.
-fn fill_empty(frame: &mut FrameBuffer, x: u16, y: u16, width: u16) {
-    for col in 0..width {
-        frame.set(x + col, y, Cell::EMPTY);
+/// Fill a span with themed empty cells.
+///
+/// Uses the given background color so generated themes display correctly.
+/// Pass `CellColor::Default` for terminal-native theme.
+fn fill_empty(frame: &mut FrameBuffer, x: u16, y: u16, width: u16, bg: CellColor) {
+    if bg.is_default() {
+        for col in 0..width {
+            frame.set(x + col, y, Cell::EMPTY);
+        }
+    } else {
+        for col in 0..width {
+            frame.set(
+                x + col,
+                y,
+                Cell::styled(' ', CellColor::Default, bg, Attr::empty(), UnderlineStyle::None),
+            );
+        }
     }
 }
 
@@ -1105,13 +1151,17 @@ pub fn render_command_line(
     x: u16,
     y: u16,
     width: u16,
+    theme: &Theme,
 ) -> Option<(u16, u16)> {
     if width == 0 {
         return None;
     }
 
+    let fg = theme.normal.fg;
+    let bg = theme.normal.bg;
+
     // Leading ':'
-    frame.set(x, y, Cell::new(':'));
+    frame.set(x, y, Cell::styled(':', fg, bg, Attr::empty(), UnderlineStyle::None));
     let mut col: u16 = 1;
 
     // Input text
@@ -1119,15 +1169,13 @@ pub fn render_command_line(
         if col >= width {
             break;
         }
-        frame.set(x + col, y, Cell::new(ch));
+        frame.set(x + col, y, Cell::styled(ch, fg, bg, Attr::empty(), UnderlineStyle::None));
         col += 1;
     }
 
-    // Fill remaining with empty cells
-    while col < width {
-        frame.set(x + col, y, Cell::EMPTY);
-        col += 1;
-    }
+    // Fill remaining
+    fill_empty(frame, x + col, y, width - col, bg);
+
 
     // Cursor position: after ':' + cursor_col
     #[allow(clippy::cast_possible_truncation)]
@@ -1171,11 +1219,8 @@ pub fn render_message_line(
         col += 1;
     }
 
-    // Fill remaining with empty cells
-    while col < width {
-        frame.set(x + col, y, Cell::EMPTY);
-        col += 1;
-    }
+    // Fill remaining with themed background.
+    fill_empty(frame, x + col, y, width - col, theme.normal.bg);
 }
 
 // ---------------------------------------------------------------------------
@@ -2060,7 +2105,7 @@ mod tests {
     #[test]
     fn command_line_basic() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_command_line(&mut frame, "wq", 2, 0, 0, 20);
+        let pos = render_command_line(&mut frame, "wq", 2, 0, 0, 20, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert!(row.starts_with(":wq"), "row = '{row}'");
@@ -2071,7 +2116,7 @@ mod tests {
     #[test]
     fn command_line_empty_input() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_command_line(&mut frame, "", 0, 0, 0, 20);
+        let pos = render_command_line(&mut frame, "", 0, 0, 0, 20, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert!(row.starts_with(':'), "row = '{row}'");
@@ -2082,7 +2127,7 @@ mod tests {
     #[test]
     fn command_line_cursor_in_middle() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_command_line(&mut frame, "write", 2, 0, 0, 20);
+        let pos = render_command_line(&mut frame, "write", 2, 0, 0, 20, &test_theme());
 
         // Cursor at char offset 2 → screen col 3 (: + w + r)
         assert_eq!(pos, Some((3, 0)));
@@ -2091,14 +2136,14 @@ mod tests {
     #[test]
     fn command_line_zero_width() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_command_line(&mut frame, "wq", 0, 0, 0, 0);
+        let pos = render_command_line(&mut frame, "wq", 0, 0, 0, 0, &test_theme());
         assert!(pos.is_none());
     }
 
     #[test]
     fn command_line_with_offset() {
         let mut frame = FrameBuffer::new(40, 24);
-        let pos = render_command_line(&mut frame, "q!", 2, 5, 10, 20);
+        let pos = render_command_line(&mut frame, "q!", 2, 5, 10, 20, &test_theme());
 
         // x offset = 5, cursor at 5 + 1 + 2 = 8
         assert_eq!(pos, Some((8, 10)));
@@ -2113,7 +2158,7 @@ mod tests {
             frame.set(col, 0, Cell::new('X'));
         }
 
-        render_command_line(&mut frame, "w", 1, 0, 0, 10);
+        render_command_line(&mut frame, "w", 1, 0, 0, 10, &test_theme());
 
         // ":w" occupies cols 0-1, rest should be empty (space).
         let row = frame.row(0).unwrap();
@@ -2434,11 +2479,11 @@ mod tests {
 
     #[test]
     fn sel_cell_helper() {
-        let normal = sel_cell('a', false, CellColor::Default);
+        let normal = sel_cell('a', false, CellColor::Default, CellColor::Default, CellColor::Default);
         assert_eq!(normal.character(), Some('a'));
         assert!(!normal.attrs.contains(Attr::INVERSE));
 
-        let selected = sel_cell('b', true, CellColor::Default);
+        let selected = sel_cell('b', true, CellColor::Default, CellColor::Default, CellColor::Default);
         assert_eq!(selected.character(), Some('b'));
         assert!(selected.attrs.contains(Attr::INVERSE));
     }
@@ -2532,7 +2577,7 @@ mod tests {
     #[test]
     fn search_line_forward() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_search_line(&mut frame, '/', "hello", 5, 0, 0, 20);
+        let pos = render_search_line(&mut frame, '/', "hello", 5, 0, 0, 20, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert!(row.starts_with("/hello"), "row = '{row}'");
@@ -2543,7 +2588,7 @@ mod tests {
     #[test]
     fn search_line_backward() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_search_line(&mut frame, '?', "world", 5, 0, 0, 20);
+        let pos = render_search_line(&mut frame, '?', "world", 5, 0, 0, 20, &test_theme());
 
         let row = row_chars(&frame, 0);
         assert!(row.starts_with("?world"), "row = '{row}'");
@@ -2553,7 +2598,7 @@ mod tests {
     #[test]
     fn search_line_empty_input() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_search_line(&mut frame, '/', "", 0, 0, 0, 20);
+        let pos = render_search_line(&mut frame, '/', "", 0, 0, 0, 20, &test_theme());
 
         assert_eq!(pos, Some((1, 0)));
     }
@@ -2561,7 +2606,7 @@ mod tests {
     #[test]
     fn search_line_zero_width() {
         let mut frame = FrameBuffer::new(20, 1);
-        let pos = render_search_line(&mut frame, '/', "hello", 0, 0, 0, 0);
+        let pos = render_search_line(&mut frame, '/', "hello", 0, 0, 0, 0, &test_theme());
         assert!(pos.is_none());
     }
 
@@ -2572,7 +2617,7 @@ mod tests {
             frame.set(col, 0, Cell::new('X'));
         }
 
-        render_search_line(&mut frame, '/', "ab", 2, 0, 0, 10);
+        render_search_line(&mut frame, '/', "ab", 2, 0, 0, 10, &test_theme());
 
         let row = frame.row(0).unwrap();
         assert_eq!(row[0].character(), Some('/'));

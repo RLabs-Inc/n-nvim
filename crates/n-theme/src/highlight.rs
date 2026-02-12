@@ -124,6 +124,20 @@ pub struct Theme {
     /// Normal messages.
     pub msg: HighlightGroup,
 
+    // ── Mode-specific status lines ────────────────────────────
+    /// Status line in insert mode (active window).
+    pub status_line_insert: HighlightGroup,
+    /// Status line in visual mode (active window).
+    pub status_line_visual: HighlightGroup,
+    /// Status line in replace mode (active window).
+    pub status_line_replace: HighlightGroup,
+
+    // ── Generation metadata ───────────────────────────────────
+    /// The pattern used to generate this theme (None for terminal).
+    pub pattern: Option<PatternKind>,
+    /// The base hue used to generate this theme (None for terminal).
+    pub base_hue: Option<f32>,
+
     // ── Color sources (for advanced consumers) ────────────────
     /// The full UI palette used to generate this theme.
     pub palette: UiPalette,
@@ -174,7 +188,10 @@ impl Theme {
             seed,
         );
 
-        Self::from_palette(name, is_dark, palette, syntax)
+        let mut theme = Self::from_palette(name, is_dark, palette, syntax);
+        theme.pattern = Some(pattern);
+        theme.base_hue = Some(base_hue);
+        theme
     }
 
     /// Assemble a theme from pre-computed palette and syntax colors.
@@ -283,6 +300,29 @@ impl Theme {
 
             msg: HighlightGroup::fg_only(p.fg1.to_cell_color()),
 
+            // Mode-specific status lines: derive from palette hues.
+            status_line_insert: HighlightGroup {
+                fg: p.fg1.to_cell_color(),
+                bg: p.info.to_cell_color(), // blue/info hue
+                attrs: Attr::BOLD,
+                underline: UnderlineStyle::None,
+            },
+            status_line_visual: HighlightGroup {
+                fg: p.fg1.to_cell_color(),
+                bg: p.ac1.to_cell_color(), // primary accent
+                attrs: Attr::BOLD,
+                underline: UnderlineStyle::None,
+            },
+            status_line_replace: HighlightGroup {
+                fg: p.fg1.to_cell_color(),
+                bg: p.error.to_cell_color(), // red/danger hue
+                attrs: Attr::BOLD,
+                underline: UnderlineStyle::None,
+            },
+
+            pattern: None, // Set by caller.
+            base_hue: None,
+
             palette,
             syntax,
         }
@@ -373,6 +413,29 @@ impl Theme {
 
             msg: HighlightGroup::fg_only(Default),
 
+            // Mode-specific: ANSI colors for terminal compatibility.
+            status_line_insert: HighlightGroup {
+                fg: Ansi256(0),
+                bg: Ansi256(2), // green
+                attrs: Attr::BOLD,
+                underline: UnderlineStyle::None,
+            },
+            status_line_visual: HighlightGroup {
+                fg: Ansi256(0),
+                bg: Ansi256(5), // magenta
+                attrs: Attr::BOLD,
+                underline: UnderlineStyle::None,
+            },
+            status_line_replace: HighlightGroup {
+                fg: Ansi256(0),
+                bg: Ansi256(1), // red
+                attrs: Attr::BOLD,
+                underline: UnderlineStyle::None,
+            },
+
+            pattern: None,
+            base_hue: None,
+
             palette: UiPalette::placeholder(),
             syntax: SyntaxPalette::placeholder(),
         }
@@ -390,15 +453,22 @@ impl Theme {
     }
 
     /// Fully random theme — random pattern, random hue, time-based seed.
+    ///
+    /// Uses bit-scrambling before pattern selection to avoid a macOS bug
+    /// where `subsec_nanos()` returns multiples of 1000 (microsecond
+    /// resolution), causing `nanos % 20` to always yield 0 (`GoldenRatio`).
     #[must_use]
     pub fn generate_surprise() -> Self {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(42, |d| d.subsec_nanos());
+        // Scramble: xorshift breaks the multiple-of-1000 alignment.
+        let scrambled = seed ^ (seed >> 7) ^ (seed >> 13);
         let patterns = PatternKind::all();
-        let pattern = patterns[(seed as usize) % patterns.len()];
-        let hue = (seed % 360) as f32;
-        let name = format!("{}_{seed}", pattern.name());
+        let pattern = patterns[(scrambled as usize) % patterns.len()];
+        #[allow(clippy::cast_precision_loss)]
+        let hue = ((scrambled ^ (seed >> 3)) % 360) as f32;
+        let name = format!("{} (hue={hue:.0})", pattern.name());
         Self::generate(&name, pattern, hue, true, false, seed)
     }
 }
